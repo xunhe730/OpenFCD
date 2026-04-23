@@ -1,0 +1,149 @@
+"""OpenFCD CLI entry point."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import typer
+
+from openfcd.cli._output import format_progress, stage_event_to_json
+
+app = typer.Typer(name="openfcd", help="Fast Checkerboard Demodulation pipeline", no_args_is_help=True)
+
+
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+
+@app.command()
+def version() -> None:
+    """Print version."""
+    import openfcd
+
+    typer.echo(openfcd.__version__)
+
+
+# ---------------------------------------------------------------------------
+# New
+# ---------------------------------------------------------------------------
+
+@app.command()
+def new(
+    name: str = typer.Argument(..., help="Project name"),
+    path: Path = typer.Argument(..., help="Directory path for new .ofcd project"),
+) -> None:
+    """Create a new .ofcd project directory."""
+    from openfcd.io.store import FileSessionStore
+
+    FileSessionStore.new(path, name)
+    typer.echo(f"Created project '{name}' at {path}")
+
+
+# ---------------------------------------------------------------------------
+# Open
+# ---------------------------------------------------------------------------
+
+@app.command()
+def open(
+    project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
+) -> None:
+    """Load and print project summary."""
+    from openfcd.io.store import FileSessionStore
+
+    store = FileSessionStore.open(project_path)
+    project = store.project
+    typer.echo(f"Name: {project.name}")
+    typer.echo(f"Created: {project.created}")
+    typer.echo(f"Format version: {project.format_version}")
+    typer.echo(f"Geometry preset: {project.geometry.optical_stack.preset}")
+    typer.echo(f"Frames dir: {project.data.frames_dir}")
+    typer.echo(f"Pattern: {project.data.pattern}")
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Validate
+# ---------------------------------------------------------------------------
+
+@app.command()
+def validate(
+    project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
+) -> None:
+    """Validate project.yaml schema. Exit 0 if OK, exit 2 if invalid."""
+    from openfcd.io.project import ProjectModel
+
+    try:
+        ProjectModel.from_yaml(project_path / "project.yaml")
+        typer.echo("Project schema is valid.")
+    except Exception as exc:
+        typer.echo(f"Validation error: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+@app.command()
+def run(
+    project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
+    workers: int = typer.Option(-1, help="Parallel workers (-1=auto)"),
+    frames: str | None = typer.Option(None, help="Frame range filter (e.g. '0:100' or 'Img200*.jpg')"),
+    run_id: str | None = typer.Option(None, help="Run ID (default: run-YYYYMMDD-HHMMSS)"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON lines"),
+) -> None:
+    """Run the FCD pipeline on a project. Writes runs/{id}/results.h5."""
+    # Delegate to cmd_run module to avoid circular imports
+    from openfcd.cli.cmd_run import run_cmd as _run_impl
+
+    _run_impl(project_path=project_path, workers=workers, frames=frames, run_id=run_id, json_output=json_output)
+
+
+# ---------------------------------------------------------------------------
+# Replay
+# ---------------------------------------------------------------------------
+
+@app.command()
+def replay(
+    project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
+    run: str | None = typer.Option(None, help="Run ID (default: latest)"),
+    figure: str | None = typer.Option(None, help="Figure ID to render (eta_heatmap, etc.)"),
+    json_output: bool = typer.Option(False, "--json", help="Output results as JSON"),
+) -> None:
+    """Replay a previous run's results (no recomputation)."""
+    from openfcd.cli.cmd_replay import replay_cmd as _replay_impl
+
+    _replay_impl(project_path=project_path, run=run, figure=figure, json_output=json_output)
+
+
+# ---------------------------------------------------------------------------
+# Project subcommand group
+# ---------------------------------------------------------------------------
+
+project_app = typer.Typer(name="project", help="Project management")
+
+
+@project_app.command("info")
+def project_info(project_path: Path = typer.Argument(...)) -> None:
+    """Print project.yaml summary."""
+    from openfcd.cli.cmd_project import project_info_cmd as _info_impl
+
+    _info_impl(project_path=project_path)
+
+
+@project_app.command("runs")
+def project_runs(project_path: Path = typer.Argument(...)) -> None:
+    """List all runs with STALE status."""
+    from openfcd.cli.cmd_project import project_runs_cmd as _runs_impl
+
+    _runs_impl(project_path=project_path)
+
+
+@project_app.command("fingerprint")
+def project_fingerprint(project_path: Path = typer.Argument(...)) -> None:
+    """Print current config_fingerprint."""
+    from openfcd.cli.cmd_project import project_fingerprint_cmd as _fp_impl
+
+    _fp_impl(project_path=project_path)
+
+
+app.add_typer(project_app)
