@@ -408,11 +408,22 @@ class MainWindow(QMainWindow):
         if not self._ensure_optical_config_ready(interactive=True):
             return
 
+        # Warn when reference and deformed carriers differ by >10% (zoom mismatch).
+        frame_path = self._frames[idx]
+        scale_warning = self._check_carrier_scale(proj, frame_path)
+        if scale_warning:
+            reply = QMessageBox.warning(
+                self, "Scale Mismatch Detected",
+                f"{scale_warning}\n\nScale normalization will be applied automatically.\nContinue?",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Ok,
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+
         self._toolbar.set_running(True, "--:--")
         self._status_bar.set_items(["Running", f"Computing frame {idx + 1}...", "0%"])
         self._status_bar.show_progress(0, 100)
-
-        frame_path = self._frames[idx]
 
         worker = _SingleFrameWorker(
             project=proj,
@@ -426,6 +437,36 @@ class MainWindow(QMainWindow):
         worker.frame_progress.connect(self._on_single_frame_progress)
         worker.finished.connect(lambda: setattr(self, "_single_frame_worker", None))
         worker.start()
+
+    def _check_carrier_scale(self, proj, frame_path) -> str | None:
+        """Return a warning string if ref/def carrier period mismatch >10%, else None."""
+        try:
+            from openfcd.pipeline.compute import load_gray
+            from openfcd.core.flatfield import flatfield_normalize
+            from openfcd.core.fcd import calculate_carriers
+            from openfcd.core.registration import _mean_carrier_period_px
+            from openfcd.cli.cmd_run import _resolve_reference
+
+            ref_img = _resolve_reference(proj, self._session.project_path)
+            def_img = load_gray(frame_path)
+            h, w = ref_img.shape
+            sigma = float(np.clip(max(h, w) * 0.06, 100.0, 2000.0))
+            ref_ff = flatfield_normalize(ref_img, sigma=sigma)
+            def_ff = flatfield_normalize(def_img, sigma=sigma, bg_src=ref_img)
+            c_ref = calculate_carriers(ref_ff - ref_ff.mean())
+            c_def = calculate_carriers(def_ff - def_ff.mean())
+            p_ref = _mean_carrier_period_px(c_ref)
+            p_def = _mean_carrier_period_px(c_def)
+            deviation = abs(p_def / p_ref - 1.0) if p_ref > 0 else 0.0
+            if deviation >= 0.10:
+                return (
+                    f"Carrier period mismatch: reference={p_ref:.0f} px, "
+                    f"frame={p_def:.0f} px ({deviation*100:.0f}% difference).\n"
+                    "This often indicates a camera zoom change between sessions."
+                )
+        except Exception:
+            pass
+        return None
 
     def _on_single_frame_done(self, eta_overlay, eta_mm) -> None:
         """Single frame computation finished — show eta map."""

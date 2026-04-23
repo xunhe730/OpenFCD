@@ -100,14 +100,14 @@
   "hotPaths": [
     {
       "path": "openfcd/gui/mainwindow.py",
-      "accessCount": 23,
-      "lastAccessed": 1776967001730,
+      "accessCount": 29,
+      "lastAccessed": 1776969743227,
       "type": "file"
     },
     {
       "path": "openfcd/cli/cmd_run.py",
-      "accessCount": 10,
-      "lastAccessed": 1776966965919,
+      "accessCount": 14,
+      "lastAccessed": 1776969705577,
       "type": "file"
     },
     {
@@ -118,14 +118,20 @@
     },
     {
       "path": "tests/unit/test_schema.py",
-      "accessCount": 7,
-      "lastAccessed": 1776969452380,
+      "accessCount": 8,
+      "lastAccessed": 1776969567041,
       "type": "file"
     },
     {
       "path": "openfcd/io/annotation.py",
+      "accessCount": 6,
+      "lastAccessed": 1776969562685,
+      "type": "file"
+    },
+    {
+      "path": "openfcd/core/fcd.py",
       "accessCount": 5,
-      "lastAccessed": 1776969421580,
+      "lastAccessed": 1776969556648,
       "type": "file"
     },
     {
@@ -135,9 +141,9 @@
       "type": "file"
     },
     {
-      "path": "openfcd/core/fcd.py",
+      "path": "openfcd/io/project.py",
       "accessCount": 4,
-      "lastAccessed": 1776967712735,
+      "lastAccessed": 1776969555483,
       "type": "file"
     },
     {
@@ -150,12 +156,6 @@
       "path": "openfcd/gui/widgets/status_bar.py",
       "accessCount": 3,
       "lastAccessed": 1776966563697,
-      "type": "file"
-    },
-    {
-      "path": "openfcd/io/project.py",
-      "accessCount": 3,
-      "lastAccessed": 1776969331352,
       "type": "file"
     },
     {
@@ -228,6 +228,24 @@
       "path": "openfcd/core/mask.py",
       "accessCount": 1,
       "lastAccessed": 1776966628491,
+      "type": "file"
+    },
+    {
+      "path": "openfcd/core/registration.py",
+      "accessCount": 1,
+      "lastAccessed": 1776969554667,
+      "type": "file"
+    },
+    {
+      "path": "openfcd/core/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1776969587765,
+      "type": "file"
+    },
+    {
+      "path": "tests/unit/test_registration.py",
+      "accessCount": 1,
+      "lastAccessed": 1776969772587,
       "type": "file"
     }
   ],

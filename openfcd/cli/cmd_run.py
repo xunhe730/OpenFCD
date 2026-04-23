@@ -481,7 +481,11 @@ def _compute_single_frame(
         suppress_nonphysical_eta_filaments,
     )
 
-    sigma = project.process.flatfield_sigma
+    if getattr(project.process, "flatfield_sigma_auto", True):
+        h_img, w_img = ref_img.shape
+        sigma = float(np.clip(max(h_img, w_img) * 0.06, 100.0, 2000.0))
+    else:
+        sigma = project.process.flatfield_sigma
     taper_alpha = project.process.taper.alpha
     edge_mm = project.process.edge_nan_mm
     same_input = np.array_equal(ref_img, def_img)
@@ -532,6 +536,12 @@ def _compute_single_frame(
     # Find carriers in reference
     _report(30, "Carriers")
     carriers0 = calculate_carriers(ref_ff - ref_ff.mean())
+
+    # Scale normalization: rescale ref to match def's carrier period when they differ.
+    if getattr(project.process, "auto_scale_ref", True):
+        from openfcd.core.registration import scale_normalize_reference
+        ref_ff, carriers0, _scale = scale_normalize_reference(ref_ff, def_ff, carriers0)
+
     filament_mask = detect_filament_occluders(def_ff, carriers0)
 
     # Build occlusion mask

@@ -5,3 +5,5 @@
 {"t":0,"agent":"a0a4089","agent_type":"unknown","event":"agent_stop","success":true}
 {"t":0,"agent":"system","event":"keyword_detected","keyword":"ralph"}
 {"t":0,"agent":"system","event":"mode_change","mode_from":"none","mode_to":"ralph"}
+{"t":0,"agent":"a809827","agent_type":"architect","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"a809827","agent_type":"architect","event":"agent_stop","success":true,"duration_ms":101172}
