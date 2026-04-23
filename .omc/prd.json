@@ -14,7 +14,7 @@
         "Module imports cleanly: `from openfcd.core.registration import scale_normalize_reference`",
         "Unit test verifies: synthetic test with 2 different-scale images produces normalized output with matching carrier periods within 3%"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-002",
@@ -28,7 +28,7 @@
         "scale_warning is logged (Python logging.warning) when scale deviation exceeds 10%",
         "AST parse of cmd_run.py and project.py succeeds after changes"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-003",
@@ -37,12 +37,12 @@
       "acceptanceCriteria": [
         "When flatfield_sigma_auto=True (default), effective sigma = max(H,W) * 0.06, clamped to [100, 2000]",
         "When flatfield_sigma_auto=False, uses process.flatfield_sigma as before",
-        "For 1280x1024 image: effective sigma ≈ 77 (clamped to 100)",
-        "For 5568x3712 image: effective sigma ≈ 334",
+        "For 1280x1024 image: effective sigma \u2248 77 (clamped to 100)",
+        "For 5568x3712 image: effective sigma \u2248 334",
         "ProjectModel schema parses both old and new projects (backwards compatible)",
         "AST parse succeeds on all modified files"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-004",
@@ -55,7 +55,7 @@
         "If mismatch <=10%: no warning shown, proceeds normally",
         "AST parse of mainwindow.py succeeds"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-005",
@@ -66,7 +66,7 @@
         "scale_normalize_reference on two 20Hz/s2 frames (same carrier period) returns ref unchanged (scale=1.0, deviation<3%)",
         "python -c 'from openfcd.cli.cmd_run import _compute_single_frame; print(\"ok\")' succeeds"
       ],
-      "passes": false
+      "passes": true
     }
   ]
 }

@@ -100,14 +100,14 @@
   "hotPaths": [
     {
       "path": "openfcd/gui/mainwindow.py",
-      "accessCount": 29,
-      "lastAccessed": 1776969743227,
+      "accessCount": 30,
+      "lastAccessed": 1776969810281,
       "type": "file"
     },
     {
       "path": "openfcd/cli/cmd_run.py",
-      "accessCount": 14,
-      "lastAccessed": 1776969705577,
+      "accessCount": 15,
+      "lastAccessed": 1776969809700,
       "type": "file"
     },
     {
@@ -135,15 +135,15 @@
       "type": "file"
     },
     {
-      "path": "openfcd/io/image.py",
-      "accessCount": 4,
-      "lastAccessed": 1776965428314,
+      "path": "openfcd/io/project.py",
+      "accessCount": 5,
+      "lastAccessed": 1776969809322,
       "type": "file"
     },
     {
-      "path": "openfcd/io/project.py",
+      "path": "openfcd/io/image.py",
       "accessCount": 4,
-      "lastAccessed": 1776969555483,
+      "lastAccessed": 1776965428314,
       "type": "file"
     },
     {
@@ -174,6 +174,18 @@
       "path": "openfcd/pipeline/compute.py",
       "accessCount": 2,
       "lastAccessed": 1776966484620,
+      "type": "file"
+    },
+    {
+      "path": "openfcd/core/registration.py",
+      "accessCount": 2,
+      "lastAccessed": 1776969807957,
+      "type": "file"
+    },
+    {
+      "path": "tests/unit/test_registration.py",
+      "accessCount": 2,
+      "lastAccessed": 1776969810226,
       "type": "file"
     },
     {
@@ -231,21 +243,9 @@
       "type": "file"
     },
     {
-      "path": "openfcd/core/registration.py",
-      "accessCount": 1,
-      "lastAccessed": 1776969554667,
-      "type": "file"
-    },
-    {
       "path": "openfcd/core/__init__.py",
       "accessCount": 1,
       "lastAccessed": 1776969587765,
-      "type": "file"
-    },
-    {
-      "path": "tests/unit/test_registration.py",
-      "accessCount": 1,
-      "lastAccessed": 1776969772587,
       "type": "file"
     }
   ],
