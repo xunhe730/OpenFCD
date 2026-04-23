@@ -22,6 +22,13 @@ class PolygonData(BaseModel):
     label: str = "body"
     visible: bool = True
 
+    @field_validator("vertices")
+    @classmethod
+    def _require_min_vertices(cls, v: list) -> list:
+        if len(v) < 3:
+            raise ValueError(f"A polygon needs at least 3 vertices, got {len(v)}")
+        return v
+
     @property
     def vertex_count(self) -> int:
         return len(self.vertices)

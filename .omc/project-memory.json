@@ -117,6 +117,18 @@
       "type": "file"
     },
     {
+      "path": "tests/unit/test_schema.py",
+      "accessCount": 7,
+      "lastAccessed": 1776969452380,
+      "type": "file"
+    },
+    {
+      "path": "openfcd/io/annotation.py",
+      "accessCount": 5,
+      "lastAccessed": 1776969421580,
+      "type": "file"
+    },
+    {
       "path": "openfcd/io/image.py",
       "accessCount": 4,
       "lastAccessed": 1776965428314,
@@ -141,6 +153,12 @@
       "type": "file"
     },
     {
+      "path": "openfcd/io/project.py",
+      "accessCount": 3,
+      "lastAccessed": 1776969331352,
+      "type": "file"
+    },
+    {
       "path": "CLAUDE.md",
       "accessCount": 2,
       "lastAccessed": 1776965095385,
@@ -156,12 +174,6 @@
       "path": "openfcd/pipeline/compute.py",
       "accessCount": 2,
       "lastAccessed": 1776966484620,
-      "type": "file"
-    },
-    {
-      "path": "openfcd/io/project.py",
-      "accessCount": 1,
-      "lastAccessed": 1776964993505,
       "type": "file"
     },
     {
@@ -186,12 +198,6 @@
       "path": "openfcd/pipeline/base.py",
       "accessCount": 1,
       "lastAccessed": 1776964999821,
-      "type": "file"
-    },
-    {
-      "path": "openfcd/io/annotation.py",
-      "accessCount": 1,
-      "lastAccessed": 1776965007810,
       "type": "file"
     },
     {

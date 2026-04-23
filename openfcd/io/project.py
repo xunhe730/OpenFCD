@@ -55,6 +55,8 @@ class TaperConfig(BaseModel):
 
 class ProcessConfig(BaseModel):
     flatfield_sigma: float = 300.0
+    flatfield_sigma_auto: bool = True
+    auto_scale_ref: bool = True
     detrend: Literal["plane", "none"] = "plane"
     taper: TaperConfig = Field(default_factory=TaperConfig)
     edge_nan_mm: float = 3.0

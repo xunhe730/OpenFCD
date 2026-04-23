@@ -37,7 +37,7 @@ def _make_annotation() -> AnnotationSchema:
         condition="20Hz_s2",
         frame_range="0001-0500",
         anchor_frame="Img0001.jpg",
-        manual_polygon=[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]],
+        polygons=[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]],
         roi={"x_mm": 140.0, "y_mm": 0.0},
         created="2026-04-22T00:00:00",
         note="test",
@@ -75,7 +75,7 @@ def test_annotation_roundtrip(tmp_path):
     assert loaded.condition == ann.condition
     assert loaded.frame_range == ann.frame_range
     assert loaded.anchor_frame == ann.anchor_frame
-    assert loaded.manual_polygon == ann.manual_polygon
+    assert loaded.polygons == ann.polygons
     assert loaded.roi == ann.roi
     assert loaded.created == ann.created
     assert loaded.note == ann.note
@@ -87,7 +87,7 @@ def test_annotation_anchor_frame_validation():
             condition="x",
             frame_range="0-1",
             anchor_frame="Img0001.png",
-            manual_polygon=[[0.0, 0.0]],
+            polygons=[[0.0, 0.0]],
             roi={},
             created="2026-04-22",
         )
@@ -102,7 +102,8 @@ def test_annotation_validate_ok(tmp_path):
 
 def test_annotation_validate_bad(tmp_path):
     bad = tmp_path / "bad.json"
-    bad.write_text("{}", encoding="utf-8")
+    # A polygon with only 1 vertex is invalid (minimum is 3)
+    bad.write_text('{"polygons": [{"vertices": [[0.0, 0.0]], "label": "body"}]}', encoding="utf-8")
     errs = validate(bad)
     assert len(errs) > 0
 
