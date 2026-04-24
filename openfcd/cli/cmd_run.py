@@ -653,6 +653,12 @@ def _compute_single_frame(
         weight = gaussian_filter(finite.astype(np.float32), sigma=hp_sigma)
         trend = gaussian_filter(filled, sigma=hp_sigma) / np.maximum(weight, 1e-6)
         eta_mm = np.where(finite, eta_mm - trend, np.nan)
+        # Near the valid-region boundary the Gaussian has truncated support and
+        # the trend estimate is unreliable, producing a coloured fringe.  NaN
+        # out a margin wider than the kernel reach (~1.5·σ) to hide it.
+        hp_margin = int(round(1.5 * hp_sigma))
+        if hp_margin > 0:
+            eta_mm[edge_margin_mask(eta_mm.shape, hp_margin)] = np.nan
 
     # Upsample back to original resolution if we downsampled earlier.
     if _original_shape is not None:
