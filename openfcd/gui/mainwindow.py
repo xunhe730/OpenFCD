@@ -291,6 +291,7 @@ class MainWindow(QMainWindow):
         self._preview.mask_completed.connect(self._on_mask_completed)
         self._preview.point_placed.connect(self._on_point_placed)
         self._properties.dilate_changed.connect(self._on_dilate_changed)
+        self._properties.highpass_sigma_changed.connect(self._on_highpass_sigma_changed)
 
     # ── Node routing ────────────────────────────────────────────────
     def _on_node_selected(self, key: str) -> None:
@@ -595,6 +596,10 @@ class MainWindow(QMainWindow):
         detrend_idx = panel._detrend.findText(proj.process.detrend)
         if detrend_idx >= 0:
             panel._detrend.setCurrentIndex(detrend_idx)
+
+        # Sync Image panel's highpass slider with project config
+        hp_sigma = getattr(proj.process, "highpass_sigma_px", 0.0)
+        self._properties.image_properties_panel.set_highpass_sigma(float(hp_sigma))
 
     def _ensure_optical_config_ready(self, *, interactive: bool) -> bool:
         """Repair legacy preset-backed stacks and reject empty custom stacks."""
@@ -977,7 +982,7 @@ class MainWindow(QMainWindow):
             ann = self._session.annotation
             ann.dilate_cells = value
             self._session.mark_dirty()
-            
+
             # Update preview if mask exists
             if self._current_frame_idx >= 0:
                 fpath = self._frames[self._current_frame_idx]
@@ -986,6 +991,16 @@ class MainWindow(QMainWindow):
                     if polys and polys[0].vertices:
                         dilate_px = value * ann.cell_mm * 7.27
                         self._preview.show_mask(polys[0].vertices, dilate_px=dilate_px)
+
+    def _on_highpass_sigma_changed(self, value: float) -> None:
+        """Live-update project.process.highpass_sigma_px from the slider.
+
+        Value is applied on the next Compute This Frame — the user tweaks the
+        slider, clicks compute, and sees the effect immediately.
+        """
+        if self._session.has_project:
+            self._session.project.process.highpass_sigma_px = float(value)
+            self._session.mark_dirty()
 
     def _on_point_placed(self, idx: int, row: int, col: int) -> None:
         """A single annotation point was placed — update status bar."""

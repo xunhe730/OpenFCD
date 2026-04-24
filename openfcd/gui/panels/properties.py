@@ -228,6 +228,7 @@ class ImagePropertiesPanel(QWidget):
     draw_mask_clicked = pyqtSignal()
     clear_clicked = pyqtSignal()
     dilate_changed = pyqtSignal(float)
+    highpass_sigma_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -318,6 +319,53 @@ class ImagePropertiesPanel(QWidget):
         g_mask.content_layout.addWidget(dilate_row)
         layout.addWidget(g_mask)
 
+        # ── Debug / tuning ──
+        g_tune = PropGroup("Compute Tuning (single-frame debug)")
+        hint = QLabel("Drift cutoff below shortest physical wavelength;\n"
+                      "0 disables. Try 200–500 for cross-session refs.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"font-size: 11px; color: {tokens.TEXT_SECONDARY}; padding: 0 0 4px 0;")
+        g_tune.content_layout.addWidget(hint)
+
+        hp_row = QWidget()
+        hp_layout = QHBoxLayout(hp_row)
+        hp_layout.setContentsMargins(0, 3, 0, 3)
+        hp_layout.setSpacing(8)
+        hp_lbl = QLabel("Highpass σ (px)")
+        hp_lbl.setFixedWidth(110)
+        hp_lbl.setStyleSheet(f"font-size: 11.5px; color: {tokens.TEXT_SECONDARY};")
+        hp_layout.addWidget(hp_lbl)
+
+        self._hp_slider = QSlider(Qt.Orientation.Horizontal)
+        self._hp_slider.setRange(0, 1000)
+        self._hp_slider.setSingleStep(10)
+        self._hp_slider.setPageStep(50)
+        self._hp_slider.setValue(0)
+        hp_layout.addWidget(self._hp_slider, 1)
+
+        self._hp_spin = QSpinBox()
+        self._hp_spin.setRange(0, 2000)
+        self._hp_spin.setSingleStep(10)
+        self._hp_spin.setFixedWidth(64)
+        self._hp_spin.setFixedHeight(24)
+        self._hp_spin.setStyleSheet(f"""
+            QSpinBox {{
+                background: {tokens.BG_TERTIARY};
+                border: 1px solid {tokens.BORDER_SUBTLE};
+                border-radius: 4px;
+                padding: 2px 4px;
+                color: {tokens.TEXT_PRIMARY};
+                font-size: 11.5px;
+            }}
+        """)
+        hp_layout.addWidget(self._hp_spin)
+
+        self._hp_syncing = False
+        self._hp_slider.valueChanged.connect(self._on_hp_slider)
+        self._hp_spin.valueChanged.connect(self._on_hp_spin)
+        g_tune.content_layout.addWidget(hp_row)
+        layout.addWidget(g_tune)
+
         # ── Compute actions ──
         g2 = PropGroup("Actions")
         self._btn_ref = _action_button("Set as Reference", icon=get_icon(ICON_STAR))
@@ -329,6 +377,32 @@ class ImagePropertiesPanel(QWidget):
         layout.addWidget(g2)
 
         layout.addStretch()
+
+    def _on_hp_slider(self, v: int) -> None:
+        if self._hp_syncing:
+            return
+        self._hp_syncing = True
+        self._hp_spin.setValue(v)
+        self._hp_syncing = False
+        self.highpass_sigma_changed.emit(float(v))
+
+    def _on_hp_spin(self, v: int) -> None:
+        if self._hp_syncing:
+            return
+        self._hp_syncing = True
+        clamped = min(max(v, 0), self._hp_slider.maximum())
+        self._hp_slider.setValue(clamped)
+        self._hp_syncing = False
+        self.highpass_sigma_changed.emit(float(v))
+
+    def set_highpass_sigma(self, v: float) -> None:
+        self._hp_syncing = True
+        self._hp_spin.setValue(int(round(v)))
+        self._hp_slider.setValue(min(max(int(round(v)), 0), self._hp_slider.maximum()))
+        self._hp_syncing = False
+
+    def highpass_sigma(self) -> float:
+        return float(self._hp_spin.value())
 
     def set_frame_info(self, name: str, size: str, index: int, total: int) -> None:
         self._name_input.setText(name)
@@ -526,6 +600,7 @@ class PropertiesPanel(QStackedWidget):
     draw_mask_clicked = pyqtSignal()
     clear_annotation_clicked = pyqtSignal()
     dilate_changed = pyqtSignal(float)
+    highpass_sigma_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -556,7 +631,8 @@ class PropertiesPanel(QStackedWidget):
         self._image_properties.draw_mask_clicked.connect(self.draw_mask_clicked)
         self._image_properties.clear_clicked.connect(self.clear_annotation_clicked)
         self._image_properties.dilate_changed.connect(self.dilate_changed)
-        
+        self._image_properties.highpass_sigma_changed.connect(self.highpass_sigma_changed)
+
         self._compute.run_all_clicked.connect(self.run_all_clicked)
 
         tokens.on_theme_changed(self._apply_theme)
