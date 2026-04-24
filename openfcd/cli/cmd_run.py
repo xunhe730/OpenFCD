@@ -538,9 +538,17 @@ def _compute_single_frame(
     carriers0 = calculate_carriers(ref_ff - ref_ff.mean())
 
     # Scale normalization: rescale ref to match def's carrier period when they differ.
+    # For scale < 1 the function returns a *smaller* ref and the crop coordinates
+    # of def that correspond to it — we must crop def to avoid carrier leakage in
+    # the FCD border region (unpaired def carrier → checkerboard through integration).
     if getattr(project.process, "auto_scale_ref", True):
         from openfcd.core.registration import scale_normalize_reference
-        ref_ff, carriers0, _scale = scale_normalize_reference(ref_ff, def_ff, carriers0)
+        ref_ff, carriers0, _scale, _valid_crop = scale_normalize_reference(ref_ff, def_ff, carriers0)
+        if _valid_crop is not None:
+            r0v, c0v, hv, wv = _valid_crop
+            def_ff = def_ff[r0v:r0v + hv, c0v:c0v + wv]
+            if robot_poly is not None:
+                robot_poly = robot_poly.shifted(-r0v, -c0v)
 
     filament_mask = detect_filament_occluders(def_ff, carriers0)
 

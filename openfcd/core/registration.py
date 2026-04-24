@@ -34,7 +34,7 @@ def scale_normalize_reference(
     carriers_ref: list[Carrier],
     *,
     tolerance: float = _SCALE_TOLERANCE,
-) -> tuple[np.ndarray, list[Carrier], float]:
+) -> tuple[np.ndarray, list[Carrier], float, tuple[int, int, int, int] | None]:
     """Rescale *ref_ff* so its carrier period matches *def_ff*.
 
     Parameters
@@ -52,10 +52,16 @@ def scale_normalize_reference(
     -------
     aligned_ref_ff:
         Rescaled reference (or the original if no correction was needed).
+        When scale < 1 this image is *smaller* than the input — see *valid_crop*.
     aligned_carriers:
         Carriers recomputed on *aligned_ref_ff* (or *carriers_ref* if unchanged).
     scale:
         Applied scale factor (``period_def / period_ref``).  1.0 means no change.
+    valid_crop:
+        ``(r0, c0, h, w)`` slice of *def_ff* that spatially corresponds to
+        *aligned_ref_ff* when scale < 1.  The caller should crop *def_ff* to
+        ``def_ff[r0:r0+h, c0:c0+w]`` before running FCD.  ``None`` when the
+        full images are used (scale ≥ 1 or no correction applied).
     """
     from openfcd.core.fcd import calculate_carriers
     from scipy.ndimage import zoom
@@ -65,13 +71,13 @@ def scale_normalize_reference(
         carriers_def = calculate_carriers(def_ff - def_ff.mean())
     except RuntimeError:
         log.debug("scale_normalize_reference: carrier detection failed on def — skipping")
-        return ref_ff, carriers_ref, 1.0
+        return ref_ff, carriers_ref, 1.0, None
 
     period_ref = _mean_carrier_period_px(carriers_ref)
     period_def = _mean_carrier_period_px(carriers_def)
 
     if period_ref <= 0 or period_def <= 0:
-        return ref_ff, carriers_ref, 1.0
+        return ref_ff, carriers_ref, 1.0, None
 
     scale = period_def / period_ref
     deviation = abs(scale - 1.0)
@@ -81,7 +87,7 @@ def scale_normalize_reference(
             "scale_normalize_reference: scale=%.4f within tolerance — no correction",
             scale,
         )
-        return ref_ff, carriers_ref, scale
+        return ref_ff, carriers_ref, scale, None
 
     if deviation >= _SCALE_WARN_THRESHOLD:
         log.warning(
@@ -105,18 +111,19 @@ def scale_normalize_reference(
     ref_zoomed = zoom(ref_ff, scale, order=1)
     hz, wz = ref_zoomed.shape
 
-    # Crop or pad the zoomed reference to the original image dimensions.
     if scale > 1.0:
-        # Zoomed image is larger — take the centre crop
+        # Zoomed image is larger — take the centre crop; full image remains valid.
         r0 = (hz - h) // 2
         c0 = (wz - w) // 2
         ref_aligned = ref_zoomed[r0: r0 + h, c0: c0 + w]
+        carriers_aligned = calculate_carriers(ref_aligned - ref_aligned.mean())
+        return ref_aligned, carriers_aligned, scale, None
     else:
-        # Zoomed image is smaller — embed in a full-size array, fill with edge mean
-        ref_aligned = np.full((h, w), ref_zoomed.mean(), dtype=ref_zoomed.dtype)
+        # Zoomed image is smaller. Return it as-is (no padding) and tell the
+        # caller which centre slice of def_ff corresponds to this ref.
+        # Padding with a constant would leave def's carrier unpaired in the
+        # border region, causing checkerboard leakage through FCD integration.
         r0 = (h - hz) // 2
         c0 = (w - wz) // 2
-        ref_aligned[r0: r0 + hz, c0: c0 + wz] = ref_zoomed
-
-    carriers_aligned = calculate_carriers(ref_aligned - ref_aligned.mean())
-    return ref_aligned, carriers_aligned, scale
+        carriers_aligned = calculate_carriers(ref_zoomed - ref_zoomed.mean())
+        return ref_zoomed, carriers_aligned, scale, (r0, c0, hz, wz)
