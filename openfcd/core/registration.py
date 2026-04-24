@@ -17,7 +17,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_SCALE_TOLERANCE = 0.03   # < 3 % → no correction
+_SCALE_TOLERANCE = 0.005  # < 0.5 % → no correction (empirical:
+                          #  a 2 % mismatch already randomises FCD phase;
+                          #  zoom + carrier-recompute cost is negligible,
+                          #  so prefer aggressive normalisation.)
 _SCALE_WARN_THRESHOLD = 0.10  # ≥ 10 % → emit warning
 
 
