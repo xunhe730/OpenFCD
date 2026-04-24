@@ -30,7 +30,7 @@ env/
 
 # OpenFCD runtime / local state
 *.ofcd/autosave/
-*.ofcd/runs/*/results.h5
+*.ofcd/runs/
 reference_built.npy
 
 # Claude Code / OMC local orchestration
@@ -45,3 +45,4 @@ test_crash*.py
 progress.txt
 scratch/
 tmp/
+tests/scratch/
