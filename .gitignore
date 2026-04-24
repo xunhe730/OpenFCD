@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+._*
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# OpenFCD runtime / local state
+*.ofcd/autosave/
+*.ofcd/runs/*/results.h5
+reference_built.npy
+
+# Claude Code / OMC local orchestration
+.omc/
+.claude/
+.omx/
+.sisyphus/
+.code-review-graph/
+
+# Local scratch
+test_crash*.py
+progress.txt
+scratch/
+tmp/

@@ -32,11 +32,14 @@ def _can_import_core() -> bool:
 _CORE_READY = _can_import_core()
 _SKIP_REASON = "openfcd.core not implemented (T2 pending)"
 
-# Paths (verified to exist in the BOS tree)
-_BOS_ROOT = pathlib.Path("/Volumes/ZXD_PKU/MAC_mini/Research/XJ-robot/BOS")
-_BATCH_DIR = (
-    _BOS_ROOT / "output" / "20hz_s2" / "batch_2000606-2000746"
-)
+# Paths — set OPENFCD_BOS_ROOT to enable golden tests; skipped otherwise.
+import os as _os
+_BOS_ROOT_STR = _os.environ.get("OPENFCD_BOS_ROOT")
+if _BOS_ROOT_STR is None:
+    import pytest as _pt
+    _pt.skip("OPENFCD_BOS_ROOT not set", allow_module_level=True)
+_BOS_ROOT = pathlib.Path(_BOS_ROOT_STR)
+_BATCH_DIR = _BOS_ROOT / "output" / "20hz_s2" / "batch_2000606-2000746"
 _FRAMES_DIR = _BATCH_DIR / "frames"
 _DATA_DIR = _BOS_ROOT / "DATA" / "20Hz" / "s2"
 _REF_IMAGE = _BOS_ROOT / "DATA" / "_ref_20hz_s2.jpg"

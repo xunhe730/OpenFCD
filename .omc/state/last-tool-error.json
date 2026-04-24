@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"git stash && python -m pytest tests/unit/test_schema.py::test_annotation_roundtrip -q --tb=line 2>&1 | tail -5; git stash pop\",\"description\":\"Check if test failure pre-exists before our ch...",
-  "error": "Exit code 1\nSaved working directory and index state WIP on feat/fcd-scale-registration: dacf450 feat: initial commit — OpenFCD v0.0.1 snapshot\nE   AttributeError: 'AnnotationSchema' object has no attribute 'manual_polygon'\n/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/site-packages/pydantic/main.py:1026: AttributeError: 'AnnotationSchema' object has no attribute 'manual_polygon'\n=========================== short test summary info ============================\nFAILED tests/unit/test_schema....",
-  "timestamp": "2026-04-23T18:34:01.652Z",
-  "retry_count": 1
-}
