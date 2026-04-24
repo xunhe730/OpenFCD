@@ -60,6 +60,11 @@ class ProcessConfig(BaseModel):
     detrend: Literal["plane", "none"] = "plane"
     taper: TaperConfig = Field(default_factory=TaperConfig)
     edge_nan_mm: float = 3.0
+    # High-pass cutoff in pixels. When > 0, features with spatial scale larger
+    # than ~sigma px are subtracted from the final η field, killing low-frequency
+    # drift caused by ref/def illumination or pattern-position mismatch.  Keep
+    # below the shortest physical wavelength of interest; 0 disables the step.
+    highpass_sigma_px: float = 0.0
 
 
 class ProfileConfig(BaseModel):

@@ -641,6 +641,19 @@ def _compute_single_frame(
             low_signal_mask=occlusion_mask,
         )
 
+    # Optional spatial high-pass: remove large-scale drift (non-physical waves
+    # from ref/def mismatch) while preserving short-wavelength surface waves.
+    hp_sigma = float(getattr(project.process, "highpass_sigma_px", 0.0))
+    if hp_sigma > 0.0:
+        _report(93, "Highpass")
+        from scipy.ndimage import gaussian_filter
+        finite = np.isfinite(eta_mm)
+        filled = np.where(finite, eta_mm, 0.0)
+        # Normalize by the filtered validity mask so NaN gaps don't bleed into the trend
+        weight = gaussian_filter(finite.astype(np.float32), sigma=hp_sigma)
+        trend = gaussian_filter(filled, sigma=hp_sigma) / np.maximum(weight, 1e-6)
+        eta_mm = np.where(finite, eta_mm - trend, np.nan)
+
     # Upsample back to original resolution if we downsampled earlier.
     if _original_shape is not None:
         _report(97, "Upsample")
