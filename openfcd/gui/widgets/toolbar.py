@@ -259,7 +259,7 @@ class Toolbar(QWidget):
                 "font-family:" + tokens.FONT_UI + ";border:none;"
             )
             self._running_label.setVisible(True)
-            self._running_label.setText("● running · " + elapsed)
+            self._running_label.setText("● running" + (f" · {elapsed}" if elapsed else ""))
         else:
             self._btn_cancel.set_muted(True)
             self._btn_cancel.setStyleSheet("")

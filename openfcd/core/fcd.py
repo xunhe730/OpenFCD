@@ -16,6 +16,38 @@ from skimage.draw import disk
 from skimage.measure import label, regionprops
 
 
+def periodic_smooth_decompose(u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Moisan (2011) periodic + smooth image decomposition.
+
+    Decomposes u = periodic + smooth where the periodic component has
+    exactly matching values on opposite edges, eliminating the discontinuity
+    jump that causes Gibbs ringing in FFT-based gradient integration.
+
+    Reference: Moisan (2011) J. Math. Imaging Vision 39(2), 161-179.
+    """
+    from numpy.fft import rfft2, irfft2, fftfreq as _fftfreq
+    H, W = u.shape
+    u64 = np.asarray(u, dtype=np.float64)
+
+    v = np.zeros_like(u64)
+    v[0, :]  -= u64[-1, :] - u64[0, :]
+    v[-1, :] += u64[-1, :] - u64[0, :]
+    v[:, 0]  -= u64[:, -1] - u64[:, 0]
+    v[:, -1] += u64[:, -1] - u64[:, 0]
+
+    V = rfft2(v)
+    ky = (2 * np.pi * _fftfreq(H))[:, None]
+    kx = 2 * np.pi * np.arange(W // 2 + 1) / W
+    denom = 2 * np.cos(ky) + 2 * np.cos(kx) - 4.0
+    denom[0, 0] = 1.0
+    S = V / denom
+    S[0, 0] = 0.0
+    smooth = irfft2(S, s=(H, W))
+    periodic = u64 - smooth
+    dtype = u.dtype if np.issubdtype(u.dtype, np.floating) else np.float64
+    return periodic.astype(dtype, copy=False), smooth.astype(dtype, copy=False)
+
+
 @functools.lru_cache(maxsize=8)
 def _kspace_axes(shape: tuple) -> tuple:
     return (fftshift(fftfreq(shape[0], 1 / (2.0 * np.pi))),

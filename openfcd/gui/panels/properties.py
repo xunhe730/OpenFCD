@@ -229,6 +229,8 @@ class ImagePropertiesPanel(QWidget):
     clear_clicked = pyqtSignal()
     dilate_changed = pyqtSignal(float)
     highpass_sigma_changed = pyqtSignal(float)
+    taper_alpha_changed = pyqtSignal(float)
+    edge_nan_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -364,6 +366,47 @@ class ImagePropertiesPanel(QWidget):
         self._hp_slider.valueChanged.connect(self._on_hp_slider)
         self._hp_spin.valueChanged.connect(self._on_hp_spin)
         g_tune.content_layout.addWidget(hp_row)
+
+        # Taper alpha (0 → Moisan periodic BC, >0 → cosine taper)
+        self._taper_alpha_spin = QDoubleSpinBox()
+        self._taper_alpha_spin.setRange(0.0, 0.5)
+        self._taper_alpha_spin.setSingleStep(0.01)
+        self._taper_alpha_spin.setDecimals(3)
+        self._taper_alpha_spin.setFixedHeight(24)
+        self._taper_alpha_spin.setToolTip(
+            "0 = Moisan periodic boundary (preserves edges)\n"
+            ">0 = cosine taper (zeros edges; 0.08 typical)"
+        )
+        self._taper_alpha_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background: {tokens.BG_TERTIARY}; "
+            f"border: 1px solid {tokens.BORDER_SUBTLE}; border-radius: 4px; "
+            f"padding: 2px 4px; color: {tokens.TEXT_PRIMARY}; font-size: 11.5px; }}"
+        )
+        self._taper_alpha_spin.valueChanged.connect(
+            lambda v: self.taper_alpha_changed.emit(float(v))
+        )
+        g_tune.add_row("Taper α", self._taper_alpha_spin)
+
+        # Edge NaN margin (mm)
+        self._edge_nan_spin = QDoubleSpinBox()
+        self._edge_nan_spin.setRange(0.0, 50.0)
+        self._edge_nan_spin.setSingleStep(0.5)
+        self._edge_nan_spin.setDecimals(1)
+        self._edge_nan_spin.setValue(3.0)
+        self._edge_nan_spin.setFixedHeight(24)
+        self._edge_nan_spin.setToolTip(
+            "Physical margin (mm) NaN'd around the ROI edge after FCD"
+        )
+        self._edge_nan_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background: {tokens.BG_TERTIARY}; "
+            f"border: 1px solid {tokens.BORDER_SUBTLE}; border-radius: 4px; "
+            f"padding: 2px 4px; color: {tokens.TEXT_PRIMARY}; font-size: 11.5px; }}"
+        )
+        self._edge_nan_spin.valueChanged.connect(
+            lambda v: self.edge_nan_changed.emit(float(v))
+        )
+        g_tune.add_row("Edge NaN mm", self._edge_nan_spin)
+
         layout.addWidget(g_tune)
 
         # ── Compute actions ──
@@ -403,6 +446,22 @@ class ImagePropertiesPanel(QWidget):
 
     def highpass_sigma(self) -> float:
         return float(self._hp_spin.value())
+
+    def set_taper_alpha(self, v: float) -> None:
+        self._taper_alpha_spin.blockSignals(True)
+        self._taper_alpha_spin.setValue(float(v))
+        self._taper_alpha_spin.blockSignals(False)
+
+    def taper_alpha(self) -> float:
+        return float(self._taper_alpha_spin.value())
+
+    def set_edge_nan_mm(self, v: float) -> None:
+        self._edge_nan_spin.blockSignals(True)
+        self._edge_nan_spin.setValue(float(v))
+        self._edge_nan_spin.blockSignals(False)
+
+    def edge_nan_mm(self) -> float:
+        return float(self._edge_nan_spin.value())
 
     def set_frame_info(self, name: str, size: str, index: int, total: int) -> None:
         self._name_input.setText(name)
@@ -601,6 +660,8 @@ class PropertiesPanel(QStackedWidget):
     clear_annotation_clicked = pyqtSignal()
     dilate_changed = pyqtSignal(float)
     highpass_sigma_changed = pyqtSignal(float)
+    taper_alpha_changed = pyqtSignal(float)
+    edge_nan_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -632,6 +693,8 @@ class PropertiesPanel(QStackedWidget):
         self._image_properties.clear_clicked.connect(self.clear_annotation_clicked)
         self._image_properties.dilate_changed.connect(self.dilate_changed)
         self._image_properties.highpass_sigma_changed.connect(self.highpass_sigma_changed)
+        self._image_properties.taper_alpha_changed.connect(self.taper_alpha_changed)
+        self._image_properties.edge_nan_changed.connect(self.edge_nan_changed)
 
         self._compute.run_all_clicked.connect(self.run_all_clicked)
 

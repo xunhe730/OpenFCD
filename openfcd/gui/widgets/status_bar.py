@@ -12,7 +12,7 @@ class StatusBar(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setFixedHeight(22)
+        self.setFixedHeight(30)
         self._items: list[str] = []
         self._labels: list[QLabel] = []
         self._setup_ui()
@@ -30,13 +30,14 @@ class StatusBar(QWidget):
             QProgressBar {{
                 background: {tokens.BG_TERTIARY};
                 border: none;
-                border-radius: 3px;
-                height: 6px;
-                max-height: 6px;
+                border-radius: 4px;
+                color: {tokens.TEXT_PRIMARY};
+                font-size: 10.5px;
+                text-align: center;
             }}
             QProgressBar::chunk {{
                 background: {tokens.ACCENT_CLAY};
-                border-radius: 3px;
+                border-radius: 4px;
             }}
         """)
         # re-apply items to trigger label styling rebuild
@@ -54,11 +55,12 @@ class StatusBar(QWidget):
         
         self._layout.addStretch()
 
-        # Progress bar (hidden by default)
+        # Progress bar (hidden by default) — prominent enough to notice during long runs
         self._progress = QProgressBar()
-        self._progress.setFixedWidth(160)
-        self._progress.setFixedHeight(6)
-        self._progress.setTextVisible(False)
+        self._progress.setFixedWidth(240)
+        self._progress.setFixedHeight(16)
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("%p%")
         self._progress.setVisible(False)
         self._layout.addWidget(self._progress)
 

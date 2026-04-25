@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from enum import Enum, auto
 from pathlib import Path
+import io
 import math
 
 import numpy as np
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QGraphicsPixmapItem, QSlider, QLabel, QHBoxLayout,
     QGraphicsEllipseItem, QGraphicsLineItem,
     QGraphicsRectItem, QGraphicsPolygonItem, QGraphicsPathItem,
+    QCheckBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt6.QtGui import (
@@ -87,6 +89,10 @@ class _ImageView(QGraphicsView):
         self._pan_start = QPointF()
         self._eta_overlay_item: QGraphicsPixmapItem | None = None
         self._eta_overlay_array: np.ndarray | None = None
+        self._eta_array: np.ndarray | None = None
+        self._eta_cmap: str = "RdBu_r"
+        self._eta_opacity: float = 0.55
+        self._overlap_on: bool = True
 
         # Crosshair
         self.crosshair_enabled = False
@@ -116,6 +122,7 @@ class _ImageView(QGraphicsView):
         self._pixmap_item = None
         self._eta_overlay_item = None
         self._eta_overlay_array = None
+        self._eta_array = None
         self._roi_rect = None
         if hasattr(self, '_roi_mask_item'): self._roi_mask_item = None
         self._mask_poly = None
@@ -205,6 +212,9 @@ class _ImageView(QGraphicsView):
         except RuntimeError: pass
         self._eta_overlay_item = None
         self._eta_overlay_array = None
+        self._eta_array = None
+        if self._pixmap_item:
+            self._pixmap_item.setVisible(True)
 
         try:
             if self._roi_rect and self._roi_rect.scene():
@@ -238,51 +248,75 @@ class _ImageView(QGraphicsView):
         *,
         opacity: float = 0.55,
         cmap_name: str = "RdBu_r",
-    ) -> None:
-        """Render a semi-transparent eta heatmap directly over the current image."""
+    ) -> tuple[float, float] | None:
+        """Store eta array and render the heatmap overlay; returns (vmin, vmax) or None."""
         if self._pixmap_item is None or self._qimage is None:
-            return
+            return None
         if cm is None:
-            return
-
+            return None
         arr = np.asarray(eta_mm, dtype=np.float64)
         if arr.ndim != 2:
-            return
+            return None
+        self._eta_array = arr
+        self._eta_cmap = cmap_name
+        self._eta_opacity = opacity
+        self._eta_overlay_array = arr
+        return self._draw_eta()
 
+    def _draw_eta(self) -> tuple[float, float] | None:
+        """Re-render the eta overlay using current _overlap_on / _eta_array state."""
+        if self._eta_array is None or self._pixmap_item is None:
+            return None
+        if cm is None:
+            return None
+
+        arr = self._eta_array
         try:
             if self._eta_overlay_item and self._eta_overlay_item.scene():
                 self._scene.removeItem(self._eta_overlay_item)
         except RuntimeError:
             pass
+        self._eta_overlay_item = None
 
         valid = np.isfinite(arr)
-        if not valid.any():
-            self._eta_overlay_item = None
-            self._eta_overlay_array = arr
-            return
+        if self._pixmap_item:
+            self._pixmap_item.setVisible(self._overlap_on)
 
-        vmin = float(np.nanpercentile(arr, 2))
-        vmax = float(np.nanpercentile(arr, 98))
+        if not valid.any():
+            return None
+
+        vmin = float(np.nanpercentile(arr, 5))
+        vmax = float(np.nanpercentile(arr, 95))
         if abs(vmax - vmin) < 1e-12:
             vmax = vmin + 1e-12
 
         norm = np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
-        rgba = cm.get_cmap(cmap_name)(norm)
-        rgba[..., 3] = np.where(valid, opacity, 0.0)
-        rgba_u8 = np.ascontiguousarray(np.round(rgba * 255).astype(np.uint8))
+        rgba = cm.get_cmap(self._eta_cmap)(norm)
 
+        if self._overlap_on:
+            rgba[..., 3] = np.where(valid, self._eta_opacity, 0.0)
+        else:
+            # Standalone mode: full opacity, theme background for NaN
+            from openfcd.gui import tokens as _tok
+            _h = _tok.BG_PRIMARY.lstrip('#')
+            _r, _g, _b = int(_h[0:2], 16) / 255.0, int(_h[2:4], 16) / 255.0, int(_h[4:6], 16) / 255.0
+            rgba[..., 3] = 1.0
+            rgba[~valid, :3] = [_r, _g, _b]
+
+        rgba_u8 = np.ascontiguousarray(np.round(rgba * 255).astype(np.uint8))
         h, w = rgba_u8.shape[:2]
         qimg = QImage(
-            rgba_u8.data,
-            w,
-            h,
-            rgba_u8.strides[0],
-            QImage.Format.Format_RGBA8888,
+            rgba_u8.data, w, h, rgba_u8.strides[0], QImage.Format.Format_RGBA8888
         ).copy()
         pixmap = QPixmap.fromImage(qimg)
         self._eta_overlay_item = self._scene.addPixmap(pixmap)
         self._eta_overlay_item.setZValue(6)
-        self._eta_overlay_array = arr
+        return vmin, vmax
+
+    def set_overlap(self, val: bool) -> tuple[float, float] | None:
+        """Toggle overlap mode and re-render; returns (vmin, vmax) or None."""
+        self._overlap_on = val
+        return self._draw_eta()
 
     # ── Display existing annotation ────────────────────────────────
     def show_roi(self, row0: int, col0: int, h: int, w: int) -> None:
@@ -609,10 +643,12 @@ class PreviewWidget(QWidget):
     roi_completed = pyqtSignal(int, int, int, int)
     mask_completed = pyqtSignal(list, list)
     point_placed = pyqtSignal(int, int, int)
+    preview_mode_changed = pyqtSignal(bool)  # True=per-frame eta, False=mean eta
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._frame_count = 0
+        self._eta_state: dict | None = None
         self._setup_ui()
         tokens.on_theme_changed(self._apply_theme)
         self._apply_theme()
@@ -622,6 +658,40 @@ class PreviewWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # ── Display controls (shown only when eta is active) ─────────
+        self._display_bar = QWidget()
+        db = QHBoxLayout(self._display_bar)
+        db.setContentsMargins(10, 3, 10, 3)
+        db.setSpacing(18)
+
+        self._overlap_cb = QCheckBox("Overlap")
+        self._overlap_cb.setChecked(True)
+        self._overlap_cb.toggled.connect(self._on_overlap_toggled)
+        db.addWidget(self._overlap_cb)
+
+        self._colorbar_cb = QCheckBox("Colorbar")
+        self._colorbar_cb.setChecked(False)
+        self._colorbar_cb.toggled.connect(self._on_colorbar_toggled)
+        db.addWidget(self._colorbar_cb)
+
+        # Per-frame preview toggle (relevant only after Run; instant toggle
+        # between showing each frame's η and the aggregate eta_mean)
+        self._preview_cb = QCheckBox("Preview")
+        self._preview_cb.setChecked(True)
+        self._preview_cb.setToolTip(
+            "ON: show this frame's η from the last Run\n"
+            "OFF: show the aggregate eta_mean across all frames\n"
+            "(toggle is instant — no recomputation)"
+        )
+        self._preview_cb.toggled.connect(self.preview_mode_changed)
+        self._preview_cb.setVisible(False)  # hidden until a Run completes
+        db.addWidget(self._preview_cb)
+
+        db.addStretch()
+        self._display_bar.setVisible(False)
+        layout.addWidget(self._display_bar)
+
+        # ── Image view ───────────────────────────────────────────────
         self._view = _ImageView(self)
         self._view.pixel_hovered.connect(self.pixel_hovered)
         self._view.roi_completed.connect(self.roi_completed)
@@ -629,7 +699,15 @@ class PreviewWidget(QWidget):
         self._view.point_placed.connect(self.point_placed)
         layout.addWidget(self._view, 1)
 
-        # Frame slider bar
+        # ── Colorbar strip ───────────────────────────────────────────
+        self._colorbar_label = QLabel()
+        self._colorbar_label.setFixedHeight(52)
+        self._colorbar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._colorbar_label.setScaledContents(False)
+        self._colorbar_label.setVisible(False)
+        layout.addWidget(self._colorbar_label)
+
+        # ── Frame slider bar ─────────────────────────────────────────
         self._slider_bar = QWidget()
         sl = QHBoxLayout(self._slider_bar)
         sl.setContentsMargins(8, 2, 8, 2)
@@ -654,6 +732,12 @@ class PreviewWidget(QWidget):
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(f"background: {tokens.BG_PRIMARY};")
+        self._display_bar.setStyleSheet(
+            f"background: {tokens.BG_SECONDARY}; border-bottom: 1px solid {tokens.BORDER_SUBTLE};"
+        )
+        for cb in (self._overlap_cb, self._colorbar_cb):
+            cb.setStyleSheet(f"font-size: 11px; color: {tokens.TEXT_PRIMARY};")
+        self._colorbar_label.setStyleSheet(f"background: {tokens.BG_SECONDARY};")
         self._slider_bar.setStyleSheet(
             f"background: {tokens.BG_SECONDARY}; border-top: 1px solid {tokens.BORDER_SUBTLE};"
         )
@@ -707,10 +791,88 @@ class PreviewWidget(QWidget):
         opacity: float = 0.55,
         cmap_name: str = "RdBu_r",
     ) -> None:
-        self._view.show_eta_overlay(eta_mm, opacity=opacity, cmap_name=cmap_name)
+        result = self._view.show_eta_overlay(eta_mm, opacity=opacity, cmap_name=cmap_name)
+        self._display_bar.setVisible(True)
+        if result is not None:
+            vmin, vmax = result
+            self._eta_state = {"vmin": vmin, "vmax": vmax, "cmap_name": cmap_name}
+            if self._colorbar_cb.isChecked():
+                self._render_colorbar(vmin, vmax, cmap_name)
+                self._colorbar_label.setVisible(True)
 
     def clear_overlays(self) -> None:
         self._view.clear_overlays()
+        self._eta_state = None
+        self._display_bar.setVisible(False)
+        self._colorbar_label.setVisible(False)
+        self._colorbar_label.clear()
+
+    def _on_overlap_toggled(self, val: bool) -> None:
+        self._view.set_overlap(val)
+
+    def _on_colorbar_toggled(self, val: bool) -> None:
+        if val and self._eta_state:
+            self._render_colorbar(
+                self._eta_state["vmin"],
+                self._eta_state["vmax"],
+                self._eta_state["cmap_name"],
+            )
+            self._colorbar_label.setVisible(True)
+        else:
+            self._colorbar_label.setVisible(False)
+
+    def _render_colorbar(self, vmin: float, vmax: float, cmap_name: str) -> None:
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.cm import ScalarMappable
+            from matplotlib.colors import Normalize
+
+            from openfcd.gui import tokens as _tok
+            bg_hex = _tok.BG_SECONDARY
+            fg_hex = _tok.TEXT_SECONDARY
+
+            fig = Figure(figsize=(6, 0.52), dpi=100)
+            fig.patch.set_facecolor(bg_hex)
+            ax = fig.add_axes([0.03, 0.38, 0.94, 0.32])
+            ax.set_facecolor(bg_hex)
+            sm = ScalarMappable(cmap=cmap_name, norm=Normalize(vmin=vmin, vmax=vmax))
+            sm.set_array([])
+            cb = fig.colorbar(sm, cax=ax, orientation="horizontal")
+            cb.set_label("η (mm)", color=fg_hex, fontsize=8)
+            ax.tick_params(labelsize=7, colors=fg_hex)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(fg_hex)
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), dpi=100)
+            buf.seek(0)
+            qimg = QImage()
+            qimg.loadFromData(buf.read())
+            pixmap = QPixmap.fromImage(qimg)
+            label_w = self._colorbar_label.width() or 600
+            self._colorbar_label.setPixmap(
+                pixmap.scaledToWidth(label_w, Qt.TransformationMode.SmoothTransformation)
+            )
+        except Exception:
+            pass
+
+    def set_overlap(self, val: bool) -> None:
+        self._overlap_cb.setChecked(val)
+
+    def set_colorbar(self, val: bool) -> None:
+        self._colorbar_cb.setChecked(val)
+
+    def set_preview_toggle_visible(self, visible: bool) -> None:
+        """Show/hide the per-frame preview toggle (shown after a Run completes)."""
+        self._preview_cb.setVisible(visible)
+
+    def set_preview_mode(self, enabled: bool) -> None:
+        self._preview_cb.blockSignals(True)
+        self._preview_cb.setChecked(enabled)
+        self._preview_cb.blockSignals(False)
+
+    def preview_mode(self) -> bool:
+        return self._preview_cb.isChecked()
 
     def setup_slider(self, frame_count: int, current: int = 0) -> None:
         self._frame_count = frame_count

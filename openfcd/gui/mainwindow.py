@@ -191,6 +191,9 @@ class MainWindow(QMainWindow):
         
         self._session = SessionController(self)
         self._run_ctrl = RunController(self)
+        # Run-result state (populated on Run completion; used for per-frame η preview)
+        self._run_eta_frames = None      # np.ndarray (N,H,W) or None
+        self._run_eta_mean = None        # np.ndarray (H,W) or None
         self._setup_ui()
         self._connect_signals()
         tokens.on_theme_changed(self._apply_theme)
@@ -286,6 +289,7 @@ class MainWindow(QMainWindow):
         self._preview.pixel_hovered.connect(self._on_pixel_hover)
         # Preview frame slider → show that frame
         self._preview.frame_changed.connect(self._on_slider_frame_changed)
+        self._preview.preview_mode_changed.connect(self._on_preview_mode_changed)
         # Properties panel action buttons
         self._properties.set_ref_clicked.connect(
             lambda: self._on_set_reference(self._current_frame_idx)
@@ -304,6 +308,8 @@ class MainWindow(QMainWindow):
         self._preview.point_placed.connect(self._on_point_placed)
         self._properties.dilate_changed.connect(self._on_dilate_changed)
         self._properties.highpass_sigma_changed.connect(self._on_highpass_sigma_changed)
+        self._properties.taper_alpha_changed.connect(self._on_taper_alpha_changed)
+        self._properties.edge_nan_changed.connect(self._on_edge_nan_changed)
 
     # ── Node routing ────────────────────────────────────────────────
     def _on_node_selected(self, key: str) -> None:
@@ -384,12 +390,13 @@ class MainWindow(QMainWindow):
         self._status_bar.set_items(base)
 
     def _on_slider_frame_changed(self, index: int) -> None:
-        """Frame slider changed — show that frame."""
+        """Frame slider changed — show that frame's source image and (after Run)
+        re-apply the η overlay for that frame (or eta_mean if preview is off)."""
         if 0 <= index < len(self._frames):
             self._current_frame_idx = index
             self._preview.set_image(self._frames[index])
-            # Also select the corresponding tree node
-            # (without re-triggering a full route)
+            # set_image wipes the scene → re-apply η overlay from run results
+            self._reapply_run_eta()
 
     def _on_set_reference(self, idx: int) -> None:
         """Set frame as reference."""
@@ -434,8 +441,8 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.Cancel:
                 return
 
-        self._toolbar.set_running(True, "--:--")
-        self._status_bar.set_items(["Running", f"Computing frame {idx + 1}...", "0%"])
+        self._toolbar.set_running(True)
+        self._status_bar.set_items(["Running", f"Computing frame {idx + 1}..."])
         self._status_bar.show_progress(0, 100)
 
         worker = _SingleFrameWorker(
@@ -609,9 +616,11 @@ class MainWindow(QMainWindow):
         if detrend_idx >= 0:
             panel._detrend.setCurrentIndex(detrend_idx)
 
-        # Sync Image panel's highpass slider with project config
-        hp_sigma = getattr(proj.process, "highpass_sigma_px", 0.0)
-        self._properties.image_properties_panel.set_highpass_sigma(float(hp_sigma))
+        # Sync Image panel's Compute Tuning fields with project config
+        img_panel = self._properties.image_properties_panel
+        img_panel.set_highpass_sigma(float(getattr(proj.process, "highpass_sigma_px", 0.0)))
+        img_panel.set_taper_alpha(float(proj.process.taper.alpha))
+        img_panel.set_edge_nan_mm(float(proj.process.edge_nan_mm))
 
     def _ensure_optical_config_ready(self, *, interactive: bool) -> bool:
         """Repair legacy preset-backed stacks and reject empty custom stacks."""
@@ -807,35 +816,88 @@ class MainWindow(QMainWindow):
         self._status_bar.hide_progress()
         self._status_bar.set_items(["Ready", "Computation complete"])
 
-        if self._session.project_path:
-            from openfcd.io.result import HDF5ResultStore
-            results_path = self._session.project_path / "runs" / _run_id / "results.h5"
-            if results_path.exists():
-                result_store = None
+        if not self._session.project_path:
+            return
+
+        from openfcd.io.result import HDF5ResultStore
+        results_path = self._session.project_path / "runs" / _run_id / "results.h5"
+        if not results_path.exists():
+            return
+
+        # Load all per-frame η + the eta_mean summary into memory so the
+        # Preview toggle switches instantly without re-reading the h5.
+        self._run_eta_frames = None
+        self._run_eta_mean = None
+        result_store = None
+        try:
+            result_store = HDF5ResultStore.open(results_path, "r")
+            batches = result_store.list_batches()
+            if not batches:
+                return
+            batch = batches[0]
+
+            try:
+                self._run_eta_mean = np.asarray(result_store.read_summary(batch, "eta_mean"))
+            except Exception:
+                self._run_eta_mean = None
+
+            frame_ids = result_store.list_frames(batch)
+            frames_list = []
+            for fid in frame_ids:
                 try:
-                    result_store = HDF5ResultStore.open(results_path, "r")
-                    eta_mm = None
-                    for batch_name in result_store.list_batches():
-                        try:
-                            eta_mm = result_store.read_summary(batch_name, "eta_mean")
-                        except Exception:
-                            frame_ids = result_store.list_frames(batch_name)
-                            for frame_id in frame_ids:
-                                candidate = result_store.read_frame(batch_name, frame_id)
-                                if candidate.ndim == 2 and candidate.size > 1:
-                                    eta_mm = candidate
-                                    break
-                        if eta_mm is not None:
-                            self._scene_tabs.setVisible(True)
-                            self._center_stack.setCurrentWidget(self._scene_tabs)
-                            self._scene_tabs.show_eta(eta_mm)
-                            break
-                except Exception as e:
-                    import logging
-                    logging.exception(f"Failed to load run results: {e}")
-                finally:
-                    if result_store is not None:
-                        result_store.close()
+                    arr = result_store.read_frame(batch, fid)
+                    if arr.ndim == 2 and arr.size > 1:
+                        frames_list.append(np.asarray(arr))
+                    else:
+                        frames_list.append(None)
+                except Exception:
+                    frames_list.append(None)
+
+            valid = [a for a in frames_list if a is not None]
+            if valid:
+                shape = valid[0].shape
+                stack = np.full((len(frames_list),) + shape, np.nan, dtype=np.float64)
+                for i, a in enumerate(frames_list):
+                    if a is not None and a.shape == shape:
+                        stack[i] = a
+                self._run_eta_frames = stack
+        except Exception as e:
+            import logging
+            logging.exception(f"Failed to load run results: {e}")
+        finally:
+            if result_store is not None:
+                result_store.close()
+
+        # Display in the preview widget (not scene_tabs) so the frame slider
+        # drives per-frame η navigation.  Toggle appears next to Overlap/Colorbar.
+        if self._run_eta_frames is not None or self._run_eta_mean is not None:
+            self._center_stack.setCurrentWidget(self._preview)
+            self._preview.set_preview_toggle_visible(self._run_eta_frames is not None)
+            self._preview.set_preview_mode(True)
+            self._reapply_run_eta()
+
+    def _on_preview_mode_changed(self, enabled: bool) -> None:
+        """Preview toggle flipped — swap between per-frame η and eta_mean (instant)."""
+        self._reapply_run_eta()
+
+    def _reapply_run_eta(self) -> None:
+        """Apply the appropriate η overlay (current-frame or mean) from the last Run."""
+        if self._run_eta_frames is None and self._run_eta_mean is None:
+            return
+        use_frame = (
+            self._preview.preview_mode()
+            and self._run_eta_frames is not None
+            and 0 <= self._current_frame_idx < self._run_eta_frames.shape[0]
+        )
+        if use_frame:
+            eta = self._run_eta_frames[self._current_frame_idx]
+        elif self._run_eta_mean is not None:
+            eta = self._run_eta_mean
+        elif self._run_eta_frames is not None and self._run_eta_frames.shape[0] > 0:
+            eta = self._run_eta_frames[0]
+        else:
+            return
+        self._preview.show_eta_overlay(np.asarray(eta))
 
     def _on_run_failed(self, error: str) -> None:
         self._toolbar.set_running(False)
@@ -900,7 +962,7 @@ class MainWindow(QMainWindow):
             self._status_bar.set_items(["Error", f"Invalid workers value: {workers_str}"])
             return
 
-        self._toolbar.set_running(True, "00:00")
+        self._toolbar.set_running(True)
         self._status_bar.set_items(["Running", "Initializing..."])
         self._status_bar.show_progress(0, 100)
         self._run_ctrl.start_run(str(self._session.project_path), workers=workers)
@@ -1012,6 +1074,18 @@ class MainWindow(QMainWindow):
         """
         if self._session.has_project:
             self._session.project.process.highpass_sigma_px = float(value)
+            self._session.mark_dirty()
+
+    def _on_taper_alpha_changed(self, value: float) -> None:
+        """Live-update project.process.taper.alpha (0 = Moisan periodic BC)."""
+        if self._session.has_project:
+            self._session.project.process.taper.alpha = float(value)
+            self._session.mark_dirty()
+
+    def _on_edge_nan_changed(self, value: float) -> None:
+        """Live-update project.process.edge_nan_mm."""
+        if self._session.has_project:
+            self._session.project.process.edge_nan_mm = float(value)
             self._session.mark_dirty()
 
     def _on_point_placed(self, idx: int, row: int, col: int) -> None:
