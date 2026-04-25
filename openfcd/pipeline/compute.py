@@ -127,11 +127,13 @@ def suppress_nonphysical_eta_filaments(
         anchor_region = dilation(low_signal_mask, disk(16))
 
     line_mask = np.zeros_like(seed, dtype=bool)
+    # Pin RNG so output is deterministic across repeat calls and threads.
     for p0, p1 in probabilistic_hough_line(
         seed,
         threshold=10,
         line_length=min_length_px,
         line_gap=6,
+        rng=np.random.default_rng(0),
     ):
         rr, cc = line(p0[1], p0[0], p1[1], p1[0])
         segment = np.zeros_like(seed, dtype=bool)

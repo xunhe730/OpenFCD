@@ -66,6 +66,7 @@ class _RunWorker(QThread):
                 "frame_count": 0,
                 "frame_paths": [],
                 "annotation": store.annotation,  # pass annotation for ROI/mask
+                "workers": self._workers,
             }
 
             stages = [PreprocessStage(), ComputeStage(), PostprocessStage()]

@@ -232,11 +232,6 @@ class ComputeStage:
             )
             return
 
-        # Save reference as temp file for process() which expects paths
-        import tempfile
-        ref_tmp = Path(tempfile.mktemp(suffix=".npy"))
-        np.save(ref_tmp, ref_img)
-
         # Resolve annotation ROI and polygon for masking
         annotation = ctx.get("annotation")  # AnnotationSchema | None
         roi_box = None
@@ -253,86 +248,136 @@ class ComputeStage:
                 )
             polygon_map = annotation.frame_polygons
 
-        # Process each frame vs reference
-        eta_list: list[np.ndarray] = []
+        # Hoist invariant ref-side work (ROI crop + flatfield) once per run.
+        ref_invariants = _compute_ref_invariants(ref_img, project, roi_box=roi_box)
+
+        # Per-frame polygon resolver
+        def _resolve_frame_poly(name: str):
+            if name not in polygon_map:
+                return None
+            polys = polygon_map[name]
+            if not polys or not polys[0].vertices:
+                return None
+            from openfcd.core.mask import Polygon
+            return Polygon([(float(v[0]), float(v[1])) for v in polys[0].vertices])
+
+        # Single-frame body shared by serial and parallel paths.
+        def _process_one(idx: int, frame_path: Path) -> tuple[int, np.ndarray | None, str | None]:
+            """Returns (idx, eta_mm, error_msg). eta_mm is None on error."""
+            try:
+                deformed_img = load_gray(frame_path)
+                if deformed_img.shape != ref_img.shape:
+                    return idx, None, "shape_mismatch"
+                eta_mm = _compute_single_frame(
+                    ref_img, deformed_img, geom, project,
+                    roi_box=roi_box,
+                    robot_poly=_resolve_frame_poly(frame_path.name),
+                    ref_invariants=ref_invariants,
+                )
+                return idx, eta_mm, None
+            except Exception as exc:  # noqa: BLE001
+                return idx, None, str(exc)
+
+        eta_list: list[np.ndarray | None] = [None] * frame_count
         processed = 0
         errors = 0
         t0 = time.time()
 
-        for idx, frame_path in enumerate(frame_paths):
-            if cancel and cancel.is_cancelled:
-                break
+        # Resolve worker count. workers<=0 means "auto" → use P-cores on Darwin
+        # else (cpu_count - 1). When workers==1, run serial (no thread overhead).
+        workers_req = int(ctx.get("workers", 1) or 1)
+        if workers_req <= 0:
+            workers_req = _resolve_default_workers()
+        # Cap at frame count.
+        n_workers = max(1, min(workers_req, frame_count if frame_count > 0 else 1))
 
-            # Resolve per-frame polygon mask
-            frame_poly = None
-            if frame_path.name in polygon_map:
-                polys = polygon_map[frame_path.name]
-                if polys and polys[0].vertices:
-                    from openfcd.core.mask import Polygon
-                    verts = polys[0].vertices  # list of [row, col]
-                    frame_poly = Polygon([(float(v[0]), float(v[1])) for v in verts])
+        write_lock = __import__("threading").Lock()
 
-            try:
-                deformed_img = load_gray(frame_path)
-                if deformed_img.shape != ref_img.shape:
-                    errors += 1
-                    yield StageEvent(
-                        kind="progress", stage=self.name, batch="default",
-                        frame_idx=idx, substage="shape_mismatch", progress=(idx + 1) / max(frame_count, 1),
-                        total=frame_count, completed=processed,
-                        metrics={"frame": str(frame_path.name), "errors": errors},
-                        run_id=run_id,
-                    )
-                    continue
-
-                eta_mm = _compute_single_frame(
-                    ref_img, deformed_img, geom, project,
-                    roi_box=roi_box,
-                    robot_poly=frame_poly,
-                )
-                eta_list.append(eta_mm)
-
-                # Write to HDF5
-                if result_store is not None:
-                    result_store.write_frame(
-                        "default", idx, eta_mm,
-                        {"status": "ok", "frame_path": str(frame_path.name)},
-                    )
-
-                processed += 1
-
-            except Exception as exc:
-                import traceback as _tb
-                errors += 1
-                if result_store is not None:
-                    result_store.write_frame(
-                        "default", idx,
-                        np.zeros((1, 1), dtype=np.float64),
-                        {"status": "error", "message": str(exc), "frame_path": str(frame_path.name)},
-                    )
-
-            prog = (idx + 1) / max(frame_count, 1)
+        def _emit_progress(idx: int, frame_name: str) -> StageEvent:
+            prog = (processed + errors) / max(frame_count, 1)
             elapsed = time.time() - t0
-            eta_sec = (elapsed / (idx + 1)) * (frame_count - idx - 1) if idx > 0 else 0
-
-            yield StageEvent(
+            eta_sec = 0.0
+            done = processed + errors
+            if done > 0:
+                eta_sec = (elapsed / done) * (frame_count - done)
+            return StageEvent(
                 kind="progress", stage=self.name, batch="default",
                 frame_idx=idx, substage="processing_frame", progress=prog,
                 total=frame_count, completed=processed,
                 metrics={
-                    "frame": str(frame_path.name),
+                    "frame": frame_name,
                     "errors": errors,
                     "eta_seconds": round(eta_sec, 1),
                 },
                 run_id=run_id,
             )
 
-        # Clean up temp file
-        if ref_tmp.exists():
-            ref_tmp.unlink()
+        def _record(idx: int, frame_path: Path, eta_mm: np.ndarray | None, err: str | None) -> None:
+            nonlocal processed, errors
+            if eta_mm is not None:
+                eta_list[idx] = eta_mm
+                if result_store is not None:
+                    with write_lock:
+                        result_store.write_frame(
+                            "default", idx, eta_mm,
+                            {"status": "ok", "frame_path": str(frame_path.name)},
+                        )
+                processed += 1
+            else:
+                errors += 1
+                if result_store is not None:
+                    with write_lock:
+                        result_store.write_frame(
+                            "default", idx,
+                            np.zeros((1, 1), dtype=np.float64),
+                            {
+                                "status": "error",
+                                "message": err or "",
+                                "frame_path": str(frame_path.name),
+                            },
+                        )
 
-        # Store eta stack in context for postprocess
-        ctx["eta_list"] = eta_list
+        if n_workers <= 1:
+            for idx, frame_path in enumerate(frame_paths):
+                if cancel and cancel.is_cancelled:
+                    break
+                idx_, eta_mm, err = _process_one(idx, frame_path)
+                _record(idx_, frame_path, eta_mm, err)
+                yield _emit_progress(idx, frame_path.name)
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from threadpoolctl import threadpool_limits
+
+            # Pin BLAS / OpenMP to 1 thread per pipeline worker. Without this,
+            # numpy/scipy/scikit-image's native pools fight the Python pool and
+            # produce nondeterministic output (especially inpaint_biharmonic's
+            # linear solver), violating serial↔parallel equivalence.
+            with threadpool_limits(limits=1):
+                executor = ThreadPoolExecutor(
+                    max_workers=n_workers, thread_name_prefix="openfcd-fcd"
+                )
+                try:
+                    futures = {
+                        executor.submit(_process_one, i, fp): (i, fp)
+                        for i, fp in enumerate(frame_paths)
+                    }
+                    for fut in as_completed(futures):
+                        if cancel and cancel.is_cancelled:
+                            for f in futures:
+                                f.cancel()
+                            break
+                        idx_orig, frame_path = futures[fut]
+                        try:
+                            idx_, eta_mm, err = fut.result()
+                        except Exception as exc:  # noqa: BLE001
+                            idx_, eta_mm, err = idx_orig, None, str(exc)
+                        _record(idx_, frame_path, eta_mm, err)
+                        yield _emit_progress(idx_, frame_path.name)
+                finally:
+                    executor.shutdown(wait=True, cancel_futures=True)
+
+        # Store eta stack in context for postprocess (drop None slots = errored frames)
+        ctx["eta_list"] = [e for e in eta_list if e is not None]
         ctx["batches_processed"] = ["default"]
         ctx["compute_errors"] = errors
 
@@ -437,6 +482,41 @@ class PostprocessStage:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+class _RefInvariants:
+    """Frame-invariant ref-side work: ROI-cropped ref + its flatfield.
+
+    Computed once per run and shared across all frames. Skipped when fast_preview
+    is on (each preview call has its own downsample factor → different sigma)."""
+
+    __slots__ = ("ref_img", "ref_ff", "sigma")
+
+    def __init__(self, ref_img: np.ndarray, ref_ff: np.ndarray, sigma: float):
+        self.ref_img = ref_img
+        self.ref_ff = ref_ff
+        self.sigma = sigma
+
+
+def _compute_ref_invariants(
+    ref_img: np.ndarray, project: ProjectModel, roi_box=None
+) -> _RefInvariants:
+    """Hoist ROI crop + flatfield of the reference image (constant across frames)."""
+    from openfcd.core.flatfield import flatfield_normalize
+
+    if getattr(project.process, "flatfield_sigma_auto", True):
+        h_img, w_img = ref_img.shape
+        sigma = float(np.clip(max(h_img, w_img) * 0.06, 100.0, 2000.0))
+    else:
+        sigma = float(project.process.flatfield_sigma)
+    if roi_box is not None:
+        r0 = max(0, roi_box.row0)
+        c0 = max(0, roi_box.col0)
+        r1 = min(ref_img.shape[0], roi_box.row0 + roi_box.height)
+        c1 = min(ref_img.shape[1], roi_box.col0 + roi_box.width)
+        ref_img = ref_img[r0:r1, c0:c1]
+    ref_ff = flatfield_normalize(ref_img, sigma=sigma)
+    return _RefInvariants(ref_img=ref_img, ref_ff=ref_ff, sigma=sigma)
+
+
 def _compute_single_frame(
     ref_img: np.ndarray,
     def_img: np.ndarray,
@@ -447,6 +527,8 @@ def _compute_single_frame(
     robot_pad_px: int = 4,
     fast_preview: bool = False,
     progress_cb=None,
+    *,
+    ref_invariants: "_RefInvariants | None" = None,
 ) -> np.ndarray:
     """Run the FCD pipeline on a single (reference, deformed) pair.
 
@@ -460,6 +542,8 @@ def _compute_single_frame(
         fast_preview: if True, auto-downsample images >3000px on longest side and
                       skip suppress_nonphysical_eta_filaments (2–4× speedup)
         progress_cb:  optional callable(pct: int, label: str) for progress updates
+        ref_invariants: precomputed ROI-cropped ref + flatfield (run-loop hoist).
+                        Mutually exclusive with fast_preview.
     """
     def _report(pct: int, label: str) -> None:
         if progress_cb is not None:
@@ -481,7 +565,14 @@ def _compute_single_frame(
         suppress_nonphysical_eta_filaments,
     )
 
-    if getattr(project.process, "flatfield_sigma_auto", True):
+    if ref_invariants is not None and fast_preview:
+        # fast_preview path performs its own downsample → cached sigma/ref_ff
+        # would be wrong. Drop the hoist for safety.
+        ref_invariants = None
+
+    if ref_invariants is not None:
+        sigma = ref_invariants.sigma
+    elif getattr(project.process, "flatfield_sigma_auto", True):
         h_img, w_img = ref_img.shape
         sigma = float(np.clip(max(h_img, w_img) * 0.06, 100.0, 2000.0))
     else:
@@ -493,12 +584,16 @@ def _compute_single_frame(
     # Fast-preview: auto-downsample images wider/taller than 3000px.
     # Processing at half resolution is ~4× faster; result is upsampled back.
     _original_shape: tuple | None = None
+    _downsample_scale = 1.0  # tracks pixel scale for sigma correction
     if fast_preview:
         h0, w0 = ref_img.shape
-        factor = max(h0, w0) // 3000  # integer downscale factor (0 or 1 = no-op)
+        # Target ~2500px on longest side (factor=2 for 5000-5999px, etc.)
+        # Capped at factor=2 to keep carrier period ≥25px and HP sigma > wave period
+        factor = min(2, max(h0, w0) // 2500)
         if factor >= 2:
             from scipy.ndimage import zoom
             scale = 1.0 / factor
+            _downsample_scale = scale
             ref_img = zoom(ref_img, scale, order=1)
             def_img = zoom(def_img, scale, order=1)
             sigma = sigma * scale
@@ -517,20 +612,28 @@ def _compute_single_frame(
 
     _report(5, "Setup")
 
-    # Apply ROI crop if specified
+    # Apply ROI crop if specified. When ref_invariants is supplied, ref_img is
+    # already ROI-cropped; def_img and robot_poly still need the same crop.
     if roi_box is not None:
         r0 = max(0, roi_box.row0)
         c0 = max(0, roi_box.col0)
-        r1 = min(ref_img.shape[0], roi_box.row0 + roi_box.height)
-        c1 = min(ref_img.shape[1], roi_box.col0 + roi_box.width)
-        ref_img = ref_img[r0:r1, c0:c1]
-        def_img = def_img[r0:r1, c0:c1]
+        if ref_invariants is None:
+            r1 = min(ref_img.shape[0], roi_box.row0 + roi_box.height)
+            c1 = min(ref_img.shape[1], roi_box.col0 + roi_box.width)
+            ref_img = ref_img[r0:r1, c0:c1]
+        r1d = min(def_img.shape[0], roi_box.row0 + roi_box.height)
+        c1d = min(def_img.shape[1], roi_box.col0 + roi_box.width)
+        def_img = def_img[r0:r1d, c0:c1d]
         if robot_poly is not None:
             robot_poly = robot_poly.shifted(-r0, -c0)
 
-    # Flatfield normalization
+    # Flatfield normalization (ref side hoisted out of the run loop when possible)
     _report(10, "Flatfield")
-    ref_ff = flatfield_normalize(ref_img, sigma=sigma)
+    if ref_invariants is not None:
+        ref_img = ref_invariants.ref_img
+        ref_ff = ref_invariants.ref_ff
+    else:
+        ref_ff = flatfield_normalize(ref_img, sigma=sigma)
     def_ff = flatfield_normalize(def_img, sigma=sigma, bg_src=ref_img)
 
     # Find carriers in reference
@@ -588,14 +691,25 @@ def _compute_single_frame(
             def_clean = def_ff
             carriers = carriers0
 
-    # Cosine taper
-    _report(65, "Taper")
+    # Edge conditioning: taper OR Moisan periodic decomposition (mutually exclusive).
+    # Combining them reintroduces a periodic→zero boundary jump that causes an
+    # artifact ring, so exactly one method is applied.
+    #
+    #  taper_alpha > 0  →  cosine taper (traditional; zeros out edges)
+    #  taper_alpha = 0  →  Moisan (2011) periodic+smooth decomposition:
+    #                       creates a truly periodic image so FFT integration
+    #                       has no boundary artefacts, preserving edge content.
+    _report(65, "Taper/PeriodicBC")
     if taper_alpha > 0:
         win = cosine_taper(ref_clean.shape, alpha=taper_alpha)
         ref_mean = ref_clean.mean()
         def_mean = def_clean.mean()
         ref_clean = (ref_clean - ref_mean) * win + ref_mean
         def_clean = (def_clean - def_mean) * win + def_mean
+    else:
+        from openfcd.core.fcd import periodic_smooth_decompose
+        ref_clean, _ = periodic_smooth_decompose(ref_clean)
+        def_clean, _ = periodic_smooth_decompose(def_clean)
 
     # Self-test path: reference against itself should produce a zero field.
     # Returning zeros explicitly is more honest than surfacing algorithmic
@@ -643,7 +757,7 @@ def _compute_single_frame(
 
     # Optional spatial high-pass: remove large-scale drift (non-physical waves
     # from ref/def mismatch) while preserving short-wavelength surface waves.
-    hp_sigma = float(getattr(project.process, "highpass_sigma_px", 0.0))
+    hp_sigma = float(getattr(project.process, "highpass_sigma_px", 0.0)) * _downsample_scale
     if hp_sigma > 0.0:
         _report(93, "Highpass")
         from scipy.ndimage import gaussian_filter
@@ -660,16 +774,18 @@ def _compute_single_frame(
         if hp_margin > 0:
             eta_mm[edge_margin_mask(eta_mm.shape, hp_margin)] = np.nan
 
-    # Upsample back to original resolution if we downsampled earlier.
+    # Upsample back to ROI-resolution (undo the fast-preview downsample).
+    # _original_shape is the full image shape but eta_mm is at cropped+downsampled
+    # resolution; using (h0/eta_h, w0/eta_w) as zoom factors would wrongly stretch
+    # the ROI content to fill the full image.  Use the exact downscale factor instead.
     if _original_shape is not None:
         _report(97, "Upsample")
         from scipy.ndimage import zoom as _zoom
         valid = np.isfinite(eta_mm)
         filled = np.where(valid, eta_mm, 0.0)
-        zy = _original_shape[0] / eta_mm.shape[0]
-        zx = _original_shape[1] / eta_mm.shape[1]
-        eta_up = _zoom(filled, (zy, zx), order=1)
-        valid_up = _zoom(valid.astype(np.float32), (zy, zx), order=0) > 0.5
+        up = round(1.0 / _downsample_scale)  # invert the fast-preview downsample
+        eta_up = _zoom(filled, up, order=1)
+        valid_up = _zoom(valid.astype(np.float32), up, order=0) > 0.5
         eta_mm = np.where(valid_up, eta_up, np.nan)
 
     _report(100, "Done")
@@ -684,6 +800,32 @@ def _filter_frames(frames: list[Path], filt: str) -> list[Path]:
         end = int(parts[1]) if len(parts) > 1 and parts[1] else len(frames)
         return frames[start:end]
     return [f for f in frames if fnmatch(f.name, filt)]
+
+
+def _resolve_default_workers() -> int:
+    """Best-effort default worker count.
+
+    Honors OPENFCD_FORCE_SERIAL=1 escape hatch. On Darwin uses physical P-cores
+    (`sysctl hw.perflevel0.physicalcpu`) to avoid scheduling onto E-cores. Other
+    platforms fall back to ``cpu_count - 1``.
+    """
+    import os
+    if os.environ.get("OPENFCD_FORCE_SERIAL", "") == "1":
+        return 1
+    import platform
+    if platform.system() == "Darwin":
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["sysctl", "-n", "hw.perflevel0.physicalcpu"],
+                text=True, timeout=1.0,
+            ).strip()
+            n = int(out)
+            if n > 0:
+                return n
+        except Exception:
+            pass
+    return max(1, (os.cpu_count() or 2) - 1)
 
 
 def _quick_fingerprint(project: ProjectModel) -> str:
@@ -735,6 +877,7 @@ def run_cmd(
         "batches_processed": [],
         "frame_count": 0,
         "frame_paths": [],
+        "workers": workers,
     }
 
     stages: list[Stage] = [
