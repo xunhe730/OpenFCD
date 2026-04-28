@@ -37,7 +37,7 @@ from PyQt6.QtGui import QImageReader
 
 class ThumbWorker(QThread):
     """Background thread to load thumbnails incrementally."""
-    thumb_loaded = pyqtSignal(int, QPixmap)
+    thumb_loaded = pyqtSignal(int, object)  # QImage; main thread converts to QPixmap
 
     def __init__(self, paths: list[Path], parent=None):
         super().__init__(parent)
@@ -52,7 +52,7 @@ class ThumbWorker(QThread):
             reader.setScaledSize(QSize(140, 100))
             img = reader.read()
             if not img.isNull():
-                self.thumb_loaded.emit(idx, QPixmap.fromImage(img))
+                self.thumb_loaded.emit(idx, img)  # emit QImage, not QPixmap
             self.msleep(1)
 
     def stop(self):
@@ -581,9 +581,9 @@ class ImageList(QWidget):
             self._thumb_worker.thumb_loaded.connect(self._on_thumb_loaded)
             self._thumb_worker.start()
 
-    def _on_thumb_loaded(self, idx: int, pixmap: QPixmap) -> None:
+    def _on_thumb_loaded(self, idx: int, qimage) -> None:
         if 0 <= idx < len(self._cells) and self._cells[idx]:
-            self._cells[idx].set_pixmap(pixmap)
+            self._cells[idx].set_pixmap(QPixmap.fromImage(qimage))
 
     def _on_cell_context_menu(self, cell: ThumbCell, pos) -> None:
         from PyQt6.QtWidgets import QMenu
