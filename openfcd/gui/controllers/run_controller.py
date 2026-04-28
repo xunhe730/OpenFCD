@@ -159,6 +159,11 @@ class RunController(QObject):
 
         path = Path(project_path)
         self._worker = _RunWorker(path, workers, disabled_indices)
+        self._worker.stage_event.connect(self.stage_event)
+        self._worker.run_finished.connect(self.run_finished)
+        self._worker.run_failed.connect(self.run_failed)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.start()
 
     def cancel(self) -> None:
         """Cancel the current run."""
