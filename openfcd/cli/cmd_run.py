@@ -109,6 +109,57 @@ def _resolve_reference(project: ProjectModel, project_dir: Path) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Auto-detect occluder on reference image
+# ---------------------------------------------------------------------------
+
+def _detect_occluder_on_ref(ref_img: np.ndarray, geom, project) -> object:
+    """Run auto-mask on the reference image and return a Polygon or None.
+
+    The reference image (flat water surface) gives the most stable occluder
+    detection because waves haven't distorted the carrier yet.  The polygon
+    is computed once and reused for all frames that lack a per-frame mask.
+    """
+    try:
+        from openfcd.core.fcd import calculate_carriers
+        from openfcd.core.flatfield import flatfield_normalize
+        from openfcd.core.mask import auto_mask, find_oriented_polygon, find_largest_interior_blob, Polygon
+
+        # Fast downsample when ref is large (mirrors fast_preview logic)
+        img = ref_img
+        scale = 1.0
+        h0, w0 = img.shape
+        factor = min(2, max(h0, w0) // 2500)
+        if factor >= 2:
+            from scipy.ndimage import zoom
+            scale = 1.0 / factor
+            img = zoom(img, scale, order=1)
+
+        # Same sigma formula as _compute_single_frame
+        h_img, w_img = img.shape
+        if getattr(project.process, "flatfield_sigma_auto", True):
+            sigma = float(np.clip(max(h_img, w_img) * 0.06, 100.0, 2000.0))
+        else:
+            sigma = float(project.process.flatfield_sigma)
+
+        ref_ff = flatfield_normalize(img, sigma=sigma)
+        carriers = calculate_carriers(ref_ff - ref_ff.mean())
+        scout = auto_mask(ref_ff, carriers, threshold_ratio=0.2, dilate_px=4)
+        poly = find_oriented_polygon(scout, edge_margin=20)
+        if poly is None:
+            box = find_largest_interior_blob(scout, edge_margin=20)
+            if box is not None:
+                poly = Polygon.from_box(box)
+        if poly is None:
+            return None
+        # Scale vertices back to original image coordinates
+        if scale != 1.0:
+            poly = Polygon([(v[0] / scale, v[1] / scale) for v in poly.vertices])
+        return poly
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Stage implementations
 # ---------------------------------------------------------------------------
 
@@ -169,7 +220,13 @@ class PreprocessStage:
         geom = _build_geom_params(project)
         ctx["geom_params"] = geom
 
-        # 4. Store frame paths and count
+        # 4. Auto-detect robot/occluder polygon from reference image once.
+        # Using the reference (clean flat-water) gives stable detection across
+        # all frames; per-frame auto-detection fails when waves are strong.
+        # Result stored so ComputeStage can use it as fallback.
+        ctx["reference_robot_poly"] = _detect_occluder_on_ref(ref_img, geom, project)
+
+        # 5. Store frame paths and count
         ctx["frame_paths"] = frames
         ctx["frame_count"] = total
 
@@ -266,15 +323,19 @@ class ComputeStage:
             if not _fallback_polys and getattr(annotation, "polygons", None):
                 _fallback_polys = [p for p in annotation.polygons if p.vertices]
 
+        # Reference auto-detected polygon — stable occluder from the clean ref
+        _ref_robot_poly = ctx.get("reference_robot_poly")
+
         def _resolve_frame_poly(name: str):
-            """Return per-frame polygon, falling back to any drawn polygon."""
+            """Return polygon: per-frame → any drawn → ref auto-detect → None."""
             polys = polygon_map.get(name, [])
             if not polys or not polys[0].vertices:
-                polys = _fallback_polys  # use any available mask as fallback
-            if not polys or not polys[0].vertices:
-                return None
-            from openfcd.core.mask import Polygon
-            return Polygon([(float(v[0]), float(v[1])) for v in polys[0].vertices])
+                polys = _fallback_polys
+            if polys and polys[0].vertices:
+                from openfcd.core.mask import Polygon
+                return Polygon([(float(v[0]), float(v[1])) for v in polys[0].vertices])
+            # Fall back to polygon auto-detected from reference image
+            return _ref_robot_poly
 
         # Single-frame body shared by serial and parallel paths.
         def _process_one(idx: int, frame_path: Path) -> tuple[int, np.ndarray | None, str | None]:
