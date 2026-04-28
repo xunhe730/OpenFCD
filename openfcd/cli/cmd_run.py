@@ -693,16 +693,11 @@ def _compute_single_frame(
     # For scale < 1 the function returns a *smaller* ref and the crop coordinates
     # of def that correspond to it — we must crop def to avoid carrier leakage in
     # the FCD border region (unpaired def carrier → checkerboard through integration).
-    # At 0.5x resolution carrier period ~25px: a 1px detection error = 4% mismatch,
-    # which fires the default 0.5% tolerance and produces wrong scale corrections.
-    # Use a 5% tolerance at lower resolution to ignore noise while still correcting
-    # genuine large-scale mismatches (>5%) caused by real optical zoom differences.
     _fast_preview_active = _original_shape is not None
-    _snr_tolerance = 0.05 if _fast_preview_active else 0.005
     if getattr(project.process, "auto_scale_ref", True):
         from openfcd.core.registration import scale_normalize_reference
         ref_ff, carriers0, _scale, _valid_crop = scale_normalize_reference(
-            ref_ff, def_ff, carriers0, tolerance=_snr_tolerance
+            ref_ff, def_ff, carriers0
         )
         if _valid_crop is not None:
             r0v, c0v, hv, wv = _valid_crop
