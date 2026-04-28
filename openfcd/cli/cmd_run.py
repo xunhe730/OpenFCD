@@ -358,7 +358,7 @@ class ComputeStage:
                         robot_poly=_resolve_frame_poly(frame_path.name),
                         ref_invariants=ref_invariants,
                         progress_cb=_cb,
-                        fast_preview=True,
+                        fast_preview=False,
                     )
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
