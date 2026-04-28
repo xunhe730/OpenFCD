@@ -468,7 +468,8 @@ class SimTree(QTreeWidget):
                         else:
                             frame_item.setText(0, name)
                             frame_item.setIcon(0, get_icon(ICON_PHOTO))
-                            frame_item.setForeground(0, QColor(tokens.TEXT_PRIMARY))
+                            color = tokens.TEXT_MUTED if idx in self._disabled_indices else tokens.TEXT_PRIMARY
+                            frame_item.setForeground(0, QColor(color))
                 break
 
     # ── Frame disable / enable ─────────────────────────────────────
