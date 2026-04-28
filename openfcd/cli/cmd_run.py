@@ -220,11 +220,8 @@ class PreprocessStage:
         geom = _build_geom_params(project)
         ctx["geom_params"] = geom
 
-        # 4. Auto-detect robot/occluder polygon from reference image once.
-        # Using the reference (clean flat-water) gives stable detection across
-        # all frames; per-frame auto-detection fails when waves are strong.
-        # Result stored so ComputeStage can use it as fallback.
-        ctx["reference_robot_poly"] = _detect_occluder_on_ref(ref_img, geom, project)
+        # 4. Skip auto-detect on reference — mask priority is per-frame polygon
+        #    → global annotation.polygons → None (per-frame auto-mask).
 
         # 5. Store frame paths and count
         ctx["frame_paths"] = frames
@@ -301,7 +298,6 @@ class ComputeStage:
         annotation = ctx.get("annotation")  # AnnotationSchema | None
         roi_box = None
         polygon_map: dict[str, list] = {}
-        _fallback_polys: list = []
         if annotation is not None:
             roi = annotation.roi
             if not roi.is_empty:
@@ -313,29 +309,20 @@ class ComputeStage:
                     width=int(roi.width),
                 )
             polygon_map = annotation.frame_polygons
-            # Build a fallback polygon list: any polygon drawn for any frame,
-            # plus global annotation.polygons. Used when a frame has no
-            # per-frame polygon (so the user's manual mask still applies).
-            for polys in polygon_map.values():
-                if polys and polys[0].vertices:
-                    _fallback_polys = polys
-                    break
-            if not _fallback_polys and getattr(annotation, "polygons", None):
-                _fallback_polys = [p for p in annotation.polygons if p.vertices]
-
-        # Reference auto-detected polygon — stable occluder from the clean ref
-        _ref_robot_poly = ctx.get("reference_robot_poly")
 
         def _resolve_frame_poly(name: str):
-            """Return polygon: per-frame → any drawn → ref auto-detect → None."""
+            """Per-frame mask → global polygons → None (auto-mask per frame)."""
             polys = polygon_map.get(name, [])
-            if not polys or not polys[0].vertices:
-                polys = _fallback_polys
             if polys and polys[0].vertices:
                 from openfcd.core.mask import Polygon
                 return Polygon([(float(v[0]), float(v[1])) for v in polys[0].vertices])
-            # Fall back to polygon auto-detected from reference image
-            return _ref_robot_poly
+            # Fall back to explicit global annotation polygons only
+            global_polys = getattr(annotation, "polygons", None) or []
+            for gp in global_polys:
+                if gp.vertices:
+                    from openfcd.core.mask import Polygon
+                    return Polygon([(float(v[0]), float(v[1])) for v in gp.vertices])
+            return None  # let _compute_single_frame do per-frame auto-mask
 
         # Single-frame body shared by serial and parallel paths.
         def _process_one(idx: int, frame_path: Path) -> tuple[int, np.ndarray | None, str | None]:

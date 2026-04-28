@@ -153,14 +153,9 @@ class _SingleFrameWorker(QThread):
 
                 polys = self._annotation.frame_polygons.get(self._frame_path.name, [])
                 if not polys or not polys[0].vertices:
-                    # Fall back to any drawn polygon so the user's manual mask
-                    # applies even when this specific frame has no polygon.
-                    for fp in self._annotation.frame_polygons.values():
-                        if fp and fp[0].vertices:
-                            polys = fp
-                            break
-                    if not polys and getattr(self._annotation, "polygons", None):
-                        polys = [p for p in self._annotation.polygons if p.vertices]
+                    # Fall back to explicit global annotation polygons only
+                    global_polys = getattr(self._annotation, "polygons", None) or []
+                    polys = [p for p in global_polys if p.vertices]
                 if polys and polys[0].vertices:
                     frame_poly = Polygon(
                         [(float(v[0]), float(v[1])) for v in polys[0].vertices]
