@@ -14,9 +14,10 @@ from openfcd.gui import tokens
 
 
 class ThumbnailLoader(QThread):
-    """Lazy thumbnail loader — emits pixmaps one at a time."""
+    """Lazy thumbnail loader — emits QImage (safe in non-main thread)."""
 
-    pixmap_ready = pyqtSignal(int, QPixmap)
+    # Emit QImage; main thread converts to QPixmap/QIcon
+    image_ready = pyqtSignal(int, object)  # (index, QImage | None)
 
     def __init__(self, frames: list[Path], icon_size: QSize) -> None:
         super().__init__()
@@ -36,13 +37,11 @@ class ThumbnailLoader(QThread):
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
-                    pixmap = QPixmap.fromImage(scaled)
-                    icon = QIcon(pixmap)
+                    self.image_ready.emit(idx, scaled)
                 else:
-                    icon = QIcon()
-                self.pixmap_ready.emit(idx, icon)
+                    self.image_ready.emit(idx, None)
             except Exception:
-                self.pixmap_ready.emit(idx, QIcon())
+                self.image_ready.emit(idx, None)
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -129,15 +128,17 @@ class ImagePickerDialog(QDialog):
 
     def _start_loading(self) -> None:
         self._worker = ThumbnailLoader(self._frames, QSize(120, 90))
-        self._worker.pixmap_ready.connect(self._on_thumbnail)
+        self._worker.image_ready.connect(self._on_thumbnail)
         self._worker.start()
 
-    def _on_thumbnail(self, index: int, icon: QIcon) -> None:
-        if icon.isNull():
+    def _on_thumbnail(self, index: int, qimage) -> None:
+        # QPixmap/QIcon must be created in the main thread — do it here
+        if qimage is None:
             return
         item = self._list.item(index)
         if item is not None:
-            item.setIcon(icon)
+            pixmap = QPixmap.fromImage(qimage)
+            item.setIcon(QIcon(pixmap))
 
     def _update_count(self) -> None:
         n = len(self.selected_indices())
