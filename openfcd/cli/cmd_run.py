@@ -249,9 +249,6 @@ class ComputeStage:
                 )
             polygon_map = annotation.frame_polygons
 
-        # Hoist invariant ref-side work (ROI crop + flatfield) once per run.
-        ref_invariants = _compute_ref_invariants(ref_img, project, roi_box=roi_box)
-
         # Per-frame polygon resolver
         def _resolve_frame_poly(name: str):
             if name not in polygon_map:
@@ -356,7 +353,6 @@ class ComputeStage:
                         ref_img, def_img, geom, project,
                         roi_box=roi_box,
                         robot_poly=_resolve_frame_poly(frame_path.name),
-                        ref_invariants=ref_invariants,
                         progress_cb=_cb,
                         fast_preview=True,
                     )
