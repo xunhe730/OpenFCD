@@ -1396,16 +1396,17 @@ class MainWindow(QMainWindow):
 
         eta = None
 
-        # 1. Run per-frame result for this frame
-        if (self._run_eta_frames is not None
+        # 1. Single-frame compute cache — user explicitly computed this frame;
+        #    takes priority so fresh results always appear over stale Run data.
+        if self._current_frame_idx in self._frame_eta_cache:
+            eta = self._frame_eta_cache[self._current_frame_idx]
+
+        # 2. Run per-frame result for this frame
+        if eta is None and (self._run_eta_frames is not None
                 and 0 <= self._current_frame_idx < self._run_eta_frames.shape[0]):
             candidate = self._run_eta_frames[self._current_frame_idx]
             if not np.all(np.isnan(candidate)):
                 eta = candidate
-
-        # 2. Single-frame compute cache for this frame
-        if eta is None and self._current_frame_idx in self._frame_eta_cache:
-            eta = self._frame_eta_cache[self._current_frame_idx]
 
         # 3. Run mean (fallback when per-frame unavailable)
         if eta is None and self._run_eta_mean is not None:
