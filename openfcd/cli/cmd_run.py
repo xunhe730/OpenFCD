@@ -358,7 +358,7 @@ class ComputeStage:
                         robot_poly=_resolve_frame_poly(frame_path.name),
                         ref_invariants=ref_invariants,
                         progress_cb=_cb,
-                        fast_preview=False,
+                        fast_preview=True,
                     )
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
@@ -635,6 +635,8 @@ def _compute_single_frame(
     # Processing at half resolution is ~4× faster; result is upsampled back.
     _original_shape: tuple | None = None
     _downsample_scale = 1.0  # tracks pixel scale for sigma correction
+    _orig_roi_shape: tuple[int, int] | None = None  # ROI dims before downscale
+    _valid_crop_offset: tuple[int, int] = (0, 0)   # (r0v, c0v) from scale_normalize_reference
     if fast_preview:
         h0, w0 = ref_img.shape
         # Target ~2500px on longest side (factor=2 for 5000-5999px, etc.)
@@ -652,6 +654,7 @@ def _compute_single_frame(
                 robot_poly = _Polygon([(v[0] * scale, v[1] * scale) for v in robot_poly.vertices])
             if roi_box is not None:
                 from openfcd.core.mask import Box as _Box
+                _orig_roi_shape = (roi_box.height, roi_box.width)  # save before scaling
                 roi_box = _Box(
                     row0=int(roi_box.row0 * scale),
                     col0=int(roi_box.col0 * scale),
@@ -699,6 +702,7 @@ def _compute_single_frame(
         ref_ff, carriers0, _scale, _valid_crop = scale_normalize_reference(ref_ff, def_ff, carriers0)
         if _valid_crop is not None:
             r0v, c0v, hv, wv = _valid_crop
+            _valid_crop_offset = (r0v, c0v)  # track for post-upsample embedding
             def_ff = def_ff[r0v:r0v + hv, c0v:c0v + wv]
             if robot_poly is not None:
                 robot_poly = robot_poly.shifted(-r0v, -c0v)
@@ -837,6 +841,21 @@ def _compute_single_frame(
         eta_up = _zoom(filled, up, order=1)
         valid_up = _zoom(valid.astype(np.float32), up, order=0) > 0.5
         eta_mm = np.where(valid_up, eta_up, np.nan)
+        # Re-embed at the correct position within the original ROI so that
+        # _valid_crop offsets from scale_normalize_reference are preserved.
+        # Without this step each frame's η lands at a slightly different
+        # position in the full frame, creating a "multi-frame superimposed" artifact.
+        if _orig_roi_shape is not None:
+            r_off = _valid_crop_offset[0] * up
+            c_off = _valid_crop_offset[1] * up
+            roi_h, roi_w = _orig_roi_shape
+            eta_roi = np.full((roi_h, roi_w), np.nan, dtype=np.float64)
+            eh, ew = eta_mm.shape
+            eh_fit = min(eh, roi_h - r_off)
+            ew_fit = min(ew, roi_w - c_off)
+            if eh_fit > 0 and ew_fit > 0:
+                eta_roi[r_off:r_off + eh_fit, c_off:c_off + ew_fit] = eta_mm[:eh_fit, :ew_fit]
+            eta_mm = eta_roi
 
     _report(100, "Done")
     return eta_mm
