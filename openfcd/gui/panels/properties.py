@@ -580,6 +580,8 @@ class VizSettingsPanel(QWidget):
     export_png_clicked = pyqtSignal()
     export_pdf_clicked = pyqtSignal()
     export_csv_clicked = pyqtSignal()
+    apply_clicked = pyqtSignal(dict)   # emits full viz_params dict
+    reset_clicked = pyqtSignal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -588,17 +590,139 @@ class VizSettingsPanel(QWidget):
         layout.setSpacing(0)
 
         g = PropGroup("Visualization", accent=True)
-        self._cmap = PropSelect(["viridis", "plasma", "inferno", "coolwarm", "RdBu_r", "seismic"])
+
+        # Colormap
+        self._cmap = PropSelect(["RdBu_r", "viridis", "plasma", "inferno", "coolwarm", "magma", "seismic"])
         g.add_row("Colormap", self._cmap)
 
+        # vmin with auto toggle
+        vmin_row = QWidget()
+        vrl = QHBoxLayout(vmin_row)
+        vrl.setContentsMargins(0, 0, 0, 0)
+        vrl.setSpacing(4)
         self._vmin = PropInput("auto", mono=True)
-        g.add_row("vmin", self._vmin)
-        self._vmax = PropInput("auto", mono=True)
-        g.add_row("vmax", self._vmax)
+        self._vmin.setFixedWidth(70)
+        self._vmin_auto = QCheckBox("auto")
+        self._vmin_auto.setChecked(True)
+        self._vmin_auto.toggled.connect(lambda c: self._vmin.setEnabled(not c))
+        self._vmin.setEnabled(False)
+        vrl.addWidget(self._vmin)
+        vrl.addWidget(self._vmin_auto)
+        vrl.addStretch()
+        g.add_row("vmin", vmin_row)
 
+        # vmax with auto toggle
+        vmax_row = QWidget()
+        vxl = QHBoxLayout(vmax_row)
+        vxl.setContentsMargins(0, 0, 0, 0)
+        vxl.setSpacing(4)
+        self._vmax = PropInput("auto", mono=True)
+        self._vmax.setFixedWidth(70)
+        self._vmax_auto = QCheckBox("auto")
+        self._vmax_auto.setChecked(True)
+        self._vmax_auto.toggled.connect(lambda c: self._vmax.setEnabled(not c))
+        self._vmax.setEnabled(False)
+        vxl.addWidget(self._vmax)
+        vxl.addWidget(self._vmax_auto)
+        vxl.addStretch()
+        g.add_row("vmax", vmax_row)
+
+        # Colorbar position
+        self._colorbar_pos = PropSelect(["right", "bottom", "none"])
+        g.add_row("Colorbar", self._colorbar_pos)
+
+        # Title
+        self._title_edit = PropInput("", mono=False)
+        self._title_edit.setPlaceholderText("(auto)")
+        g.add_row("Title", self._title_edit)
+
+        # DPI
         self._dpi = PropInput("150", mono=True)
         g.add_row("DPI", self._dpi)
+
+        # Inline help tooltips on viz fields
+        self._cmap.setToolTip("Color palette used for the η/RMS heatmap")
+        self._vmin.setToolTip("Minimum value for colorbar (2nd percentile when auto)")
+        self._vmax.setToolTip("Maximum value for colorbar (98th percentile when auto)")
+        self._colorbar_pos.setToolTip("Colorbar position: right, bottom, or hidden")
+        self._title_edit.setToolTip("Optional plot title (leave blank for auto-generated)")
+        self._dpi.setToolTip("Output resolution in dots per inch (default 150)")
+
         layout.addWidget(g)
+
+        # Type-specific params
+        g_type = PropGroup("Type Parameters")
+        self._type_stack = QStackedWidget()
+
+        # η_map panel (index 0)
+        p_eta = QWidget()
+        pl = QVBoxLayout(p_eta)
+        pl.setContentsMargins(0, 0, 0, 0)
+        self._alpha_spin = QDoubleSpinBox()
+        self._alpha_spin.setRange(0.0, 1.0)
+        self._alpha_spin.setValue(0.8)
+        self._alpha_spin.setSingleStep(0.05)
+        self._alpha_spin.setFixedHeight(24)
+        ar = QWidget()
+        arl = QHBoxLayout(ar)
+        arl.setContentsMargins(0, 3, 0, 3)
+        arl.setSpacing(8)
+        albl = QLabel("Alpha")
+        albl.setFixedWidth(110)
+        albl.setStyleSheet(f"font-size:11.5px;color:{tokens.TEXT_SECONDARY};")
+        arl.addWidget(albl)
+        arl.addWidget(self._alpha_spin)
+        pl.addWidget(ar)
+        self._type_stack.addWidget(p_eta)  # 0: eta_map
+
+        # profile panel (index 1)
+        p_prof = QWidget()
+        ppl = QVBoxLayout(p_prof)
+        ppl.setContentsMargins(0, 0, 0, 0)
+        self._line_color = PropInput("#CC785C")
+        ppl.addWidget(QLabel("Line color"))
+        ppl.addWidget(self._line_color)
+        self._type_stack.addWidget(p_prof)  # 1: profile
+
+        # rms panel (index 2)
+        p_rms = QWidget()
+        rpl = QVBoxLayout(p_rms)
+        rpl.setContentsMargins(0, 0, 0, 0)
+        self._clip_pct = QSpinBox()
+        self._clip_pct.setRange(0, 100)
+        self._clip_pct.setValue(98)
+        self._clip_pct.setFixedHeight(24)
+        cr = QWidget()
+        crl = QHBoxLayout(cr)
+        crl.setContentsMargins(0, 3, 0, 3)
+        crl.setSpacing(8)
+        clbl = QLabel("Clip pct")
+        clbl.setFixedWidth(110)
+        clbl.setStyleSheet(f"font-size:11.5px;color:{tokens.TEXT_SECONDARY};")
+        crl.addWidget(clbl)
+        crl.addWidget(self._clip_pct)
+        rpl.addWidget(cr)
+        self._type_stack.addWidget(p_rms)  # 2: rms
+
+        g_type.content_layout.addWidget(self._type_stack)
+        layout.addWidget(g_type)
+
+        # Apply / Reset buttons
+        g_act = PropGroup("Apply")
+        self._btn_apply = QPushButton("Apply")
+        self._btn_apply.setFixedHeight(28)
+        self._btn_apply.setStyleSheet(
+            f"background:{tokens.BG_TERTIARY};color:{tokens.TEXT_PRIMARY};"
+            f"border:1px solid {tokens.BORDER_SUBTLE};border-radius:5px;"
+            f"padding:4px 14px;font-size:12px;"
+        )
+        self._btn_apply.clicked.connect(self._on_apply)
+        g_act.content_layout.addWidget(self._btn_apply)
+        self._btn_reset = QPushButton("Reset Defaults")
+        self._btn_reset.setFixedHeight(28)
+        self._btn_reset.clicked.connect(self.reset_clicked)
+        g_act.content_layout.addWidget(self._btn_reset)
+        layout.addWidget(g_act)
 
         # Export buttons
         g2 = PropGroup("Export")
@@ -614,6 +738,71 @@ class VizSettingsPanel(QWidget):
         layout.addWidget(g2)
 
         layout.addStretch()
+
+        # Track dirty state
+        self._dirty = False
+        for widget in [self._cmap, self._vmin, self._vmax, self._colorbar_pos, self._title_edit, self._dpi]:
+            if hasattr(widget, "currentIndexChanged"):
+                widget.currentIndexChanged.connect(self._mark_dirty)
+            elif hasattr(widget, "textChanged"):
+                widget.textChanged.connect(self._mark_dirty)
+
+    def _mark_dirty(self) -> None:
+        if not self._dirty:
+            self._dirty = True
+            self._btn_apply.setText("Apply *")
+            self._btn_apply.setStyleSheet(
+                f"background:{tokens.ACCENT_CLAY_BG};color:{tokens.ACCENT_CLAY};"
+                f"border:1px solid {tokens.ACCENT_CLAY};border-radius:5px;"
+                f"padding:4px 14px;font-size:12px;font-weight:600;"
+            )
+
+    def _on_apply(self) -> None:
+        self._dirty = False
+        self._btn_apply.setText("Apply")
+        self._btn_apply.setStyleSheet(
+            f"background:{tokens.BG_TERTIARY};color:{tokens.TEXT_PRIMARY};"
+            f"border:1px solid {tokens.BORDER_SUBTLE};border-radius:5px;"
+            f"padding:4px 14px;font-size:12px;"
+        )
+        self.apply_clicked.emit(self.get_viz_params())
+
+    def get_viz_params(self) -> dict:
+        return {
+            "cmap": self._cmap.currentText(),
+            "vmin": None if self._vmin_auto.isChecked() else self._vmin.text(),
+            "vmax": None if self._vmax_auto.isChecked() else self._vmax.text(),
+            "colorbar": self._colorbar_pos.currentText(),
+            "title": self._title_edit.text() or None,
+            "dpi": int(self._dpi.text()) if self._dpi.text().isdigit() else 150,
+            "alpha": self._alpha_spin.value(),
+        }
+
+    def set_scene_type(self, scene_type: str) -> None:
+        """Switch type-specific panel based on scene type."""
+        idx_map = {"eta_map": 0, "profile": 1, "rms": 2}
+        self._type_stack.setCurrentIndex(idx_map.get(scene_type, 0))
+
+    def load_viz_params(self, params: dict) -> None:
+        """Populate fields from a viz_params dict."""
+        if "cmap" in params:
+            idx = self._cmap.findText(params["cmap"])
+            if idx >= 0:
+                self._cmap.setCurrentIndex(idx)
+        if params.get("vmin") is not None:
+            self._vmin_auto.setChecked(False)
+            self._vmin.setText(str(params["vmin"]))
+        else:
+            self._vmin_auto.setChecked(True)
+        if params.get("vmax") is not None:
+            self._vmax_auto.setChecked(False)
+            self._vmax.setText(str(params["vmax"]))
+        else:
+            self._vmax_auto.setChecked(True)
+        if "dpi" in params:
+            self._dpi.setText(str(params["dpi"]))
+        self._dirty = False
+        self._btn_apply.setText("Apply")
 
 
 class ImportPanel(QWidget):

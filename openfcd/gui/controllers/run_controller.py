@@ -27,15 +27,15 @@ class _RunWorker(QThread):
     run_finished = pyqtSignal(str)    # run_id
     run_failed = pyqtSignal(str)      # error message
 
-    def __init__(self, project_path: Path, workers: int = -1) -> None:
+    def __init__(self, project_path: Path, workers: int = -1, disabled_indices: frozenset[int] = frozenset()) -> None:
         super().__init__()
         self._project_path = project_path
         self._workers = workers
+        self._disabled_indices = disabled_indices
         self._process: subprocess.Popen | None = None
         self._cancelled = False
 
     def run(self) -> None:
-        from datetime import datetime, timezone
         from openfcd.cli.cmd_run import PreprocessStage, ComputeStage, PostprocessStage
         from openfcd.io.store import FileSessionStore
         from openfcd.io.result import HDF5ResultStore
@@ -48,9 +48,13 @@ class _RunWorker(QThread):
         try:
             store = FileSessionStore.open(self._project_path)
             project = store.project
-            run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            run_id = "run-latest"
 
+            # Delete the previous run so results don't accumulate.
+            import shutil as _shutil
             run_dir = store._dir / "runs" / run_id
+            if run_dir.exists():
+                _shutil.rmtree(run_dir)
             run_dir.mkdir(parents=True, exist_ok=True)
             result_store = HDF5ResultStore.open(run_dir / "results.h5", mode="w")
 
@@ -65,9 +69,10 @@ class _RunWorker(QThread):
                 "batches_processed": [],
                 "frame_count": 0,
                 "frame_paths": [],
-                "annotation": store.annotation,  # pass annotation for ROI/mask
+"annotation": store.annotation,  # pass annotation for ROI/mask
                 "workers": self._workers,
-            }
+                "disabled_frame_indices": self._disabled_indices,
+}
 
             stages = [PreprocessStage(), ComputeStage(), PostprocessStage()]
             runner = PipelineRunner(stages, workers=self._workers if self._workers > 0 else -1)
@@ -146,19 +151,14 @@ class RunController(QObject):
     def is_running(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
-    def start_run(self, project_path: str | Path, workers: int = -1) -> None:
+    def start_run(self, project_path: str | Path, workers: int = -1, disabled_indices: frozenset[int] = frozenset()) -> None:
         """Start a pipeline run in background thread."""
         if self.is_running:
             self.run_failed.emit("Run already in progress")
             return
 
         path = Path(project_path)
-        self._worker = _RunWorker(path, workers)
-        self._worker.stage_event.connect(self.stage_event.emit)
-        self._worker.run_finished.connect(self.run_finished.emit)
-        self._worker.run_failed.connect(self.run_failed.emit)
-        self._worker.finished.connect(self._on_worker_finished)
-        self._worker.start()
+        self._worker = _RunWorker(path, workers, disabled_indices)
 
     def cancel(self) -> None:
         """Cancel the current run."""

@@ -25,6 +25,7 @@ class DataConfig(BaseModel):
     frames_dir: str
     pattern: str = "Img*.jpg"
     time_step_ms: float | None = None
+    disabled_frame_indices: list[int] = []
 
 
 class ReferenceConfig(BaseModel):

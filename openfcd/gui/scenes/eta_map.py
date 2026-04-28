@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget, QSizePolicy
 
 from openfcd.gui import tokens
 
@@ -33,6 +33,7 @@ class EtaMap(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._image_item = None
         self._mpl_canvas = None
         self._mpl_axes = None
@@ -85,6 +86,9 @@ class EtaMap(QWidget):
 
         if HAS_MATPLOTLIB and self._mpl_axes is not None and self._mpl_canvas is not None:
             self._mpl_axes.clear()
+            if arr.ndim < 2 or arr.size == 0:
+                self._mpl_canvas.draw_idle()
+                return
             image = self._mpl_axes.imshow(arr, cmap=colormap, origin="upper")
             self._mpl_axes.set_title("η heatmap")
             self._mpl_axes.set_xlabel("x [px]")

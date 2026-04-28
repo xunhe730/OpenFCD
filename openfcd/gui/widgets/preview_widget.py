@@ -28,6 +28,7 @@ from PyQt6.QtGui import (
 )
 
 from openfcd.gui import tokens
+from openfcd.gui.widgets.display_mode import DisplayMode, DisplayModeRegistry, DisplayModeSpec
 
 try:
     from matplotlib import cm
@@ -644,11 +645,21 @@ class PreviewWidget(QWidget):
     mask_completed = pyqtSignal(list, list)
     point_placed = pyqtSignal(int, int, int)
     preview_mode_changed = pyqtSignal(bool)  # True=per-frame eta, False=mean eta
+    export_png_requested = pyqtSignal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._frame_count = 0
         self._eta_state: dict | None = None
+        self._display_mode_registry = DisplayModeRegistry()
+        self._current_display_mode = DisplayMode.ORIGINAL
+        # Seed registry with ORIGINAL mode (no-op painter; image already shown by _view)
+        self._display_mode_registry.register(DisplayModeSpec(
+            mode=DisplayMode.ORIGINAL,
+            label="Original",
+            tooltip="Show source image only",
+            paint=lambda w, eta: None,
+        ))
         self._setup_ui()
         tokens.on_theme_changed(self._apply_theme)
         self._apply_theme()
@@ -790,9 +801,12 @@ class PreviewWidget(QWidget):
         *,
         opacity: float = 0.55,
         cmap_name: str = "RdBu_r",
+        show_overlap: bool = True,
     ) -> None:
+        # Sync the _ImageView overlap flag before rendering.
+        self._view._overlap_on = show_overlap
         result = self._view.show_eta_overlay(eta_mm, opacity=opacity, cmap_name=cmap_name)
-        self._display_bar.setVisible(True)
+        # display_bar (Overlap/Colorbar) now lives in the toolbar — keep hidden.
         if result is not None:
             vmin, vmax = result
             self._eta_state = {"vmin": vmin, "vmax": vmax, "cmap_name": cmap_name}
@@ -893,6 +907,37 @@ class PreviewWidget(QWidget):
         self._index_label.setText(f"{index + 1} / {self._frame_count}")
         self._slider.blockSignals(False)
 
+    def set_scene_slider(self, frame_indices: list[int]) -> None:
+        """Remap slider to a scene's frame subset (0..len-1 ticks)."""
+        self._scene_frame_indices = list(frame_indices)
+        if frame_indices:
+            self._slider.blockSignals(True)
+            self._slider.setRange(0, len(frame_indices) - 1)
+            self._slider.setValue(0)
+            self._slider.blockSignals(False)
+            self._slider.setVisible(len(frame_indices) > 1)
+        else:
+            self._slider.setVisible(False)
+
+    def restore_full_slider(self, total_frames: int) -> None:
+        """Restore slider to full frame range after leaving a scene view."""
+        self._scene_frame_indices = []
+        if total_frames > 0:
+            self._slider.blockSignals(True)
+            self._slider.setRange(0, total_frames - 1)
+            self._slider.blockSignals(False)
+            self._slider.setVisible(total_frames > 1)
+
+    def current_slider_value(self) -> int:
+        """Return current slider position."""
+        return self._slider.value()
+
     def _on_slider_changed(self, value: int) -> None:
         self._index_label.setText(f"{value + 1} / {self._frame_count}")
         self.frame_changed.emit(value)
+
+    def contextMenuEvent(self, event) -> None:
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.addAction("Export PNG…", lambda: self.export_png_requested.emit())
+        menu.exec(event.globalPos())

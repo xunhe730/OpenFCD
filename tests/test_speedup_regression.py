@@ -119,13 +119,14 @@ def test_compute_ref_invariants_matches_inline(tmp_path: Path) -> None:
     np.testing.assert_array_equal(inv.ref_ff, flatfield_normalize(ref, sigma=sigma_expected))
 
 
-def test_serial_vs_parallel_bit_equal(tmp_path: Path) -> None:
+def test_serial_vs_parallel_bit_equal(tmp_path: Path, monkeypatch) -> None:
     """workers=1 vs workers=4 produce bit-equal eta_mm.
 
-    The parallel branch wraps the thread pool in ``threadpool_limits(1)`` so
-    native math libraries (BLAS / OpenMP) don't oversubscribe and inject
-    nondeterminism into routines like ``inpaint_biharmonic``.
+    Pin OPENFCD_BLAS_THREADS=1 so native math libraries don't inject
+    nondeterminism (e.g. inpaint_biharmonic's linear solver).
+    The default is now "auto"; this test opts back into deterministic mode.
     """
+    monkeypatch.setenv("OPENFCD_BLAS_THREADS", "1")
     eta_serial = _run_compute(1, tmp_path)
     eta_parallel = _run_compute(4, tmp_path)
     assert len(eta_serial) == len(eta_parallel) > 0

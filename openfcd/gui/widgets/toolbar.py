@@ -4,9 +4,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from PyQt6.QtWidgets import (
-    QWidget, QHBoxLayout, QPushButton, QLabel, QFrame,
+    QWidget, QHBoxLayout, QPushButton, QLabel, QFrame, QCheckBox,
 )
-from PyQt6.QtCore import pyqtSignal, QEvent, QSize
+from PyQt6.QtCore import pyqtSignal, QEvent, QSize, QObject
 
 from openfcd.gui import tokens
 from openfcd.gui.icons import get_icon, ICON_NEW, ICON_OPEN, ICON_SAVE, ICON_RUN, ICON_STOP, ICON_LIGHT_MODE, ICON_DARK_MODE
@@ -151,14 +151,51 @@ class _ThemeToggle(QPushButton):
         self.setStyleSheet(";".join(parts) + ";")
 
 
+class _PreviewToggle(QPushButton):
+    """ON/OFF preview toggle. When ON: η overlay shown. OFF: source only."""
+
+    toggled_preview = pyqtSignal(bool)  # True=on, False=off
+
+    def __init__(self, parent=None) -> None:
+        super().__init__("Preview", parent)
+        self.setCheckable(True)
+        self.setChecked(False)
+        self.setEnabled(False)
+        self.setFixedHeight(26)
+        self.setMinimumWidth(70)
+        tokens.on_theme_changed(self._apply_style)
+        self.toggled.connect(self._on_toggled)
+        self._apply_style()
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._apply_style()
+        self.toggled_preview.emit(checked)
+
+    def _apply_style(self) -> None:
+        if not self.isEnabled():
+            bg, fg = tokens.BG_TERTIARY, tokens.TEXT_MUTED
+        elif self.isChecked():
+            bg, fg = tokens.ACCENT_CLAY, "#fff"
+        else:
+            bg, fg = tokens.BG_TERTIARY, tokens.TEXT_PRIMARY
+        self.setStyleSheet(
+            f"background:{bg};color:{fg};border-radius:5px;"
+            f"padding:3px 10px;font-size:12px;font-weight:{'600' if self.isChecked() else '500'};"
+            f"font-family:{tokens.FONT_UI};border:1px solid {tokens.BORDER_SUBTLE};"
+        )
+
+
 class Toolbar(QWidget):
-    """Action toolbar: New, Open, Save | Run, Cancel | Theme Toggle."""
+    """Action toolbar: New, Open, Save | Run, Cancel | Preview + Overlap + Colorbar | Theme Toggle."""
 
     new_project_clicked = pyqtSignal()
     open_clicked = pyqtSignal()
     save_clicked = pyqtSignal()
     run_clicked = pyqtSignal()
     cancel_clicked = pyqtSignal()
+    preview_changed = pyqtSignal(bool)    # True=on, False=off
+    overlap_changed = pyqtSignal(bool)
+    colorbar_changed = pyqtSignal(bool)
 
     _running: bool
     _btn_open: _ToolbarButton
@@ -188,6 +225,8 @@ class Toolbar(QWidget):
         )
         for sep in self._dividers:
             sep.setStyleSheet("background:" + tokens.BORDER_SUBTLE + ";border:none;")
+        for cb in (self._overlap_cb, self._colorbar_cb):
+            cb.setStyleSheet(f"color:{tokens.TEXT_SECONDARY};font-size:12px;")
         self.set_running(self._running)
 
     def _setup_ui(self) -> None:
@@ -226,6 +265,28 @@ class Toolbar(QWidget):
         self._running_label.setVisible(False)
         layout.addWidget(self._running_label)
 
+        layout.addWidget(self._divider())
+
+        # Preview toggle + Overlap + Colorbar inline
+        self._btn_preview_toggle = _PreviewToggle()
+        self._btn_preview_toggle.toggled_preview.connect(self._on_preview_toggled)
+        self._btn_preview_toggle.toggled_preview.connect(self.preview_changed)
+        layout.addWidget(self._btn_preview_toggle)
+
+        self._overlap_cb = QCheckBox("Overlap")
+        self._overlap_cb.setChecked(True)
+        self._overlap_cb.setEnabled(False)
+        self._overlap_cb.setStyleSheet(f"color:{tokens.TEXT_SECONDARY};font-size:12px;")
+        self._overlap_cb.toggled.connect(self.overlap_changed)
+        layout.addWidget(self._overlap_cb)
+
+        self._colorbar_cb = QCheckBox("Colorbar")
+        self._colorbar_cb.setChecked(False)
+        self._colorbar_cb.setEnabled(False)
+        self._colorbar_cb.setStyleSheet(f"color:{tokens.TEXT_SECONDARY};font-size:12px;")
+        self._colorbar_cb.toggled.connect(self.colorbar_changed)
+        layout.addWidget(self._colorbar_cb)
+
         # Spacer
         layout.addStretch()
 
@@ -233,9 +294,13 @@ class Toolbar(QWidget):
         self._theme_toggle = _ThemeToggle()
         layout.addWidget(self._theme_toggle)
 
-        # Background
         # Managed by _apply_theme
         self.set_running(self._running)
+
+    def _on_preview_toggled(self, on: bool) -> None:
+        self._overlap_cb.setEnabled(on)
+        self._colorbar_cb.setEnabled(on)
+        self._apply_theme()
 
     def _divider(self) -> QFrame:
         sep = QFrame()
@@ -250,7 +315,7 @@ class Toolbar(QWidget):
         """Toggle Run/Cancel visibility and show running indicator."""
         self._running = running
         self._btn_run.setVisible(not running)
-        self._btn_cancel.setVisible(not running)
+        self._btn_cancel.setVisible(running)   # Cancel shows while running
         if running:
             self._btn_cancel.set_muted(False)
             self._btn_cancel.setStyleSheet(
@@ -265,3 +330,35 @@ class Toolbar(QWidget):
             self._btn_cancel.setStyleSheet("")
             self._btn_cancel.set_muted(True)
             self._running_label.setVisible(False)
+
+    def set_preview_available(self, available: bool) -> None:
+        """Enable/disable the Preview toggle button."""
+        self._btn_preview_toggle.setEnabled(available)
+        if not available:
+            self._btn_preview_toggle.blockSignals(True)
+            self._btn_preview_toggle.setChecked(False)
+            self._btn_preview_toggle.blockSignals(False)
+            self._btn_preview_toggle._apply_style()
+            self._overlap_cb.setEnabled(False)
+            self._colorbar_cb.setEnabled(False)
+
+    def set_preview_on(self, on: bool) -> None:
+        """Programmatically set preview on/off without emitting toggled_preview."""
+        self._btn_preview_toggle.blockSignals(True)
+        self._btn_preview_toggle.setChecked(on)
+        self._btn_preview_toggle.blockSignals(False)
+        self._overlap_cb.setEnabled(on)
+        self._colorbar_cb.setEnabled(on)
+        self._btn_preview_toggle._apply_style()
+
+    def preview_on(self) -> bool:
+        """Return True if preview is currently ON."""
+        return self._btn_preview_toggle.isChecked()
+
+    def overlap_on(self) -> bool:
+        """Return True if Overlap checkbox is checked."""
+        return self._overlap_cb.isChecked()
+
+    def colorbar_on(self) -> bool:
+        """Return True if Colorbar checkbox is checked."""
+        return self._colorbar_cb.isChecked()

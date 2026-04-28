@@ -18,6 +18,7 @@ from openfcd.gui.icons import (
     ICON_SPEED, ICON_CHECK_CIRCLE, ICON_ERROR, ICON_SCHEDULE,
     ICON_PIE_CHART,
 )
+from openfcd.io.scene import SceneSpec, SceneType
 
 
 class NodeType(Enum):
@@ -52,14 +53,20 @@ class SimTree(QTreeWidget):
     node_selected = pyqtSignal(str)
     set_reference_requested = pyqtSignal(int)
     compute_frame_requested = pyqtSignal(int)
+    frame_disabled_requested = pyqtSignal(int)
+    frame_enabled_requested = pyqtSignal(int)
+    new_scene_requested = pyqtSignal(str)        # scene type string
+    delete_scene_requested = pyqtSignal(str)     # scene id
+    duplicate_scene_requested = pyqtSignal(str)  # scene id
+    export_scene_requested = pyqtSignal(str)     # scene id
+    reveal_scene_requested = pyqtSignal(str)     # scene id
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._frames: list[Path] = []
         self._ref_index: int = -1
+        self._disabled_indices: set[int] = set()
         self._setup_ui()
-        tokens.on_theme_changed(self._apply_theme)
-        self._apply_theme()
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(self._style())
@@ -241,7 +248,120 @@ class SimTree(QTreeWidget):
             item.setForeground(0, QColor(tokens.TEXT_MUTED))
         return item
 
-    # ── Context menu ────────────────────────────────────────────────
+    # ── Scene population ─────────────────────────────────────────────
+
+    def _find_or_create_parent(self, label: str) -> QTreeWidgetItem:
+        """Find the section node whose text starts with label, or create it.
+
+        Searches children of topLevelItem(0) first (normal populated tree),
+        then top-level items directly (bare/test tree), then creates one.
+        """
+        root = self.topLevelItem(0)
+        if root is not None:
+            # Search children of root (normal case after populate_from_session)
+            for i in range(root.childCount()):
+                child = root.child(i)
+                if child.text(0).startswith(label):
+                    return child
+            # Also check if root itself matches (bare tree with label as root)
+            if root.text(0).startswith(label):
+                return root
+        # Search all top-level items
+        for i in range(self.topLevelItemCount()):
+            tli = self.topLevelItem(i)
+            if tli.text(0).startswith(label):
+                return tli
+        # Not found: create and attach under root, or as top-level
+        item = QTreeWidgetItem([label])
+        if root is not None:
+            root.addChild(item)
+        else:
+            self.addTopLevelItem(item)
+        return item
+
+    def populate_scenes(
+        self,
+        scenes: list[SceneSpec],
+        missing_counts: dict[str, int] | None = None,
+    ) -> None:
+        """Add/update Scene child nodes under the Scenes parent.
+
+        Args:
+            scenes: list of SceneSpec to display.
+            missing_counts: optional mapping of scene_id → count of frame indices
+                absent in the latest Run's results.h5. When non-zero a badge is
+                appended to the label and a warning line added to the tooltip.
+        """
+        scenes_parent = self._find_or_create_parent("Scenes")
+        while scenes_parent.childCount() > 0:
+            scenes_parent.removeChild(scenes_parent.child(0))
+        for spec in scenes:
+            missing = (missing_counts or {}).get(spec.id, 0)
+            total = len(spec.frame_indices)
+            label = spec.name
+            if missing > 0:
+                label = f"{spec.name}  [{missing}/{total} missing]"
+            item = QTreeWidgetItem(scenes_parent)
+            item.setText(0, label)
+            item.setData(0, ROLE_DATA, spec.id)
+            item.setData(0, ROLE_NODE_TYPE, NodeType.SCENE_ITEM)
+            created = spec.created_at[:10] if spec.created_at else "—"
+            type_str = spec.type.value if hasattr(spec.type, "value") else str(spec.type)
+            run_str = spec.run_id if spec.run_id else "—"
+            tooltip = f"[{type_str.upper()}] {total} frames · created {created} · run: {run_str}"
+            if missing > 0:
+                tooltip += f"\n⚠ {missing} frames not in latest Run"
+            item.setToolTip(0, tooltip)
+        scenes_parent.setExpanded(True)
+
+    @staticmethod
+    def _reveal_label() -> str:
+        import sys
+        if sys.platform == "darwin":
+            return "Reveal in Finder"
+        if sys.platform == "win32":
+            return "Show in Explorer"
+        return "Open Folder"
+
+    def _start_rename(self, item: QTreeWidgetItem) -> None:
+        self.editItem(item, 0)
+
+    def contextMenuEvent(self, event) -> None:
+        item = self.itemAt(event.pos())
+        if item is None:
+            return
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background-color: {tokens.BG_PRIMARY}; color: {tokens.TEXT_PRIMARY};"
+            f" border: 1px solid {tokens.BORDER_SUBTLE}; font-family: {tokens.FONT_UI};"
+            f" font-size: 12px; }}"
+            f" QMenu::item:selected {{ background-color: {tokens.ACCENT_CLAY}; color: white; }}"
+        )
+        if node_type == NodeType.SCENES:
+            menu.addAction("New η Map",   lambda: self.new_scene_requested.emit("eta_map"))
+            menu.addAction("New Profile", lambda: self.new_scene_requested.emit("profile"))
+            menu.addAction("New RMS",     lambda: self.new_scene_requested.emit("rms"))
+        elif node_type == NodeType.SCENE_ITEM:
+            scene_id = item.data(0, ROLE_DATA)
+            menu.addAction("Rename",    lambda: self._start_rename(item))
+            menu.addAction("Delete",    lambda: self.delete_scene_requested.emit(scene_id))
+            menu.addAction("Duplicate", lambda: self.duplicate_scene_requested.emit(scene_id))
+            menu.addSeparator()
+            menu.addAction("Export PNG…", lambda: self.export_scene_requested.emit(scene_id))
+            menu.addSeparator()
+            menu.addAction(self._reveal_label(), lambda sid=scene_id: self.reveal_scene_requested.emit(sid))
+        if not menu.isEmpty():
+            menu.exec(event.globalPos())
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        item = self.currentItem()
+        if item and item.data(0, ROLE_NODE_TYPE) == NodeType.SCENE_ITEM:
+            self.editItem(item, 0)
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    # ── Legacy context menu (internal slot) ─────────────────────────
 
     def _on_context_menu(self, pos) -> None:
         item = self.itemAt(pos)
@@ -274,6 +394,15 @@ class SimTree(QTreeWidget):
                 act_ref.triggered.connect(lambda: self.set_reference_requested.emit(frame_idx))
                 act_compute = menu.addAction("Compute This Frame")
                 act_compute.triggered.connect(lambda: self.compute_frame_requested.emit(frame_idx))
+                menu.addSeparator()
+                if frame_idx in self._disabled_indices:
+                    act_enable = menu.addAction("Enable Frame")
+                    act_enable.triggered.connect(
+                        lambda: self.frame_enabled_requested.emit(frame_idx))
+                else:
+                    act_disable = menu.addAction("Disable Frame")
+                    act_disable.triggered.connect(
+                        lambda: self.frame_disabled_requested.emit(frame_idx))
 
         elif node_type == NodeType.RUNS:
             act_run_all = menu.addAction("Run All Frames")
@@ -281,15 +410,20 @@ class SimTree(QTreeWidget):
             act_run_all.setData("run_all")
 
         elif node_type == NodeType.SCENES:
-            for label in ["New η Map", "New λ/h Profile", "New RMS Map"]:
-                menu.addAction(label)
+            menu.addAction("New η Map",   lambda: self.new_scene_requested.emit("eta_map"))
+            menu.addAction("New Profile", lambda: self.new_scene_requested.emit("profile"))
+            menu.addAction("New RMS",     lambda: self.new_scene_requested.emit("rms"))
 
         elif node_type == NodeType.SCENE_ITEM:
-            menu.addAction("Export as PNG")
-            menu.addAction("Export as PDF")
-            menu.addAction("Export as CSV")
+            scene_id = item.data(0, ROLE_DATA)
+            menu.addAction("Rename",    lambda: self._start_rename(item))
+            menu.addAction("Delete",    lambda: self.delete_scene_requested.emit(scene_id))
+            menu.addAction("Duplicate", lambda: self.duplicate_scene_requested.emit(scene_id))
             menu.addSeparator()
-            menu.addAction("Delete")
+            menu.addAction("Export PNG…", lambda: self.export_scene_requested.emit(scene_id))
+            menu.addSeparator()
+            menu.addAction(self._reveal_label(),
+                           lambda sid=scene_id: self.reveal_scene_requested.emit(sid))
 
         else:
             return  # No menu for other node types
@@ -336,3 +470,36 @@ class SimTree(QTreeWidget):
                             frame_item.setIcon(0, get_icon(ICON_PHOTO))
                             frame_item.setForeground(0, QColor(tokens.TEXT_PRIMARY))
                 break
+
+    # ── Frame disable / enable ─────────────────────────────────────
+
+    @property
+    def disabled_indices(self) -> frozenset[int]:
+        return frozenset(self._disabled_indices)
+
+    def set_frame_disabled(self, index: int, disabled: bool) -> None:
+        if disabled:
+            self._disabled_indices.add(index)
+        else:
+            self._disabled_indices.discard(index)
+        self._refresh_frame_visual(index)
+
+    def _refresh_frame_visual(self, index: int) -> None:
+        root = self.topLevelItem(0)
+        if root is None:
+            return
+        for i in range(root.childCount()):
+            section = root.child(i)
+            if section.data(0, ROLE_NODE_TYPE) == NodeType.IMAGES:
+                for j in range(section.childCount()):
+                    frame_item = section.child(j)
+                    idx = frame_item.data(0, ROLE_DATA)
+                    if idx == index:
+                        if idx in self._disabled_indices:
+                            frame_item.setForeground(0, QColor(tokens.TEXT_MUTED))
+                        elif idx == self._ref_index:
+                            frame_item.setForeground(0, QColor(tokens.ACCENT_CLAY))
+                        else:
+                            frame_item.setForeground(0, QColor(tokens.TEXT_PRIMARY))
+                        return
+                return

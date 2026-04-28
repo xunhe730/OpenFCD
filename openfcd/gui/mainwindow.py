@@ -18,6 +18,8 @@ from openfcd.gui.widgets.status_bar import StatusBar
 from openfcd.gui.widgets.toolbar import Toolbar
 from openfcd.gui.widgets.preview_widget import PreviewWidget
 from openfcd.gui.controllers import RunController, SessionController
+from openfcd.gui.controllers.view_router import ViewRouter
+from openfcd.gui.preferences import get_prefs
 
 
 def _apply_optical_preset(project, preset: str) -> bool:
@@ -93,6 +95,7 @@ class _SingleFrameWorker(QThread):
     frame_done = pyqtSignal(object, object)  # eta_mm overlay, eta_mm cropped
     frame_failed = pyqtSignal(str)           # error message
     frame_progress = pyqtSignal(int, str)    # pct (0-100), stage label
+    reference_resolved = pyqtSignal(object)  # np.ndarray, for cache write-back
 
     def __init__(
         self,
@@ -100,12 +103,14 @@ class _SingleFrameWorker(QThread):
         project_dir: Path,
         frame_path: Path,
         annotation,
+        cached_reference=None,
     ) -> None:
         super().__init__()
         self._project = project
         self._project_dir = project_dir
         self._frame_path = frame_path
         self._annotation = annotation
+        self._cached_reference = cached_reference
 
     def run(self) -> None:
         try:
@@ -118,7 +123,13 @@ class _SingleFrameWorker(QThread):
             from openfcd.pipeline.compute import load_gray
 
             geom = _build_geom_params(self._project)
-            ref_img = _resolve_reference(self._project, self._project_dir)
+            self.frame_progress.emit(2, "Loading reference…")
+            if self._cached_reference is not None:
+                ref_img = self._cached_reference
+            else:
+                ref_img = _resolve_reference(self._project, self._project_dir)
+                self.reference_resolved.emit(ref_img)
+            self.frame_progress.emit(8, "Loading frame…")
             def_img = load_gray(self._frame_path)
 
             if ref_img.shape != def_img.shape:
@@ -189,11 +200,15 @@ class MainWindow(QMainWindow):
         
         tokens.set_dark_mode(tokens.is_dark)
         
+        self._prefs = get_prefs()
         self._session = SessionController(self)
         self._run_ctrl = RunController(self)
         # Run-result state (populated on Run completion; used for per-frame η preview)
         self._run_eta_frames = None      # np.ndarray (N,H,W) or None
         self._run_eta_mean = None        # np.ndarray (H,W) or None
+        # Per-frame η cache: populated by single-frame compute AND full Run.
+        # Keyed by frame index; cleared when a new project opens.
+        self._frame_eta_cache: dict[int, np.ndarray] = {}
         self._setup_ui()
         self._connect_signals()
         tokens.on_theme_changed(self._apply_theme)
@@ -236,6 +251,7 @@ class MainWindow(QMainWindow):
         # Central stack: index 0 = placeholder, expanded later with
         # PreviewWidget / thumbnail grid / SceneTabs (post-processing only)
         self._center_stack = QStackedWidget()
+        self._view_router = ViewRouter(self._center_stack)
 
         # Placeholder welcome label
         from PyQt6.QtWidgets import QLabel
@@ -255,6 +271,11 @@ class MainWindow(QMainWindow):
         self._scene_tabs.setVisible(False)
         self._center_stack.addWidget(self._scene_tabs)  # index 2
 
+        # SceneContainer — routes scene type to dedicated view (index 3)
+        from openfcd.gui.scenes.scene_container import SceneContainer
+        self._scene_container = SceneContainer(self)
+        self._center_stack.addWidget(self._scene_container)  # index 3
+
         center_layout.addWidget(self._center_stack, 1)
         splitter.addWidget(center_col)
 
@@ -269,6 +290,16 @@ class MainWindow(QMainWindow):
         self._frames: list[Path] = []
         self._current_frame_idx: int = -1
 
+        # Track current scene selection and per-scene slider positions
+        self._current_scene_id: str | None = None
+        self._scene_slider_pos: dict[str, int] = {}   # scene_id → last slider index
+
+        # Register view handlers
+        self._view_router.register("image_frame", lambda s, c: self._handle_image_frame(s, c))
+        self._view_router.register("images",      lambda s, c: self._handle_images(s, c))
+        self._view_router.register("scene_item",  lambda s, c: self._handle_scene_item(s, c))
+        self._view_router.set_default(lambda s, c: None)
+
         # ── Status bar (22px) ──
         self._status_bar = StatusBar(self)
         self._status_bar.set_items(["Ready"])
@@ -278,6 +309,11 @@ class MainWindow(QMainWindow):
         self._sim_tree.node_selected.connect(self._on_node_selected)
         self._sim_tree.set_reference_requested.connect(self._on_set_reference)
         self._sim_tree.compute_frame_requested.connect(self._on_compute_frame)
+        self._sim_tree.new_scene_requested.connect(self._on_new_scene_requested)
+        self._sim_tree.delete_scene_requested.connect(self._on_delete_scene_requested)
+        self._sim_tree.duplicate_scene_requested.connect(self._on_duplicate_scene_requested)
+        self._sim_tree.export_scene_requested.connect(self._on_export_scene_png)
+        self._sim_tree.reveal_scene_requested.connect(self._on_reveal_scene)
         self._title_bar.menu_requested.connect(self._on_menu_requested)
         self._session.session_opened.connect(self._on_session_opened)
         self._session.session_modified.connect(self._on_session_dirty)
@@ -285,6 +321,11 @@ class MainWindow(QMainWindow):
         self._run_ctrl.stage_event.connect(self._on_stage_event)
         self._run_ctrl.run_finished.connect(self._on_run_finished)
         self._run_ctrl.run_failed.connect(self._on_run_failed)
+        self._toolbar.preview_changed.connect(self._on_preview_changed)
+        self._toolbar.overlap_changed.connect(self._on_overlap_changed)
+        self._toolbar.colorbar_changed.connect(self._on_colorbar_changed)
+        # Preview export PNG via right-click context menu
+        self._preview.export_png_requested.connect(self._export_current_view_png)
         # Preview pixel hover → status bar
         self._preview.pixel_hovered.connect(self._on_pixel_hover)
         # Preview frame slider → show that frame
@@ -311,75 +352,246 @@ class MainWindow(QMainWindow):
         self._properties.taper_alpha_changed.connect(self._on_taper_alpha_changed)
         self._properties.edge_nan_changed.connect(self._on_edge_nan_changed)
 
+        # ⌘N shortcut: New η Map when a Scene node is selected, else New Project
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        self._shortcut_new_eta = QShortcut(QKeySequence("Ctrl+N"), self)
+        self._shortcut_new_eta.activated.connect(self._on_shortcut_new_eta)
+
+    def _on_shortcut_new_eta(self) -> None:
+        """⌘N — trigger New η Map when a Scene node is selected."""
+        item = self._sim_tree.currentItem()
+        if item is None:
+            self._on_new()  # no selection → fall back to New Project
+            return
+        from openfcd.gui.panels.sim_tree import ROLE_NODE_TYPE, NodeType
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type in (NodeType.SCENE_ITEM, NodeType.SCENES):
+            self._on_new_scene_requested("eta_map")
+        else:
+            self._on_new()
+
+    # ── Scene signal handlers ────────────────────────────────────────
+    def _on_new_scene_requested(self, scene_type: str) -> None:
+        """Open FramePickerDialog, create a SceneSpec, add to session, navigate."""
+        if not self._session.has_project:
+            return
+        if not self._frames:
+            QMessageBox.information(self, "No Frames",
+                "请先打开一个包含图像帧的项目。\nNo image frames loaded.")
+            return
+
+        # Check if a Run exists (needed to display η)
+        run_exists = bool(self._run_eta_frames is not None or self._run_eta_mean is not None)
+        if not run_exists and self._session.project_path:
+            runs_dir = self._session.project_path / "runs"
+            run_exists = runs_dir.is_dir() and any(runs_dir.iterdir())
+
+        from openfcd.gui.dialogs.frame_picker import FramePickerDialog
+        if not run_exists:
+            QMessageBox.information(self, "Run First",
+                f"创建 {scene_type} Scene 需要先完成一次 Run。\n"
+                "Please run a computation first.")
+            return
+
+        dialog = FramePickerDialog(
+            self,
+            frames=self._frames,
+            run_exists=run_exists,
+            preselected=list(range(len(self._frames))),
+        )
+        if dialog.exec() != FramePickerDialog.DialogCode.Accepted:
+            return
+
+        indices = dialog.selected_indices()
+        if not indices:
+            return
+
+        import uuid, datetime
+        from openfcd.io.scene import SceneSpec, SceneType
+        type_map = {"eta_map": SceneType.ETA_MAP, "profile": SceneType.PROFILE, "rms": SceneType.RMS}
+        name_map = {"eta_map": "η Map", "profile": "Profile", "rms": "RMS"}
+
+        # Bind to latest run_id if available
+        run_id = None
+        if self._session.project_path:
+            runs_dir = self._session.project_path / "runs"
+            if runs_dir.is_dir():
+                dirs = sorted(d.name for d in runs_dir.iterdir() if d.is_dir())
+                run_id = dirs[-1] if dirs else None
+
+        spec = SceneSpec(
+            id=str(uuid.uuid4())[:8],
+            name=f"{name_map.get(scene_type, scene_type)} {len(self._session.scenes) + 1}",
+            type=type_map.get(scene_type, SceneType.ETA_MAP),
+            frame_indices=indices,
+            created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            run_id=run_id,
+        )
+        self._session.add_scene(spec)
+        self._sim_tree.populate_scenes(self._session.scenes)
+        self._status_bar.set_items(["Ready", f"Scene created: {spec.name}"])
+
+        # Navigate immediately to the new scene
+        self._scene_container.show_scene(spec, self._session.project_path)
+        self._center_stack.setCurrentWidget(self._scene_container)
+        self._current_scene_id = spec.id
+        self._toolbar.set_preview_available(False)
+
+    def _on_delete_scene_requested(self, scene_id: str) -> None:
+        reply = QMessageBox.question(
+            self, "Delete Scene",
+            "Delete this scene? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._session.remove_scene(scene_id)
+            self._sim_tree.populate_scenes(self._session.scenes)
+            self._status_bar.set_items(["Ready", "Scene deleted"])
+
+    def _on_duplicate_scene_requested(self, scene_id: str) -> None:
+        from openfcd.io.scene import SceneSpec
+        import uuid
+        import datetime
+        for spec in self._session.scenes:
+            if spec.id == scene_id:
+                new_spec = SceneSpec(
+                    id=str(uuid.uuid4())[:8],
+                    name=f"{spec.name} (copy)",
+                    type=spec.type,
+                    frame_indices=list(spec.frame_indices),
+                    viz_params=dict(spec.viz_params),
+                    profile_lines=spec.profile_lines,
+                    created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    run_id=spec.run_id,
+                )
+                self._session.add_scene(new_spec)
+                self._sim_tree.populate_scenes(self._session.scenes)
+                self._status_bar.set_items(["Ready", f"Duplicated: {new_spec.name}"])
+                return
+
+    def _on_reveal_scene(self, scene_id: str) -> None:
+        """Open the OS file browser at the scene's JSON file location."""
+        if not self._session.project_path:
+            return
+        scenes_dir = self._session.project_path / "scenes"
+        scene_file = scenes_dir / f"{scene_id}.json"
+        target = scene_file if scene_file.exists() else scenes_dir
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
     # ── Node routing ────────────────────────────────────────────────
     def _on_node_selected(self, key: str) -> None:
         """Route tree selection to center preview + right panel."""
-        # Right panel routing
         self._properties.show_figure_properties(key)
+        self._view_router.route(key, {"key": key})
 
-        # Center preview routing
-        k = key.lower()
-        if k == "image_frame":
-            # Show the selected frame image
-            item = self._sim_tree.currentItem()
-            if item:
-                from openfcd.gui.panels.sim_tree import ROLE_DATA
-                idx = item.data(0, ROLE_DATA)
-                if idx is not None and 0 <= idx < len(self._frames):
-                    self._current_frame_idx = idx
-                    self._preview.set_image(self._frames[idx])
-                    self._preview.set_slider_value(idx)
-                    self._center_stack.setCurrentWidget(self._preview)
-                    # Update frame info panel
-                    fpath = self._frames[idx]
-                    from PyQt6.QtGui import QImage
-                    qimg = QImage(str(fpath))
-                    size_str = f"{qimg.width()}×{qimg.height()}" if not qimg.isNull() else "?"
-                    panel = self._properties.image_properties_panel
-                    panel.set_frame_info(
-                        fpath.name, size_str, idx, len(self._frames)
-                    )
-                    
-                    # Update annotation state
-                    self._preview.clear_overlays()
-                    if self._session.has_project:
-                        ann = self._session.annotation
-                        
-                        # ROI
-                        roi = ann.roi
-                        if not roi.is_empty:
-                            self._preview.show_roi(int(roi.y), int(roi.x), int(roi.height), int(roi.width))
-                            panel.set_roi(int(roi.x), int(roi.y), int(roi.width), int(roi.height))
-                        else:
-                            panel.set_roi(0, 0, 0, 0)
-                            
-                        # Dilate value
-                        panel._dilate_spin.blockSignals(True)
-                        panel._dilate_spin.setValue(ann.dilate_cells)
-                        panel._dilate_spin.blockSignals(False)
-                        dilate_px = ann.dilate_cells * ann.cell_mm * 7.27 # rough estimation
-                            
-                        # Mask (per frame)
-                        if fpath.name in ann.frame_polygons:
-                            polys = ann.frame_polygons[fpath.name]
-                            if polys and polys[0].vertices:
-                                self._preview.show_mask(polys[0].vertices, dilate_px=dilate_px)
-                                panel.set_mask_status(f"{len(polys[0].vertices)} pts")
-                            else:
-                                panel.set_mask_status("Not set")
+    def _handle_image_frame(self, stack, ctx: dict) -> None:
+        """Show the selected frame image in the preview."""
+        item = self._sim_tree.currentItem()
+        if item:
+            from openfcd.gui.panels.sim_tree import ROLE_DATA
+            idx = item.data(0, ROLE_DATA)
+            if idx is not None and 0 <= idx < len(self._frames):
+                self._current_frame_idx = idx
+                self._preview.set_image(self._frames[idx])
+                self._preview.set_slider_value(idx)
+                stack.setCurrentWidget(self._preview)
+                # Restore full-frame slider range when returning from a scene view
+                self._preview.restore_full_slider(len(self._frames))
+                # Update frame info panel
+                fpath = self._frames[idx]
+                from PyQt6.QtGui import QImage
+                qimg = QImage(str(fpath))
+                size_str = f"{qimg.width()}×{qimg.height()}" if not qimg.isNull() else "?"
+                panel = self._properties.image_properties_panel
+                panel.set_frame_info(
+                    fpath.name, size_str, idx, len(self._frames)
+                )
+
+                # Re-enable toolbar preview if a run exists
+                if self._run_eta_frames is not None or self._run_eta_mean is not None:
+                    self._toolbar.set_preview_available(True)
+
+                # Update annotation state
+                self._preview.clear_overlays()
+                if self._session.has_project:
+                    ann = self._session.annotation
+
+                    # ROI
+                    roi = ann.roi
+                    if not roi.is_empty:
+                        self._preview.show_roi(int(roi.y), int(roi.x), int(roi.height), int(roi.width))
+                        panel.set_roi(int(roi.x), int(roi.y), int(roi.width), int(roi.height))
+                    else:
+                        panel.set_roi(0, 0, 0, 0)
+
+                    # Dilate value
+                    panel._dilate_spin.blockSignals(True)
+                    panel._dilate_spin.setValue(ann.dilate_cells)
+                    panel._dilate_spin.blockSignals(False)
+                    dilate_px = ann.dilate_cells * ann.cell_mm * 7.27  # rough estimation
+
+                    # Mask (per frame)
+                    if fpath.name in ann.frame_polygons:
+                        polys = ann.frame_polygons[fpath.name]
+                        if polys and polys[0].vertices:
+                            self._preview.show_mask(polys[0].vertices, dilate_px=dilate_px)
+                            panel.set_mask_status(f"{len(polys[0].vertices)} pts")
                         else:
                             panel.set_mask_status("Not set")
-                            
-        elif k == "images":
-            # Show welcome or thumbnail grid (TODO: Phase 5)
-            self._center_stack.setCurrentIndex(0)
-        elif k == "scene_item":
-            # Post-processing viz
-            self._scene_tabs.setVisible(True)
-            self._center_stack.setCurrentIndex(2)  # SceneTabs
-        else:
-            # Default: keep current view
-            pass
+                    else:
+                        panel.set_mask_status("Not set")
+
+                # Re-apply η overlay according to current toolbar mode.
+                # MUST come after annotation setup so η renders on top.
+                self._reapply_run_eta()
+
+    def _handle_images(self, stack, ctx: dict) -> None:
+        """Show welcome or thumbnail grid (TODO: Phase 5)."""
+        stack.setCurrentIndex(0)
+        self._preview.restore_full_slider(len(self._frames))
+        if self._run_eta_frames is not None or self._run_eta_mean is not None:
+            self._toolbar.set_preview_available(True)
+
+    def _handle_scene_item(self, stack, ctx: dict) -> None:
+        """Show scene view for selected Scene (routes by SceneType)."""
+        from openfcd.gui.panels.sim_tree import ROLE_DATA
+        self._toolbar.set_preview_available(False)
+
+        item = self._sim_tree.currentItem()
+        if item is None:
+            stack.setCurrentIndex(0)
+            return
+
+        scene_id: str | None = item.data(0, ROLE_DATA)
+        if not scene_id or not self._session.has_project:
+            stack.setCurrentIndex(0)
+            return
+
+        # Save previous scene slider pos
+        if self._current_scene_id and self._current_scene_id != scene_id:
+            self._scene_slider_pos[self._current_scene_id] = self._preview.current_slider_value()
+
+        self._current_scene_id = scene_id
+
+        spec = next((s for s in self._session.scenes if s.id == scene_id), None)
+        self._scene_container.show_scene(spec, self._session.project_path)
+        stack.setCurrentWidget(self._scene_container)
+
+    def _on_preview_changed(self, on: bool) -> None:
+        """Toolbar Preview ON/OFF toggled — re-apply eta overlay."""
+        self._reapply_run_eta()
+        self._status_bar.set_items(["Ready", "Preview: ON" if on else "Preview: OFF"])
+
+    def _on_overlap_changed(self, on: bool) -> None:
+        """Toolbar Overlap checkbox changed — re-apply eta overlay."""
+        self._reapply_run_eta()
+
+    def _on_colorbar_changed(self, on: bool) -> None:
+        """Toolbar Colorbar checkbox changed — re-apply eta overlay."""
+        self._reapply_run_eta()
 
     def _on_pixel_hover(self, row: int, col: int, value: int) -> None:
         """Update status bar with pixel coordinates."""
@@ -407,6 +619,7 @@ class MainWindow(QMainWindow):
             proj.reference.mode = "use_existing"
             proj.reference.source = self._frames[idx].name
             self._sim_tree.update_ref_mark(idx)
+            self._session.invalidate_reference_cache()
             self._session.mark_dirty()
 
     def _on_compute_frame(self, idx: int) -> None:
@@ -423,38 +636,34 @@ class MainWindow(QMainWindow):
         if idx < 0 or idx >= len(self._frames):
             return
 
-        # Sync ComputePanel params before running
+        # Reflect "running" state immediately so the user gets instant feedback,
+        # before any blocking sync/validation runs.
+        self._toolbar.set_running(True)
+        self._status_bar.set_items(["Running", f"Preparing frame {idx + 1}…"])
+        self._status_bar.show_progress(0, 100)
+
+        # Sync ComputePanel params before running. These are cheap UI reads.
         self._sync_compute_panel_to_project()
         if not self._ensure_optical_config_ready(interactive=True):
+            self._toolbar.set_running(False)
+            self._status_bar.hide_progress()
             return
 
-        # Warn when reference and deformed carriers differ by >10% (zoom mismatch).
         frame_path = self._frames[idx]
-        scale_warning = self._check_carrier_scale(proj, frame_path)
-        if scale_warning:
-            reply = QMessageBox.warning(
-                self, "Scale Mismatch Detected",
-                f"{scale_warning}\n\nScale normalization will be applied automatically.\nContinue?",
-                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Ok,
-            )
-            if reply == QMessageBox.StandardButton.Cancel:
-                return
-
-        self._toolbar.set_running(True)
-        self._status_bar.set_items(["Running", f"Computing frame {idx + 1}..."])
-        self._status_bar.show_progress(0, 100)
+        self._status_bar.set_items(["Running", f"Computing frame {idx + 1}…"])
 
         worker = _SingleFrameWorker(
             project=proj,
             project_dir=self._session.project_path,
             frame_path=frame_path,
             annotation=self._session.annotation,
+            cached_reference=self._session.get_cached_reference(),
         )
         self._single_frame_worker = worker
         worker.frame_done.connect(self._on_single_frame_done)
         worker.frame_failed.connect(self._on_single_frame_failed)
         worker.frame_progress.connect(self._on_single_frame_progress)
+        worker.reference_resolved.connect(self._session.cache_reference)
         worker.finished.connect(lambda: setattr(self, "_single_frame_worker", None))
         worker.start()
 
@@ -489,18 +698,24 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_single_frame_done(self, eta_overlay, eta_mm) -> None:
-        """Single frame computation finished — show eta map."""
+        """Single frame computation finished — store result and display."""
         self._toolbar.set_running(False)
         self._status_bar.hide_progress()
         import numpy as np
         vmin = float(np.nanpercentile(eta_mm, 2)) if not np.all(np.isnan(eta_mm)) else -0.35
         vmax = float(np.nanpercentile(eta_mm, 98)) if not np.all(np.isnan(eta_mm)) else 0.35
-        self._status_bar.set_items([
-            "Done",
-            f"η ∈ [{vmin:.3f}, {vmax:.3f}] mm",
-        ])
+        self._status_bar.set_items(["Done", f"η ∈ [{vmin:.3f}, {vmax:.3f}] mm"])
+
+        # Store in unified cache so frame navigation can re-show this η.
+        self._frame_eta_cache[self._current_frame_idx] = eta_overlay
+
+        # Activate toolbar if not already done.
+        self._toolbar.set_preview_available(True)
+        if not self._toolbar.preview_on():
+            self._toolbar.set_preview_on(True)
+
         self._center_stack.setCurrentWidget(self._preview)
-        self._preview.show_eta_overlay(eta_overlay)
+        self._reapply_run_eta()
 
     def _on_single_frame_failed(self, error: str) -> None:
         """Single frame computation failed."""
@@ -690,7 +905,7 @@ class MainWindow(QMainWindow):
         """Handle custom menu requests from the title bar."""
         from PyQt6.QtWidgets import QMenu
         from PyQt6.QtGui import QCursor
-        
+
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
@@ -703,28 +918,199 @@ class MainWindow(QMainWindow):
                 color: white;
             }}
         """)
-        
-        if menu_name == "File":
-            menu.addAction("New Project...", self._on_new)
-            menu.addAction("Open Project...", self._on_open)
-            menu.addSeparator()
-            menu.addAction("Save", self._session.save)
-            menu.addSeparator()
-            menu.addAction("Exit", self.close)
-        elif menu_name == "Run":
-            menu.addAction("Run All Frames", self._on_run)
-            menu.addSeparator()
-            menu.addAction("Cancel", self._run_ctrl.cancel)
-        elif menu_name == "View":
-            menu.addAction("Dark Mode", lambda: tokens.set_dark_mode(not tokens.is_dark))
-        else:
-            act = menu.addAction(f"Not applicable for {menu_name} in v0.0.1")
+
+        builders = {
+            "File": self._build_file_menu,
+            "Edit": self._build_edit_menu,
+            "Run": self._build_run_menu,
+            "Scenes": self._build_scenes_menu,
+            "Tools": self._build_tools_menu,
+            "View": self._build_view_menu,
+            "Help": self._build_help_menu,
+        }
+        builder = builders.get(menu_name)
+        if builder is None:
+            act = menu.addAction(f"Unknown menu: {menu_name}")
             act.setEnabled(False)
-            
+        else:
+            builder(menu)
+
         menu.exec(QCursor.pos())
+
+    # ── menu builders ────────────────────────────────────────────────
+    def _export_current_view_png(self) -> None:
+        """Export the currently visible central widget as PNG."""
+        from PyQt6.QtWidgets import QFileDialog
+        import datetime
+        project_name = (
+            self._session.project_path.name.replace(".ofcd", "")
+            if self._session.project_path else "openfcd"
+        )
+        scene_name = "view"
+        if self._current_scene_id:
+            for spec in self._session.scenes:
+                if spec.id == self._current_scene_id:
+                    scene_name = spec.name.replace(" ", "_")
+                    break
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{project_name}_{scene_name}_{ts}.png"
+        start_dir = self._prefs.last_export_dir or self._prefs.last_project_dir or str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export PNG", str(Path(start_dir) / default_name), "PNG files (*.png)"
+        )
+        if not path:
+            return
+        self._prefs.last_export_dir = str(Path(path).parent)
+        current = self._center_stack.currentWidget()
+        if current is None:
+            return
+        from PyQt6.QtGui import QPixmap
+        pixmap = current.grab()
+        if pixmap.save(path, "PNG"):
+            self._status_bar.set_items(["Exported", Path(path).name])
+        else:
+            QMessageBox.warning(self, "Export Failed", f"Could not save PNG to:\n{path}")
+
+    def _on_export_scene_png(self, scene_id: str) -> None:
+        self._current_scene_id = scene_id
+        self._export_current_view_png()
+
+    def _build_file_menu(self, menu) -> None:
+        menu.addAction("New Project...", self._on_new)
+        menu.addAction("Open Project...", self._on_open)
+        recent_menu = menu.addMenu("Recent Projects")
+        self._populate_recent_projects_menu(recent_menu)
+        menu.addSeparator()
+        save_act = menu.addAction("Save", self._session.save)
+        save_act.setEnabled(self._session.has_project)
+        export_act = menu.addAction("Export Current View as PNG…", self._export_current_view_png)
+        export_act.setEnabled(self._center_stack.currentIndex() > 0)
+        menu.addSeparator()
+        menu.addAction("Exit", self.close)
+
+    def _populate_recent_projects_menu(self, recent_menu) -> None:
+        recents = self._prefs.recent_projects
+        if not recents:
+            none_act = recent_menu.addAction("(none)")
+            none_act.setEnabled(False)
+        else:
+            for path in recents:
+                exists = Path(path).exists()
+                label = path if exists else f"{path}  (missing)"
+                act = recent_menu.addAction(label)
+                act.triggered.connect(lambda _checked=False, p=path: self._open_project_path(p))
+        recent_menu.addSeparator()
+        clear_act = recent_menu.addAction("Clear Recent")
+        clear_act.setEnabled(bool(recents))
+        clear_act.triggered.connect(self._on_clear_recent)
+
+    def _on_clear_recent(self) -> None:
+        self._prefs.clear_recent_projects()
+        self._status_bar.set_items(["Ready", "Recent projects cleared"])
+
+    def _build_edit_menu(self, menu) -> None:
+        clear_act = menu.addAction("Clear Recent Projects", self._on_clear_recent)
+        clear_act.setEnabled(bool(self._prefs.recent_projects))
+        menu.addSeparator()
+        menu.addAction("Reset UI Preferences", self._on_reset_prefs)
+
+    def _on_reset_prefs(self) -> None:
+        reply = QMessageBox.question(
+            self, "Reset UI Preferences",
+            "Reset all UI preferences (last directories, last parameters, recent list)?\n"
+            "This does not modify any project files.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._prefs.reset()
+            self._status_bar.set_items(["Ready", "UI preferences reset"])
+
+    def _build_run_menu(self, menu) -> None:
+        run_act = menu.addAction("Run All Frames", self._on_run)
+        run_act.setEnabled(self._session.has_project)
+        menu.addSeparator()
+        menu.addAction("Cancel", self._run_ctrl.cancel)
+
+    def _build_scenes_menu(self, menu) -> None:
+        menu.addAction("Show Welcome", lambda: self._center_stack.setCurrentIndex(0))
+        menu.addAction(
+            "Show Image Preview",
+            lambda: self._center_stack.setCurrentWidget(self._preview),
+        )
+
+        def _show_scene_tabs() -> None:
+            self._scene_tabs.setVisible(True)
+            self._center_stack.setCurrentWidget(self._scene_tabs)
+
+        menu.addAction("Show Scene Tabs", _show_scene_tabs)
+
+    def _build_tools_menu(self, menu) -> None:
+        validate_act = menu.addAction(
+            "Validate Optical Stack",
+            lambda: self._ensure_optical_config_ready(interactive=True),
+        )
+        validate_act.setEnabled(self._session.has_project)
+
+        reset_act = menu.addAction(
+            "Reset Compute Defaults",
+            self._populate_compute_panel_from_project,
+        )
+        reset_act.setEnabled(self._session.has_project)
+
+        menu.addSeparator()
+        fast_act = menu.addAction("Fast Compute (use all CPU cores)")
+        fast_act.setCheckable(True)
+        fast_act.setChecked(self._prefs.fast_compute)
+        fast_act.setToolTip(
+            "Let BLAS/OpenMP fan out across cores during a Run.\n"
+            "Faster on large frame sets but breaks bit-equal serial↔parallel."
+        )
+        fast_act.toggled.connect(self._on_fast_compute_toggled)
+
+    def _on_fast_compute_toggled(self, enabled: bool) -> None:
+        self._prefs.fast_compute = enabled
+        self._status_bar.set_items([
+            "Ready",
+            "Fast compute: ON" if enabled else "Fast compute: OFF",
+        ])
+
+    def _build_view_menu(self, menu) -> None:
+        menu.addAction("Toggle Dark Mode", lambda: tokens.set_dark_mode(not tokens.is_dark))
+
+    def _build_help_menu(self, menu) -> None:
+        menu.addAction("About OpenFCD", self._on_about)
+        menu.addAction("Open Documentation", self._on_open_docs)
+
+    def _on_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "About OpenFCD",
+            "<b>OpenFCD</b> v0.0.1<br>"
+            "Free-surface height reconstruction from synthetic-Schlieren video.<br><br>"
+            "Pipeline: Preprocess → Compute → Postprocess.<br>"
+            "GUI · CLI parity via shared stage chain.",
+        )
+
+    def _on_open_docs(self) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        # Walk up from this module to find the repo root containing docs/.
+        candidate = Path(__file__).resolve()
+        for parent in candidate.parents:
+            docs = parent / "docs"
+            if docs.is_dir():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(docs)))
+                return
+        self._status_bar.set_items(["Help", "docs/ folder not found"])
 
     # ── Session events ──────────────────────────────────────────────
     def _on_session_opened(self, path: str) -> None:
+        # New project → clear η caches from any previous session.
+        self._frame_eta_cache = {}
+        self._run_eta_frames = None
+        self._run_eta_mean = None
         proj_path = Path(path)
         name = proj_path.name
         self._title_bar.set_project_title(f"{name} — OpenFCD")
@@ -739,6 +1125,14 @@ class MainWindow(QMainWindow):
         if proj and proj.data.frames_dir:
             from openfcd.io.image import scan_frames
             frames = scan_frames(proj.data.frames_dir, proj.data.pattern)
+
+            # Show image picker to let user filter frames before import.
+            if frames:
+                from openfcd.gui.dialogs.image_picker import ImagePickerDialog
+                picker = ImagePickerDialog(self, frames=frames)
+                if picker.exec() == ImagePickerDialog.DialogCode.Accepted:
+                    frames = picker.selected_frames
+
             # Find ref index
             if proj.reference.source:
                 for i, f in enumerate(frames):
@@ -754,6 +1148,9 @@ class MainWindow(QMainWindow):
             frames=frames,
             ref_index=ref_idx,
         )
+
+        # Load scenes into SimTree
+        self._sim_tree.populate_scenes(self._session.scenes)
 
         # Setup preview slider
         self._preview.setup_slider(len(frames))
@@ -800,21 +1197,74 @@ class MainWindow(QMainWindow):
             # TODO: get annotation from AnnotationPanel once built
 
     # ── Run events ──────────────────────────────────────────────────
+    # Map each stage's local 0..1 progress onto a slice of the global bar so
+    # Preprocess (fast) doesn't shoot to 100% before Compute starts.
+    _STAGE_RANGES = {
+        "preprocess": (0.0, 0.05),
+        "compute":    (0.05, 0.95),
+        "postprocess":(0.95, 1.0),
+    }
+
     def _on_stage_event(self, event) -> None:
-        stage = getattr(event, "stage", "unknown")
-        progress = getattr(event, "progress", 0.0)
+        stage = getattr(event, "stage", "unknown") or "unknown"
+        progress = getattr(event, "progress", None)
         frame = getattr(event, "frame", None)
 
-        self._status_bar.set_progress(int(progress * 100))
-        if frame is not None:
-            self._status_bar.set_items(["Running", stage, f"frame {frame}", f"{progress:.0%}"])
+        lo, hi = self._STAGE_RANGES.get(stage.lower(), (0.0, 1.0))
+        if progress is None:
+            # Info/heartbeat event — keep the bar at the stage floor instead
+            # of snapping to 0% (which used to make the bar look frozen).
+            global_pct = int(lo * 100)
         else:
-            self._status_bar.set_items(["Running", stage, f"{progress:.0%}"])
+            local = max(0.0, min(1.0, float(progress)))
+            global_pct = int((lo + (hi - lo) * local) * 100)
+
+        self._status_bar.set_progress(global_pct)
+        label_pct = f"{global_pct}%"
+        if frame is not None:
+            self._status_bar.set_items(["Running", stage, f"frame {frame}", label_pct])
+        else:
+            self._status_bar.set_items(["Running", stage, label_pct])
+
+    def _compute_missing_counts(self, run_id: str) -> dict[str, int]:
+        """For each scene, count how many frame_indices are absent in results.h5."""
+        if not self._session.project_path:
+            return {}
+        h5_path = self._session.project_path / "runs" / run_id / "results.h5"
+        if not h5_path.exists():
+            return {}
+        try:
+            from openfcd.io.result import HDF5ResultStore
+            store = HDF5ResultStore.open(h5_path, "r")
+            available = set(store.list_frames("default"))
+            store.close()
+        except Exception:
+            return {}
+        result = {}
+        for spec in self._session.scenes:
+            missing = sum(1 for idx in spec.frame_indices if idx not in available)
+            if missing:
+                result[spec.id] = missing
+        return result
 
     def _on_run_finished(self, _run_id: str) -> None:
         self._toolbar.set_running(False)
         self._status_bar.hide_progress()
-        self._status_bar.set_items(["Ready", "Computation complete"])
+
+        # Refresh all scenes to use the new run
+        self._session.refresh_scenes(_run_id)
+        # Invalidate RMS view caches (force recompute with new data)
+        if hasattr(self, "_scene_container"):
+            self._scene_container._rms_view._cached_spec_id = None
+            self._scene_container._rms_view._cached_rms = None
+        # Re-populate SimTree scene nodes with updated specs + badges
+        missing_counts = self._compute_missing_counts(_run_id)
+        self._sim_tree.populate_scenes(self._session.scenes, missing_counts)
+        n_scenes = len(self._session.scenes)
+        if n_scenes > 0:
+            self._status_bar.set_items(["Ready", "Computation complete", f"{n_scenes} scenes refreshed"])
+        else:
+            self._status_bar.set_items(["Ready", "Computation complete"])
 
         if not self._session.project_path:
             return
@@ -842,11 +1292,23 @@ class MainWindow(QMainWindow):
                 self._run_eta_mean = None
 
             frame_ids = result_store.list_frames(batch)
+            # Guard against OOM: skip per-frame caching when total would
+            # exceed ~800 MB. GUI falls back to showing only eta_mean.
+            _guard_bytes = 800_000_000
             frames_list = []
+            _size_known = False
+            _per_frame_bytes = 0
             for fid in frame_ids:
                 try:
                     arr = result_store.read_frame(batch, fid)
                     if arr.ndim == 2 and arr.size > 1:
+                        if not _size_known:
+                            _per_frame_bytes = arr.nbytes
+                            _size_known = True
+                        if _per_frame_bytes * len(frame_ids) > _guard_bytes:
+                            # Too large to cache all frames — skip per-frame stack
+                            frames_list = []
+                            break
                         frames_list.append(np.asarray(arr))
                     else:
                         frames_list.append(None)
@@ -868,36 +1330,68 @@ class MainWindow(QMainWindow):
             if result_store is not None:
                 result_store.close()
 
-        # Display in the preview widget (not scene_tabs) so the frame slider
-        # drives per-frame η navigation.  Toggle appears next to Overlap/Colorbar.
+        # Populate per-frame cache from Run results so frame navigation works.
+        if self._run_eta_frames is not None:
+            for i, eta in enumerate(self._run_eta_frames):
+                if 0 <= i < len(self._frames) and not np.all(np.isnan(eta)):
+                    self._frame_eta_cache[i] = eta
+
+        # Display in the preview widget.
         if self._run_eta_frames is not None or self._run_eta_mean is not None:
             self._center_stack.setCurrentWidget(self._preview)
             self._preview.set_preview_toggle_visible(self._run_eta_frames is not None)
             self._preview.set_preview_mode(True)
+            self._toolbar.set_preview_available(True)
+            self._toolbar.set_preview_on(True)
+            self._status_bar.set_items(["Run done", "Preview: ON"])
             self._reapply_run_eta()
+
+        # Show "N scenes refreshed" for 3 seconds then restore to "Ready"
+        from PyQt6.QtCore import QTimer
+        n_scenes = len(self._session.scenes)
+        if n_scenes > 0:
+            self._status_bar.set_items(["Run done", f"{n_scenes} scenes refreshed"])
+            QTimer.singleShot(3000, lambda: self._status_bar.set_items(["Ready"]))
+        else:
+            self._status_bar.set_items(["Ready", "Computation complete"])
 
     def _on_preview_mode_changed(self, enabled: bool) -> None:
         """Preview toggle flipped — swap between per-frame η and eta_mean (instant)."""
         self._reapply_run_eta()
 
     def _reapply_run_eta(self) -> None:
-        """Apply the appropriate η overlay (current-frame or mean) from the last Run."""
-        if self._run_eta_frames is None and self._run_eta_mean is None:
+        """Apply η overlay for the current frame using unified cache.
+
+        Priority: Run per-frame stack > single-frame cache > Run mean.
+        Respects the toolbar Preview ON/OFF and Overlap toggle.
+        """
+        preview_on = self._toolbar.preview_on() if hasattr(self._toolbar, "preview_on") else False
+        if not preview_on:
+            self._preview.clear_overlays()
             return
-        use_frame = (
-            self._preview.preview_mode()
-            and self._run_eta_frames is not None
-            and 0 <= self._current_frame_idx < self._run_eta_frames.shape[0]
-        )
-        if use_frame:
-            eta = self._run_eta_frames[self._current_frame_idx]
-        elif self._run_eta_mean is not None:
+
+        eta = None
+
+        # 1. Run per-frame result for this frame
+        if (self._run_eta_frames is not None
+                and 0 <= self._current_frame_idx < self._run_eta_frames.shape[0]):
+            candidate = self._run_eta_frames[self._current_frame_idx]
+            if not np.all(np.isnan(candidate)):
+                eta = candidate
+
+        # 2. Single-frame compute cache for this frame
+        if eta is None and self._current_frame_idx in self._frame_eta_cache:
+            eta = self._frame_eta_cache[self._current_frame_idx]
+
+        # 3. Run mean (fallback when per-frame unavailable)
+        if eta is None and self._run_eta_mean is not None:
             eta = self._run_eta_mean
-        elif self._run_eta_frames is not None and self._run_eta_frames.shape[0] > 0:
-            eta = self._run_eta_frames[0]
-        else:
+
+        if eta is None:
             return
-        self._preview.show_eta_overlay(np.asarray(eta))
+
+        overlap = self._toolbar.overlap_on() if hasattr(self._toolbar, "overlap_on") else True
+        self._preview.show_eta_overlay(np.asarray(eta), show_overlap=overlap)
 
     def _on_run_failed(self, error: str) -> None:
         self._toolbar.set_running(False)
@@ -906,21 +1400,33 @@ class MainWindow(QMainWindow):
 
     # ── Actions ─────────────────────────────────────────────────────
     def _on_open(self) -> None:
+        start_dir = self._prefs.last_project_dir or ""
         path = QFileDialog.getExistingDirectory(
-            self, "Open .ofcd Project", ""
+            self, "Open .ofcd Project", start_dir
         )
         if path:
-            try:
-                self._session.open_project(path)
-            except (FileNotFoundError, ValueError) as e:
-                QMessageBox.warning(self, "Open Failed", str(e))
+            self._open_project_path(path)
+
+    def _open_project_path(self, path: str) -> None:
+        try:
+            self._session.open_project(path)
+        except (FileNotFoundError, ValueError) as err:
+            QMessageBox.warning(self, "Open Failed", str(err))
+            return
+        self._record_recent_project(path)
+
+    def _record_recent_project(self, path: str) -> None:
+        proj_path = Path(path)
+        self._prefs.add_recent_project(str(proj_path))
+        if proj_path.parent.exists():
+            self._prefs.last_project_dir = str(proj_path.parent)
 
     def _on_new(self) -> None:
         from openfcd.gui.dialogs.new_project_wizard import NewProjectWizard
-        wizard = NewProjectWizard(self)
+        wizard = NewProjectWizard(self, prefs=self._prefs)
         if wizard.exec() == NewProjectWizard.DialogCode.Accepted:
             try:
-                self._session.new_project(
+                project_dir = self._session.new_project(
                     name=wizard.project_name,
                     location=wizard.project_location,
                     image_folder=wizard.image_folder,
@@ -930,8 +1436,9 @@ class MainWindow(QMainWindow):
                     glass_thickness_mm=wizard.glass_thickness_mm,
                     fluid_depth_mm=wizard.fluid_depth_mm,
                 )
-            except Exception as e:
-                QMessageBox.warning(self, "Create Failed", str(e))
+                self._record_recent_project(str(project_dir))
+            except Exception as err:
+                QMessageBox.warning(self, "Create Failed", str(err))
 
     def _on_run(self) -> None:
         if not self._session.has_project:
@@ -965,6 +1472,17 @@ class MainWindow(QMainWindow):
         self._toolbar.set_running(True)
         self._status_bar.set_items(["Running", "Initializing..."])
         self._status_bar.show_progress(0, 100)
+
+        # Apply fast-compute toggle: lets BLAS/OpenMP fan out across cores
+        # (gives N-way parallelism even on a single Run). Off → bit-equal mode.
+        import os as _os
+        if self._prefs.fast_compute:
+            _os.environ["OPENFCD_BLAS_THREADS"] = "auto"
+            _os.environ["OPENFCD_STREAM_RESULTS"] = "1"
+        else:
+            _os.environ.pop("OPENFCD_BLAS_THREADS", None)
+            _os.environ.pop("OPENFCD_STREAM_RESULTS", None)
+
         self._run_ctrl.start_run(str(self._session.project_path), workers=workers)
 
     # ── Annotation handlers ────────────────────────────────────────

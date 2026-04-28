@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from openfcd.io.project import ProjectModel
 from openfcd.io.annotation import AnnotationSchema, load as load_annotation, save as save_annotation
+from openfcd.io.scene import load_scenes, save_scene as _save_scene, delete_scene as _delete_scene
 
 
 _LOCK = threading.Lock()
@@ -45,9 +46,12 @@ class FileSessionStore:
             data={"frames_dir": ""},
         )
         project.to_yaml(dir_path / "project.yaml")
-        session = {"scenes": {}, "ui_state": {}}
+        session = {"scenes": {}, "ui_state": {}, "scenes_order": []}
         (dir_path / "session.json").write_text(json.dumps(session, indent=2))
-        return cls(dir_path, project)
+        store = cls(dir_path, project)
+        store._scenes: list = []
+        store._scenes_dirty: set[str] = set()
+        return store
 
     @classmethod
     def open(cls, dir_path: str | Path, read_only: bool = False) -> "FileSessionStore":
@@ -64,6 +68,25 @@ class FileSessionStore:
         if not read_only:
             lock_path = dir_path / "session.lock"
             lock_path.write_text(str(threading.get_ident()))
+
+        # Load scenes
+        scenes_dir = dir_path / "scenes"
+        loaded_scenes = load_scenes(scenes_dir)
+        # Load scenes_order from session.json
+        session_data: dict = {}
+        session_path = dir_path / "session.json"
+        if session_path.exists():
+            try:
+                session_data = json.loads(session_path.read_text())
+            except Exception:
+                pass
+        scenes_order = session_data.get("scenes_order", [])
+        # Reorder loaded_scenes according to scenes_order
+        id_to_spec = {s.id: s for s in loaded_scenes}
+        ordered = [id_to_spec[sid] for sid in scenes_order if sid in id_to_spec]
+        unordered = [s for s in loaded_scenes if s.id not in set(scenes_order)]
+        store._scenes = ordered + unordered
+        store._scenes_dirty: set[str] = set()
         return store
 
     def save(self) -> None:
@@ -73,9 +96,28 @@ class FileSessionStore:
         tmp = yaml_path.with_suffix(".yaml.tmp")
         self._project.to_yaml(tmp)
         os.replace(tmp, yaml_path)
-        
+
         save_annotation(self._dir / "annotations" / "default.json", self._annotation)
-        
+
+        # Persist dirty scenes
+        scenes_dir = self._dir / "scenes"
+        for spec in getattr(self, "_scenes", []):
+            if spec.id in getattr(self, "_scenes_dirty", set()):
+                _save_scene(spec, scenes_dir)
+        if hasattr(self, "_scenes_dirty"):
+            self._scenes_dirty.clear()
+
+        # Write scenes_order into session.json
+        session_path = self._dir / "session.json"
+        try:
+            session_data = json.loads(session_path.read_text()) if session_path.exists() else {}
+        except Exception:
+            session_data = {}
+        session_data["scenes_order"] = [s.id for s in getattr(self, "_scenes", [])]
+        tmp_s = session_path.with_suffix(".json.tmp")
+        tmp_s.write_text(json.dumps(session_data, indent=2))
+        os.replace(tmp_s, session_path)
+
         self._dirty = False
 
     def save_as(self, path: str | Path) -> None:
@@ -135,3 +177,29 @@ class FileSessionStore:
     @property
     def dirty(self) -> bool:
         return self._dirty
+
+    # ── Scene mutation API ───────────────────────────────────────────
+    @property
+    def scenes(self) -> list:
+        return list(getattr(self, "_scenes", []))
+
+    def add_scene(self, spec) -> None:
+        scenes = list(getattr(self, "_scenes", []))
+        scenes.append(spec)
+        self._scenes = scenes
+        if not hasattr(self, "_scenes_dirty"):
+            self._scenes_dirty = set()
+        self._scenes_dirty.add(spec.id)
+
+    def update_scene(self, spec) -> None:
+        scenes = getattr(self, "_scenes", [])
+        self._scenes = [spec if s.id == spec.id else s for s in scenes]
+        if not hasattr(self, "_scenes_dirty"):
+            self._scenes_dirty = set()
+        self._scenes_dirty.add(spec.id)
+
+    def remove_scene(self, scene_id: str) -> None:
+        self._scenes = [s for s in getattr(self, "_scenes", []) if s.id != scene_id]
+        if hasattr(self, "_scenes_dirty"):
+            self._scenes_dirty.discard(scene_id)
+        _delete_scene(scene_id, self._dir / "scenes")

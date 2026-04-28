@@ -14,12 +14,22 @@ from PyQt6.QtGui import QIcon
 
 from openfcd.gui import tokens
 from openfcd.gui.icons import get_icon, ICON_ARROW_BACK, ICON_ARROW_FORWARD
+from openfcd.gui.preferences import UserPrefs, get_prefs
+
+# Hardcoded fallbacks for first-run when no prefs exist.
+_FALLBACK_PERIOD_MM = 1.2
+_FALLBACK_GLASS_MM = 3.0
+_FALLBACK_FLUID_MM = 12.0
+_FALLBACK_PATTERN = "Img*.jpg"
+_FALLBACK_PRESET = "pattern_below_window"
+
 
 class NewProjectWizard(QDialog):
     """3-step wizard: Name & path → Image source & reference → Optical setup."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, prefs: UserPrefs | None = None) -> None:
         super().__init__(parent)
+        self._prefs = prefs if prefs is not None else get_prefs()
         self._step = 0  # 0-indexed
         self._setup_ui()
         self._update_nav()
@@ -108,7 +118,8 @@ class NewProjectWizard(QDialog):
         form.addRow("Project name:", self.name_edit)
 
         path_layout = QHBoxLayout()
-        self.location_edit = QLineEdit(str(Path.home() / "Documents"))
+        initial_location = self._prefs.last_project_dir or str(Path.home() / "Documents")
+        self.location_edit = QLineEdit(initial_location)
         self.location_edit.setStyleSheet(self._input_style())
         self.location_edit.textChanged.connect(self._update_preview)
         browse_btn = QPushButton("Browse…")
@@ -140,7 +151,7 @@ class NewProjectWizard(QDialog):
         form.setSpacing(10)
 
         img_layout = QHBoxLayout()
-        self.image_folder_edit = QLineEdit("")
+        self.image_folder_edit = QLineEdit(self._prefs.last_image_folder)
         self.image_folder_edit.setPlaceholderText("/path/to/image/folder")
         self.image_folder_edit.setStyleSheet(self._input_style())
         img_browse = QPushButton("Browse…")
@@ -149,7 +160,7 @@ class NewProjectWizard(QDialog):
         img_layout.addWidget(img_browse)
         form.addRow("Image folder:", img_layout)
 
-        self.pattern_edit = QLineEdit("Img*.jpg")
+        self.pattern_edit = QLineEdit(self._prefs.last_file_pattern or _FALLBACK_PATTERN)
         self.pattern_edit.setStyleSheet(self._input_style())
         self.pattern_edit.textChanged.connect(self._on_pattern_changed)
         form.addRow("File pattern:", self.pattern_edit)
@@ -177,25 +188,30 @@ class NewProjectWizard(QDialog):
         self._optical_preset = QComboBox()
         self._optical_preset.addItems(["pattern_below_window", "immersed_pattern", "custom"])
         self._optical_preset.setStyleSheet(self._input_style())
+        preset_idx = self._optical_preset.findText(
+            self._prefs.last_optical_preset or _FALLBACK_PRESET
+        )
+        if preset_idx >= 0:
+            self._optical_preset.setCurrentIndex(preset_idx)
         form.addRow("Preset:", self._optical_preset)
 
         self._pattern_period = QDoubleSpinBox()
         self._pattern_period.setRange(0.01, 50.0)
-        self._pattern_period.setValue(1.2)
+        self._pattern_period.setValue(self._prefs.last_pattern_period_mm or _FALLBACK_PERIOD_MM)
         self._pattern_period.setSuffix(" mm")
         self._pattern_period.setDecimals(2)
         form.addRow("Pattern period:", self._pattern_period)
 
         self._glass_thickness = QDoubleSpinBox()
         self._glass_thickness.setRange(0.0, 100.0)
-        self._glass_thickness.setValue(3.0)
+        self._glass_thickness.setValue(self._prefs.last_glass_thickness_mm or _FALLBACK_GLASS_MM)
         self._glass_thickness.setSuffix(" mm")
         self._glass_thickness.setDecimals(2)
         form.addRow("Window glass:", self._glass_thickness)
 
         self._fluid_depth = QDoubleSpinBox()
         self._fluid_depth.setRange(0.01, 500.0)
-        self._fluid_depth.setValue(12.0)
+        self._fluid_depth.setValue(self._prefs.last_fluid_depth_mm or _FALLBACK_FLUID_MM)
         self._fluid_depth.setSuffix(" mm")
         self._fluid_depth.setDecimals(2)
         form.addRow("Fluid depth:", self._fluid_depth)
@@ -242,7 +258,20 @@ class NewProjectWizard(QDialog):
             self._step += 1
             self._update_nav()
         else:
+            self.persist_to_prefs()
             self.accept()
+
+    def persist_to_prefs(self) -> None:
+        """Save the wizard's current values back to UserPrefs."""
+        self._prefs.last_project_dir = self.project_location
+        if self.image_folder:
+            self._prefs.last_image_folder = self.image_folder
+        if self.file_pattern:
+            self._prefs.last_file_pattern = self.file_pattern
+        self._prefs.last_optical_preset = self.optical_preset
+        self._prefs.last_pattern_period_mm = float(self.pattern_period_mm)
+        self._prefs.last_glass_thickness_mm = float(self.glass_thickness_mm)
+        self._prefs.last_fluid_depth_mm = float(self.fluid_depth_mm)
 
     def _prev_step(self) -> None:
         if self._step > 0:
@@ -256,12 +285,22 @@ class NewProjectWizard(QDialog):
         self._path_preview.setText(str(Path(loc) / f"{name}.ofcd"))
 
     def _browse_location(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Project Location")
+        start = (
+            self.location_edit.text().strip()
+            or self._prefs.last_project_dir
+            or str(Path.home() / "Documents")
+        )
+        path = QFileDialog.getExistingDirectory(self, "Select Project Location", start)
         if path:
             self.location_edit.setText(path)
 
     def _browse_image_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+        start = (
+            self.image_folder_edit.text().strip()
+            or self._prefs.last_image_folder
+            or str(Path.home())
+        )
+        path = QFileDialog.getExistingDirectory(self, "Select Image Folder", start)
         if path:
             self.image_folder_edit.setText(path)
             self._auto_detect_pattern(path)

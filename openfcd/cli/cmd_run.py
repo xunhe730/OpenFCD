@@ -83,10 +83,11 @@ def _resolve_reference(project: ProjectModel, project_dir: Path) -> np.ndarray:
         raise ValueError("reference.mode='use_existing' but reference.source is empty")
 
     elif mode == "first_frame":
+        from openfcd.pipeline.compute import load_gray as _lg
         frames = scan_frames(project.data.frames_dir, project.data.pattern)
         if not frames:
             raise FileNotFoundError("No frames found for first_frame reference mode")
-        return load_gray(frames[0])
+        return _lg(frames[0])
 
     elif mode == "build":
         from openfcd.core.reference_builder import build_reference
@@ -283,23 +284,11 @@ class ComputeStage:
         errors = 0
         t0 = time.time()
 
-        # Resolve worker count. workers<=0 means "auto" → use P-cores on Darwin
-        # else (cpu_count - 1). When workers==1, run serial (no thread overhead).
-        workers_req = int(ctx.get("workers", 1) or 1)
-        if workers_req <= 0:
-            workers_req = _resolve_default_workers()
-        # Cap at frame count.
-        n_workers = max(1, min(workers_req, frame_count if frame_count > 0 else 1))
-
-        write_lock = __import__("threading").Lock()
-
-        def _emit_progress(idx: int, frame_name: str) -> StageEvent:
+        def _emit_frame_progress(idx: int, frame_name: str) -> StageEvent:
             prog = (processed + errors) / max(frame_count, 1)
-            elapsed = time.time() - t0
-            eta_sec = 0.0
             done = processed + errors
-            if done > 0:
-                eta_sec = (elapsed / done) * (frame_count - done)
+            elapsed = time.time() - t0
+            eta_sec = (elapsed / done) * (frame_count - done) if done > 0 else 0.0
             return StageEvent(
                 kind="progress", stage=self.name, batch="default",
                 frame_idx=idx, substage="processing_frame", progress=prog,
@@ -312,69 +301,136 @@ class ComputeStage:
                 run_id=run_id,
             )
 
-        def _record(idx: int, frame_path: Path, eta_mm: np.ndarray | None, err: str | None) -> None:
-            nonlocal processed, errors
+        # Stream results to disk: drop in-memory array after writing to HDF5.
+        # Trigger when total estimated η size exceeds 400 MB (size-aware) or
+        # frame count exceeds 50, whichever comes first.
+        import os as _os
+        _stream_env = _os.environ.get("OPENFCD_STREAM_RESULTS", "").strip().lower()
+        if _stream_env in ("1", "true", "yes", "on"):
+            stream_results = result_store is not None
+        elif _stream_env in ("0", "false", "no", "off"):
+            stream_results = False
+        else:
+            estimated_bytes = ref_img.nbytes * frame_count
+            stream_results = result_store is not None and (
+                frame_count > 50 or estimated_bytes > 400_000_000
+            )
+
+        # Incremental running mean — avoids PostprocessStage re-reading all frames.
+        _eta_sum: np.ndarray | None = None
+        _eta_count: np.ndarray | None = None
+
+        # Simple serial loop — direct call, no per-frame thread overhead.
+        # Sub-step events are collected during compute and yielded immediately
+        # after; the bar still shows per-step movement at each frame boundary.
+        for idx, frame_path in enumerate(frame_paths):
+            if cancel and cancel.is_cancelled:
+                break
+
+            # Pre-frame: show which frame we're starting.
+            yield StageEvent(
+                kind="progress", stage=self.name, batch="default",
+                frame_idx=idx, substage="loading",
+                progress=idx / max(frame_count, 1),
+                total=frame_count, completed=processed,
+                metrics={"frame": frame_path.name,
+                         "frame_no": f"{idx + 1}/{frame_count}"},
+                run_id=run_id,
+            )
+
+            # Collect sub-step events; yield them in a burst after compute so
+            # the bar animates through the frame's slice without thread overhead.
+            _sub_events: list[tuple[float, str]] = []
+
+            def _cb(pct: int, lbl: str, _i=idx) -> None:
+                _sub_events.append((_i + pct / 100.0, lbl))
+
+            eta_mm: np.ndarray | None = None
+            err: str | None = None
+            try:
+                def_img = load_gray(frame_path)
+                if def_img.shape != ref_img.shape:
+                    err = "shape_mismatch"
+                else:
+                    eta_mm = _compute_single_frame(
+                        ref_img, def_img, geom, project,
+                        roi_box=roi_box,
+                        robot_poly=_resolve_frame_poly(frame_path.name),
+                        ref_invariants=ref_invariants,
+                        progress_cb=_cb,
+                        fast_preview=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+
+            # Yield the collected sub-step events (frame is already done, but
+            # the bar still animates through them before the "done" event).
+            for local_prog, label in _sub_events:
+                yield StageEvent(
+                    kind="progress", stage=self.name, batch="default",
+                    frame_idx=idx, substage=label,
+                    progress=local_prog / max(frame_count, 1),
+                    total=frame_count, completed=processed,
+                    metrics={"frame": frame_path.name,
+                             "frame_no": f"{idx + 1}/{frame_count}"},
+                    run_id=run_id,
+                )
+
+            # Place eta_mm into a full-frame NaN overlay so all saved frames
+            # share a consistent shape (ref_img.shape) and the GUI overlay
+            # aligns correctly with the source image regardless of ROI/cropping.
             if eta_mm is not None:
-                eta_list[idx] = eta_mm
+                h_ref, w_ref = ref_img.shape
+                if eta_mm.shape != (h_ref, w_ref):
+                    eta_full = np.full((h_ref, w_ref), np.nan, dtype=np.float64)
+                    if roi_box is not None:
+                        r0 = max(0, roi_box.row0)
+                        c0 = max(0, roi_box.col0)
+                    else:
+                        r0, c0 = 0, 0
+                    eh, ew = eta_mm.shape
+                    ef_h = min(eh, h_ref - r0)
+                    ef_w = min(ew, w_ref - c0)
+                    eta_full[r0:r0 + ef_h, c0:c0 + ef_w] = eta_mm[:ef_h, :ef_w]
+                    eta_mm = eta_full
+
+            # Record result.
+            if eta_mm is not None:
                 if result_store is not None:
-                    with write_lock:
-                        result_store.write_frame(
-                            "default", idx, eta_mm,
-                            {"status": "ok", "frame_path": str(frame_path.name)},
-                        )
+                    result_store.write_frame(
+                        "default", idx, eta_mm,
+                        {"status": "ok", "frame_path": str(frame_path.name)},
+                    )
+                if not stream_results:
+                    eta_list[idx] = eta_mm
                 processed += 1
+                # Update incremental running mean.
+                if _eta_sum is None:
+                    _eta_sum = np.zeros_like(eta_mm, dtype=np.float64)
+                    _eta_count = np.zeros(eta_mm.shape, dtype=np.int64)
+                if eta_mm.shape == _eta_sum.shape:
+                    valid = np.isfinite(eta_mm)
+                    _eta_sum[valid] += eta_mm[valid]
+                    _eta_count[valid] += 1
             else:
                 errors += 1
                 if result_store is not None:
-                    with write_lock:
-                        result_store.write_frame(
-                            "default", idx,
-                            np.zeros((1, 1), dtype=np.float64),
-                            {
-                                "status": "error",
-                                "message": err or "",
-                                "frame_path": str(frame_path.name),
-                            },
-                        )
+                    result_store.write_frame(
+                        "default", idx,
+                        np.zeros((1, 1), dtype=np.float64),
+                        {"status": "error", "message": err or "",
+                         "frame_path": str(frame_path.name)},
+                    )
 
-        if n_workers <= 1:
-            for idx, frame_path in enumerate(frame_paths):
-                if cancel and cancel.is_cancelled:
-                    break
-                idx_, eta_mm, err = _process_one(idx, frame_path)
-                _record(idx_, frame_path, eta_mm, err)
-                yield _emit_progress(idx, frame_path.name)
-        else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            from threadpoolctl import threadpool_limits
+            yield _emit_frame_progress(idx, frame_path.name)
 
-            # Pin BLAS / OpenMP to 1 thread per pipeline worker. Without this,
-            # numpy/scipy/scikit-image's native pools fight the Python pool and
-            # produce nondeterministic output (especially inpaint_biharmonic's
-            # linear solver), violating serial↔parallel equivalence.
-            with threadpool_limits(limits=1):
-                executor = ThreadPoolExecutor(
-                    max_workers=n_workers, thread_name_prefix="openfcd-fcd"
-                )
-                try:
-                    futures = {
-                        executor.submit(_process_one, i, fp): (i, fp)
-                        for i, fp in enumerate(frame_paths)
-                    }
-                    for fut in as_completed(futures):
-                        if cancel and cancel.is_cancelled:
-                            for f in futures:
-                                f.cancel()
-                            break
-                        idx_orig, frame_path = futures[fut]
-                        try:
-                            idx_, eta_mm, err = fut.result()
-                        except Exception as exc:  # noqa: BLE001
-                            idx_, eta_mm, err = idx_orig, None, str(exc)
-                        _record(idx_, frame_path, eta_mm, err)
-                        yield _emit_progress(idx_, frame_path.name)
-                finally:
-                    executor.shutdown(wait=True, cancel_futures=True)
+        # Compute and store precomputed mean in ctx for PostprocessStage.
+        if _eta_sum is not None and _eta_count is not None:
+            safe_count = np.maximum(_eta_count, 1)
+            precomp_mean = _eta_sum / safe_count
+            precomp_mean[_eta_count == 0] = np.nan
+            ctx["precomputed_eta_mean"] = precomp_mean
+            ctx["precomputed_eta_count"] = int(np.nansum(_eta_count > 0))
 
         # Store eta stack in context for postprocess (drop None slots = errored frames)
         ctx["eta_list"] = [e for e in eta_list if e is not None]
@@ -421,39 +477,33 @@ class PostprocessStage:
             )
             return
 
-        if eta_list and result_store is not None:
-            # Compute summary statistics
-            # Filter to same-size arrays (some might have failed)
-            target_shape = eta_list[0].shape
-            valid_etas = [e for e in eta_list if e.shape == target_shape]
-
-            if valid_etas:
-                stack = np.stack(valid_etas, axis=0)
-
-                # Per-pixel statistics (ignoring NaN)
-                eta_mean = np.nanmean(stack, axis=0)
-                eta_median = np.nanmedian(stack, axis=0)
-                eta_rms = np.sqrt(np.nanmean(stack ** 2, axis=0))
+        if result_store is not None:
+            summary = _summarize_results(
+                eta_list,
+                result_store,
+                precomputed_mean=ctx.get("precomputed_eta_mean"),
+                precomputed_count=ctx.get("precomputed_eta_count", 0),
+            )
+            if summary is not None:
+                eta_mean, eta_median, eta_rms, n_valid = summary
 
                 yield StageEvent(
                     kind="progress", stage=self.name, batch="default",
                     frame_idx=None, substage="writing_summaries",
-                    progress=0.5, total=total_frames, completed=total_frames,
-                    metrics={"n_valid_frames": len(valid_etas)},
+                    progress=0.95, total=total_frames, completed=total_frames,
+                    metrics={"n_valid_frames": n_valid},
                     run_id=run_id,
                 )
 
-                # Write batch data
                 result_store.write_batch(
                     "default",
                     data={
                         "eta_mean": eta_mean,
                         "eta_median": eta_median,
                         "eta_rms": eta_rms,
-                        "eta_stack": stack,
                     },
                     meta={
-                        "n_frames": len(valid_etas),
+                        "n_frames": n_valid,
                         "n_errors": ctx.get("compute_errors", 0),
                         "project_name": project.name,
                         "config_fingerprint": _quick_fingerprint(project),
@@ -800,6 +850,115 @@ def _filter_frames(frames: list[Path], filt: str) -> list[Path]:
         end = int(parts[1]) if len(parts) > 1 and parts[1] else len(frames)
         return frames[start:end]
     return [f for f in frames if fnmatch(f.name, filt)]
+
+
+def _summarize_results(
+    eta_list: list,
+    result_store: HDF5ResultStore,
+    precomputed_mean=None,
+    precomputed_count: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
+    """Compute (eta_mean, eta_median, eta_rms, n_valid) over a batch.
+
+    Two paths:
+      * In-memory: use the list as-is, compute median exactly via np.stack.
+      * Streaming (eta_list empty/None): read frames one-by-one from HDF5 and
+        accumulate per-pixel sum / sum-of-squares / count. This stays at
+        O(target_shape) memory regardless of frame count. Median is set to
+        eta_mean in this mode (true streaming median would need a second pass
+        or chunked quantile, both expensive — and downstream rarely uses it).
+
+    When precomputed_mean is provided (from ComputeStage incremental accumulator),
+    large-image streaming mode returns it directly without re-reading HDF5.
+    """
+    # Use precomputed mean from ComputeStage if available — avoids re-reading HDF5.
+    if precomputed_mean is not None:
+        eta_mean = np.asarray(precomputed_mean, dtype=np.float64)
+        in_memory = [e for e in eta_list if e is not None]
+        if not in_memory:
+            # Large image streaming mode: return precomputed mean as mean, rms, median
+            return eta_mean, eta_mean.copy(), eta_mean.copy(), precomputed_count
+        # else: in_memory path runs normally below for proper rms/median
+
+    in_memory = [e for e in eta_list if e is not None]
+    if in_memory:
+        target_shape = in_memory[0].shape
+        valid_etas = [e for e in in_memory if e.shape == target_shape]
+        if not valid_etas:
+            return None
+        stack = np.stack(valid_etas, axis=0)
+        eta_mean = np.nanmean(stack, axis=0)
+        eta_median = np.nanmedian(stack, axis=0)
+        eta_rms = np.sqrt(np.nanmean(stack ** 2, axis=0))
+        return eta_mean, eta_median, eta_rms, len(valid_etas)
+
+    # Streaming path.
+    try:
+        frame_ids = result_store.list_frames("default")
+    except Exception:
+        return None
+
+    target_shape = None
+    sum_arr: np.ndarray | None = None
+    sumsq_arr: np.ndarray | None = None
+    count_arr: np.ndarray | None = None
+    n_valid = 0
+    for fid in frame_ids:
+        try:
+            arr = result_store.read_frame("default", fid)
+        except Exception:
+            continue
+        if arr.ndim != 2 or arr.size <= 1:
+            continue
+        if target_shape is None:
+            target_shape = arr.shape
+            sum_arr = np.zeros(target_shape, dtype=np.float64)
+            sumsq_arr = np.zeros(target_shape, dtype=np.float64)
+            count_arr = np.zeros(target_shape, dtype=np.int64)
+        if arr.shape != target_shape:
+            continue
+        a = np.asarray(arr, dtype=np.float64)
+        valid = ~np.isnan(a)
+        sum_arr[valid] += a[valid]
+        sumsq_arr[valid] += a[valid] ** 2
+        count_arr[valid] += 1
+        n_valid += 1
+
+    if not n_valid or sum_arr is None:
+        return None
+
+    safe_count = np.maximum(count_arr, 1)
+    eta_mean = sum_arr / safe_count
+    eta_rms = np.sqrt(sumsq_arr / safe_count)
+    eta_mean[count_arr == 0] = np.nan
+    eta_rms[count_arr == 0] = np.nan
+    # Median omitted in streaming mode (see docstring); reuse mean so downstream
+    # consumers always see a valid array of the right shape.
+    return eta_mean, eta_mean.copy(), eta_rms, n_valid
+
+
+def _resolve_blas_threads(n_workers: int) -> int:
+    """BLAS threads per worker for the parallel ComputeStage.
+
+    Default (unset / "auto"): max(1, ncores // n_workers) — each worker gets a
+    fair share of cores, matching the throughput of single-frame compute × N.
+
+    OPENFCD_BLAS_THREADS:
+      - unset / "auto"  → max(1, ncores // n_workers)  [default]
+      - "1"             → 1 (deterministic; bit-equal serial↔parallel)
+      - "<int>"         → that integer (clamped >=1)
+    """
+    import os
+    raw = os.environ.get("OPENFCD_BLAS_THREADS", "auto").strip().lower()
+    if raw == "auto" or not raw:
+        ncores = os.cpu_count() or 1
+        return max(1, ncores // max(1, n_workers))
+    if raw == "1":
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return max(1, (os.cpu_count() or 1) // max(1, n_workers))
 
 
 def _resolve_default_workers() -> int:
