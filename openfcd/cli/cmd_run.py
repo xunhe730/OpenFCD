@@ -244,6 +244,7 @@ class ComputeStage:
         annotation = ctx.get("annotation")  # AnnotationSchema | None
         roi_box = None
         polygon_map: dict[str, list] = {}
+        _fallback_polys: list = []
         if annotation is not None:
             roi = annotation.roi
             if not roi.is_empty:
@@ -255,12 +256,21 @@ class ComputeStage:
                     width=int(roi.width),
                 )
             polygon_map = annotation.frame_polygons
+            # Build a fallback polygon list: any polygon drawn for any frame,
+            # plus global annotation.polygons. Used when a frame has no
+            # per-frame polygon (so the user's manual mask still applies).
+            for polys in polygon_map.values():
+                if polys and polys[0].vertices:
+                    _fallback_polys = polys
+                    break
+            if not _fallback_polys and getattr(annotation, "polygons", None):
+                _fallback_polys = [p for p in annotation.polygons if p.vertices]
 
-        # Per-frame polygon resolver
         def _resolve_frame_poly(name: str):
-            if name not in polygon_map:
-                return None
-            polys = polygon_map[name]
+            """Return per-frame polygon, falling back to any drawn polygon."""
+            polys = polygon_map.get(name, [])
+            if not polys or not polys[0].vertices:
+                polys = _fallback_polys  # use any available mask as fallback
             if not polys or not polys[0].vertices:
                 return None
             from openfcd.core.mask import Polygon
