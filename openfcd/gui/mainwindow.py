@@ -314,6 +314,8 @@ class MainWindow(QMainWindow):
         self._sim_tree.duplicate_scene_requested.connect(self._on_duplicate_scene_requested)
         self._sim_tree.export_scene_requested.connect(self._on_export_scene_png)
         self._sim_tree.reveal_scene_requested.connect(self._on_reveal_scene)
+        self._sim_tree.frame_disabled_requested.connect(self._on_disable_frame)
+        self._sim_tree.frame_enabled_requested.connect(self._on_enable_frame)
         self._title_bar.menu_requested.connect(self._on_menu_requested)
         self._session.session_opened.connect(self._on_session_opened)
         self._session.session_modified.connect(self._on_session_dirty)
@@ -609,6 +611,25 @@ class MainWindow(QMainWindow):
             self._preview.set_image(self._frames[index])
             # set_image wipes the scene → re-apply η overlay from run results
             self._reapply_run_eta()
+
+    def _on_disable_frame(self, idx: int) -> None:
+        self._sim_tree.set_frame_disabled(idx, True)
+        if self._session.has_project and self._session.project:
+            proj = self._session.project
+            disabled = list(proj.data.disabled_frame_indices)
+            if idx not in disabled:
+                disabled.append(idx)
+            proj.data.disabled_frame_indices = disabled
+            self._session.mark_dirty()
+
+    def _on_enable_frame(self, idx: int) -> None:
+        self._sim_tree.set_frame_disabled(idx, False)
+        if self._session.has_project and self._session.project:
+            proj = self._session.project
+            proj.data.disabled_frame_indices = [
+                i for i in proj.data.disabled_frame_indices if i != idx
+            ]
+            self._session.mark_dirty()
 
     def _on_set_reference(self, idx: int) -> None:
         """Set frame as reference."""
@@ -1148,6 +1169,11 @@ class MainWindow(QMainWindow):
             frames=frames,
             ref_index=ref_idx,
         )
+
+        # Restore disabled frame state
+        if proj and proj.data.disabled_frame_indices:
+            for idx in proj.data.disabled_frame_indices:
+                self._sim_tree.set_frame_disabled(idx, True)
 
         # Load scenes into SimTree
         self._sim_tree.populate_scenes(self._session.scenes)
