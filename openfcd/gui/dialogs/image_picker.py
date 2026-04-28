@@ -26,28 +26,19 @@ class ThumbnailLoader(QThread):
         self._cancelled = False
 
     def run(self) -> None:
-        w, h = self._icon_size.width(), self._icon_size.height()
         for idx, fpath in enumerate(self._frames):
             if self._cancelled:
                 break
             try:
                 image = QImage(str(fpath))
                 if not image.isNull():
+                    # Scale preserving aspect ratio — main thread does the letterbox
                     scaled = image.scaled(
                         self._icon_size,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
-                    # Letterbox onto a fixed background so QIcon doesn't distort
-                    canvas = QImage(w, h, QImage.Format.Format_ARGB32)
-                    canvas.fill(0x00000000)
-                    x = (w - scaled.width()) // 2
-                    y = (h - scaled.height()) // 2
-                    from PyQt6.QtGui import QPainter
-                    p = QPainter(canvas)
-                    p.drawImage(x, y, scaled)
-                    p.end()
-                    self.image_ready.emit(idx, canvas)
+                    self.image_ready.emit(idx, scaled)
                 else:
                     self.image_ready.emit(idx, None)
             except Exception:
@@ -73,7 +64,10 @@ class ImagePickerDialog(QDialog):
         super().__init__(parent)
         self._frames = list(frames or [])
         self.setWindowTitle("Select Images to Import")
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(800, 560)
+        self._icon_w, self._icon_h = 160, 120
+        from PyQt6.QtGui import QColor
+        self._bg_color = QColor(40, 40, 40)
         self._worker: ThumbnailLoader | None = None
         self._setup_ui()
         self._start_loading()
@@ -99,12 +93,12 @@ class ImagePickerDialog(QDialog):
         # Thumbnail grid
         self._list = QListWidget()
         self._list.setViewMode(QListWidget.ViewMode.IconMode)
-        self._list.setIconSize(QSize(120, 90))
-        self._list.setGridSize(QSize(134, 118))  # icon(90) + text(~18) + padding
+        self._list.setIconSize(QSize(self._icon_w, self._icon_h))
+        self._list.setGridSize(QSize(self._icon_w + 16, self._icon_h + 28))
         self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self._list.setUniformItemSizes(True)
         self._list.setWordWrap(True)
-        self._list.setSpacing(4)
+        self._list.setSpacing(6)
 
         for fpath in self._frames:
             item = QListWidgetItem(fpath.name)
@@ -139,18 +133,28 @@ class ImagePickerDialog(QDialog):
         self._update_count()
 
     def _start_loading(self) -> None:
-        self._worker = ThumbnailLoader(self._frames, QSize(120, 90))
+        self._worker = ThumbnailLoader(self._frames, QSize(self._icon_w, self._icon_h))
         self._worker.image_ready.connect(self._on_thumbnail)
         self._worker.start()
 
     def _on_thumbnail(self, index: int, qimage) -> None:
-        # QPixmap/QIcon must be created in the main thread — do it here
+        # All QPixmap/QPainter/QIcon work must happen on the main thread
         if qimage is None:
             return
         item = self._list.item(index)
-        if item is not None:
-            pixmap = QPixmap.fromImage(qimage)
-            item.setIcon(QIcon(pixmap))
+        if item is None:
+            return
+        iw, ih = self._icon_w, self._icon_h
+        # Letterbox: draw scaled image centered on a solid-background pixmap
+        canvas = QPixmap(iw, ih)
+        canvas.fill(self._bg_color)
+        from PyQt6.QtGui import QPainter
+        p = QPainter(canvas)
+        x = (iw - qimage.width()) // 2
+        y = (ih - qimage.height()) // 2
+        p.drawImage(x, y, qimage)
+        p.end()
+        item.setIcon(QIcon(canvas))
 
     def _update_count(self) -> None:
         n = len(self.selected_indices())
