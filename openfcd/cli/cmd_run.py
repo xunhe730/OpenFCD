@@ -219,6 +219,13 @@ class ComputeStage:
         result_store: HDF5ResultStore | None = ctx.get("result_store")
         project: ProjectModel = ctx["project"]
 
+        # Filter out disabled frames before processing.
+        disabled = set(ctx.get("disabled_frame_indices", []))
+        if disabled:
+            frame_paths = [fp for i, fp in enumerate(ctx["frame_paths"]) if i not in disabled]
+            frame_count = len(frame_paths)
+            ctx["frame_count"] = frame_count
+            ctx["frame_paths"] = frame_paths
         yield StageEvent(
             kind="start", stage=self.name, batch=None, frame_idx=None,
             substage=None, progress=0.0, total=frame_count, completed=0,
@@ -376,19 +383,7 @@ class ComputeStage:
             # share a consistent shape (ref_img.shape) and the GUI overlay
             # aligns correctly with the source image regardless of ROI/cropping.
             if eta_mm is not None:
-                h_ref, w_ref = ref_img.shape
-                if eta_mm.shape != (h_ref, w_ref):
-                    eta_full = np.full((h_ref, w_ref), np.nan, dtype=np.float64)
-                    if roi_box is not None:
-                        r0 = max(0, roi_box.row0)
-                        c0 = max(0, roi_box.col0)
-                    else:
-                        r0, c0 = 0, 0
-                    eh, ew = eta_mm.shape
-                    ef_h = min(eh, h_ref - r0)
-                    ef_w = min(ew, w_ref - c0)
-                    eta_full[r0:r0 + ef_h, c0:c0 + ef_w] = eta_mm[:ef_h, :ef_w]
-                    eta_mm = eta_full
+                eta_mm = _embed_eta_in_frame(eta_mm, ref_img.shape, roi_box)
 
             # Record result.
             if eta_mm is not None:
@@ -525,6 +520,41 @@ class PostprocessStage:
 
 
 # ---------------------------------------------------------------------------
+# Helper: embed ROI-sized η into full-frame NaN canvas
+# ---------------------------------------------------------------------------
+
+
+def _embed_eta_in_frame(
+    eta_mm: np.ndarray,
+    ref_shape: tuple[int, int],
+    roi_box,
+) -> np.ndarray:
+    """Embed ROI-sized eta_mm into a full-frame NaN canvas.
+
+    Uses centering logic so Run results are spatially identical to
+    single-frame compute for the same inputs.
+    """
+    h_ref, w_ref = ref_shape
+    eta_full = np.full((h_ref, w_ref), np.nan, dtype=np.float64)
+    if roi_box is not None:
+        r0 = max(0, roi_box.row0)
+        c0 = max(0, roi_box.col0)
+        r1 = min(h_ref, roi_box.row0 + roi_box.height)
+        c1 = min(w_ref, roi_box.col0 + roi_box.width)
+    else:
+        r0, c0, r1, c1 = 0, 0, h_ref, w_ref
+    box_h, box_w = r1 - r0, c1 - c0
+    eh, ew = eta_mm.shape
+    dr = max(0, (box_h - eh) // 2)
+    dc = max(0, (box_w - ew) // 2)
+    ef_h = min(eh, box_h - dr)
+    ef_w = min(ew, box_w - dc)
+    if ef_h > 0 and ef_w > 0:
+        eta_full[r0 + dr : r0 + dr + ef_h, c0 + dc : c0 + dc + ef_w] = eta_mm[:ef_h, :ef_w]
+    return eta_full
+
+
+
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -631,8 +661,6 @@ def _compute_single_frame(
     # Processing at half resolution is ~4× faster; result is upsampled back.
     _original_shape: tuple | None = None
     _downsample_scale = 1.0  # tracks pixel scale for sigma correction
-    _orig_roi_shape: tuple[int, int] | None = None  # ROI dims before downscale
-    _valid_crop_offset: tuple[int, int] = (0, 0)   # (r0v, c0v) from scale_normalize_reference
     if fast_preview:
         h0, w0 = ref_img.shape
         # Target ~2500px on longest side (factor=2 for 5000-5999px, etc.)
@@ -650,7 +678,6 @@ def _compute_single_frame(
                 robot_poly = _Polygon([(v[0] * scale, v[1] * scale) for v in robot_poly.vertices])
             if roi_box is not None:
                 from openfcd.core.mask import Box as _Box
-                _orig_roi_shape = (roi_box.height, roi_box.width)  # save before scaling
                 roi_box = _Box(
                     row0=int(roi_box.row0 * scale),
                     col0=int(roi_box.col0 * scale),
@@ -701,7 +728,6 @@ def _compute_single_frame(
         )
         if _valid_crop is not None:
             r0v, c0v, hv, wv = _valid_crop
-            _valid_crop_offset = (r0v, c0v)  # track for post-upsample embedding
             def_ff = def_ff[r0v:r0v + hv, c0v:c0v + wv]
             if robot_poly is not None:
                 robot_poly = robot_poly.shifted(-r0v, -c0v)
@@ -840,21 +866,8 @@ def _compute_single_frame(
         eta_up = _zoom(filled, up, order=1)
         valid_up = _zoom(valid.astype(np.float32), up, order=0) > 0.5
         eta_mm = np.where(valid_up, eta_up, np.nan)
-        # Pad upsampled result to exact original ROI dimensions: integer
-        # truncation in roi_box scaling (e.g. int(1001*0.5)=500 → zoom*2=1000≠1001)
-        # can leave the result 1px short.  Also places the result at the
-        # correct offset if scale_normalize_reference ever applies a _valid_crop.
-        if _orig_roi_shape is not None:
-            r_off = _valid_crop_offset[0] * up
-            c_off = _valid_crop_offset[1] * up
-            roi_h, roi_w = _orig_roi_shape
-            eta_roi = np.full((roi_h, roi_w), np.nan, dtype=np.float64)
-            eh, ew = eta_mm.shape
-            eh_fit = min(eh, roi_h - r_off)
-            ew_fit = min(ew, roi_w - c_off)
-            if eh_fit > 0 and ew_fit > 0:
-                eta_roi[r_off:r_off + eh_fit, c_off:c_off + ew_fit] = eta_mm[:eh_fit, :ew_fit]
-            eta_mm = eta_roi
+
+    _report(100, "Done")
 
     _report(100, "Done")
     return eta_mm

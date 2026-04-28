@@ -117,6 +117,7 @@ class _SingleFrameWorker(QThread):
             from openfcd.cli.cmd_run import (
                 _build_geom_params,
                 _compute_single_frame,
+                _embed_eta_in_frame,
                 _resolve_reference,
             )
             from openfcd.core.mask import Box, Polygon
@@ -170,22 +171,7 @@ class _SingleFrameWorker(QThread):
             # (ref zoomed down to match def's carrier period).  Re-centre it
             # inside the ROI (or the full frame if no ROI) to preserve alignment
             # with the original pixel grid.
-            eta_overlay = np.full(ref_img.shape, np.nan, dtype=np.float64)
-            if roi_box is not None:
-                r0 = max(0, roi_box.row0)
-                c0 = max(0, roi_box.col0)
-                r1 = min(ref_img.shape[0], roi_box.row0 + roi_box.height)
-                c1 = min(ref_img.shape[1], roi_box.col0 + roi_box.width)
-            else:
-                r0, c0, r1, c1 = 0, 0, ref_img.shape[0], ref_img.shape[1]
-            box_h, box_w = r1 - r0, c1 - c0
-            eh, ew = eta_mm.shape
-            dr = max(0, (box_h - eh) // 2)
-            dc = max(0, (box_w - ew) // 2)
-            # Clip eta if it somehow exceeds the box
-            ef_h = min(eh, box_h)
-            ef_w = min(ew, box_w)
-            eta_overlay[r0 + dr:r0 + dr + ef_h, c0 + dc:c0 + dc + ef_w] = eta_mm[:ef_h, :ef_w]
+            eta_overlay = _embed_eta_in_frame(eta_mm, ref_img.shape, roi_box)
 
             self.frame_done.emit(eta_overlay, eta_mm)
 
