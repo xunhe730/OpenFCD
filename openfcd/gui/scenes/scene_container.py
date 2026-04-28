@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtWidgets import QStackedWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 
 from openfcd.gui.scenes.scene_view_placeholder import SceneViewPlaceholder
 
@@ -18,10 +18,11 @@ class SceneContainer(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self._stack = QStackedWidget()
-        layout.addWidget(self._stack)
+        layout.addWidget(self._stack, 1)
 
         self._placeholder = SceneViewPlaceholder()
         self._stack.addWidget(self._placeholder)  # 0
@@ -36,6 +37,7 @@ class SceneContainer(QWidget):
 
         from openfcd.gui.scenes.rms_scene import RmsSceneView
         self._rms_view = RmsSceneView()
+        self._rms_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._stack.addWidget(self._rms_view)  # 3
 
     def show_scene(self, spec, project_path: Path) -> None:

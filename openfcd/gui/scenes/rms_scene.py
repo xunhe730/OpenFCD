@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from openfcd.gui import tokens
 from openfcd.gui.scenes.eta_map import EtaMap
@@ -89,6 +89,7 @@ class RmsSceneView(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._worker: _RmsWorker | None = None
         self._cached_rms: np.ndarray | None = None
         self._cached_spec_id: str | None = None

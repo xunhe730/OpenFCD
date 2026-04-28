@@ -1,108 +1,65 @@
-"""Eta Map scene with pyqtgraph primary rendering and matplotlib fallback."""
-
+"""η Map display widget — matplotlib FigureCanvasQTAgg."""
 from __future__ import annotations
 
 import numpy as np
+from PyQt6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget, QSizePolicy
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
 
 from openfcd.gui import tokens
 
-try:
-    import pyqtgraph as pg
-
-    HAS_PYQTGRAPH = True
-except ImportError:
-    pg = None
-    HAS_PYQTGRAPH = False
-
-try:
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-    from matplotlib.figure import Figure
-
-    HAS_MATPLOTLIB = True
-except ImportError:
-    FigureCanvasQTAgg = None
-    Figure = None
-    HAS_MATPLOTLIB = False
-
 
 class EtaMap(QWidget):
-    """Scene widget for eta heatmap."""
+    """Full-canvas η heatmap with colorbar."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._image_item = None
-        self._mpl_canvas = None
-        self._mpl_axes = None
-        self._mpl_colorbar = None
-        self._fallback_label = None
-        self._setup_ui()
-
-    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._title = QLabel("η Map")
-        self._title.setStyleSheet(
-            f"font-size: 12px; font-weight: 600; color: {tokens.TEXT_PRIMARY}; "
-            f"padding: 8px 16px; background: {tokens.BG_SECONDARY}; "
-            f"border-bottom: 1px solid {tokens.BORDER_SUBTLE};"
+        self._fig = Figure(tight_layout=True)
+        self._ax = self._fig.add_subplot(111)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self._canvas, 1)
+
+        self._im = None
+        self._cb = None
+        self._apply_dark_style()
+
+    def _apply_dark_style(self) -> None:
+        try:
+            bg = tokens.BG_PRIMARY.lstrip("#")
+            r = int(bg[0:2], 16) / 255
+            g = int(bg[2:4], 16) / 255
+            b = int(bg[4:6], 16) / 255
+            self._fig.patch.set_facecolor((r, g, b))
+            self._ax.set_facecolor((r, g, b))
+        except Exception:
+            pass
+
+    def set_data(self, eta: np.ndarray, colormap: str = "RdBu_r") -> None:
+        """Render eta array as heatmap with colorbar."""
+        if eta is None or eta.size == 0:
+            return
+        self._ax.cla()
+        if self._cb is not None:
+            try:
+                self._cb.remove()
+            except Exception:
+                pass
+            self._cb = None
+        # Symmetric colormap for bidirectional data
+        finite = eta[np.isfinite(eta)]
+        vmax = float(np.nanpercentile(np.abs(finite), 98)) if finite.size > 0 else 1.0
+        vmin = -vmax if colormap in ("RdBu_r", "RdBu", "bwr", "seismic") else 0.0
+        self._im = self._ax.imshow(
+            eta, cmap=colormap, aspect="auto", vmin=vmin, vmax=vmax
         )
-        layout.addWidget(self._title)
-
-        if HAS_PYQTGRAPH:
-            self._view = pg.ImageView()
-            self._image_item = self._view.getImageItem()
-            layout.addWidget(self._view)
-            return
-
-        if HAS_MATPLOTLIB:
-            figure = Figure(figsize=(6, 4), tight_layout=True)
-            self._mpl_axes = figure.add_subplot(111)
-            self._mpl_axes.set_title("η heatmap")
-            self._mpl_canvas = FigureCanvasQTAgg(figure)
-            layout.addWidget(self._mpl_canvas)
-            return
-
-        self._fallback_label = QLabel(
-            "No heatmap backend available.\nInstall pyqtgraph or matplotlib."
-        )
-        self._fallback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._fallback_label.setStyleSheet(
-            f"color: {tokens.TEXT_MUTED}; font-size: 12px; padding: 40px;"
-        )
-        layout.addWidget(self._fallback_label)
-
-    def set_data(self, data, colormap: str = "RdBu_r") -> None:
-        arr = np.asarray(data)
-
-        if HAS_PYQTGRAPH and hasattr(self, "_view"):
-            self._view.setImage(arr.T)
-            return
-
-        if HAS_MATPLOTLIB and self._mpl_axes is not None and self._mpl_canvas is not None:
-            self._mpl_axes.clear()
-            if arr.ndim < 2 or arr.size == 0:
-                self._mpl_canvas.draw_idle()
-                return
-            image = self._mpl_axes.imshow(arr, cmap=colormap, origin="upper")
-            self._mpl_axes.set_title("η heatmap")
-            self._mpl_axes.set_xlabel("x [px]")
-            self._mpl_axes.set_ylabel("y [px]")
-
-            if self._mpl_colorbar is not None:
-                self._mpl_colorbar.remove()
-            self._mpl_colorbar = self._mpl_canvas.figure.colorbar(
-                image, ax=self._mpl_axes, label="η [mm]"
-            )
-            self._mpl_canvas.draw_idle()
-            return
-
-        if self._fallback_label is not None:
-            self._fallback_label.setText(
-                f"η Map  shape={arr.shape}\n(install pyqtgraph or matplotlib for rendering)"
-            )
+        self._cb = self._fig.colorbar(self._im, ax=self._ax, fraction=0.03, pad=0.02)
+        self._ax.set_axis_off()
+        self._apply_dark_style()
+        self._canvas.draw_idle()  # non-blocking, no reentrance

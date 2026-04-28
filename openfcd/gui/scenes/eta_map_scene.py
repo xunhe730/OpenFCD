@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -53,7 +53,13 @@ class EtaMapSceneView(QWidget):
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setMinimum(0)
         self._slider.setMaximum(0)
-        self._slider.valueChanged.connect(self._on_slider)
+        # Debounced slider: prevent reentrant matplotlib draw() calls
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(80)
+        self._pending_idx = 0
+        self._render_timer.timeout.connect(self._do_render)
+        self._slider.valueChanged.connect(self._on_slider_moved)
         sr.addWidget(self._slider_lbl)
         sr.addWidget(self._slider, 1)
         layout.addWidget(slider_row)
@@ -106,8 +112,12 @@ class EtaMapSceneView(QWidget):
         dirs = sorted(d.name for d in runs_dir.iterdir() if d.is_dir())
         return dirs[-1] if dirs else None
 
-    def _on_slider(self, idx: int) -> None:
-        self._show_frame(idx)
+    def _on_slider_moved(self, idx: int) -> None:
+        self._pending_idx = idx
+        self._render_timer.start()
+
+    def _do_render(self) -> None:
+        self._show_frame(self._pending_idx)
 
     def _show_frame(self, idx: int) -> None:
         n = len(self._eta_frames)

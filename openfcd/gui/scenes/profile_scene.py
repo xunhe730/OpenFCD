@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import Qt, QPoint
+from PyQt6.QtCore import Qt, QPoint, QTimer
 from PyQt6.QtGui import QColor, QMouseEvent, QPainter, QPen
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -153,10 +153,23 @@ class ProfileSceneView(QWidget):
         sr.setContentsMargins(12, 4, 12, 4)
         self._slider_lbl = QLabel("frame 0/0")
         self._slider = QSlider(Qt.Orientation.Horizontal)
-        self._slider.valueChanged.connect(self._on_slider)
+        # Debounced slider: prevent reentrant matplotlib draw() calls
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(80)
+        self._pending_idx = 0
+        self._render_timer.timeout.connect(self._do_render)
+        self._slider.valueChanged.connect(self._on_slider_moved)
         sr.addWidget(self._slider_lbl)
         sr.addWidget(self._slider, 1)
         layout.addWidget(slider_row)
+
+    def _on_slider_moved(self, idx: int) -> None:
+        self._pending_idx = idx
+        self._render_timer.start()
+
+    def _do_render(self) -> None:
+        self._on_slider(self._pending_idx)
 
     def _make_chart_widget(self) -> QWidget:
         try:
