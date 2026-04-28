@@ -205,17 +205,23 @@ class _ImageView(QGraphicsView):
         self._crosshair_h = None
         self._crosshair_v = None
 
-    def clear_overlays(self) -> None:
-        """Remove ROI rect and Mask polygon overlays."""
+    def clear_eta_overlay(self) -> None:
+        """Remove only the η overlay — leaves ROI rect and mask intact."""
         try:
             if self._eta_overlay_item and self._eta_overlay_item.scene():
                 self._scene.removeItem(self._eta_overlay_item)
-        except RuntimeError: pass
+        except RuntimeError:
+            pass
         self._eta_overlay_item = None
         self._eta_overlay_array = None
         self._eta_array = None
         if self._pixmap_item:
             self._pixmap_item.setVisible(True)
+
+    def clear_overlays(self) -> None:
+        """Remove ROI rect and Mask polygon overlays."""
+        self.clear_eta_overlay()
+
 
         try:
             if self._roi_rect and self._roi_rect.scene():
@@ -813,6 +819,13 @@ class PreviewWidget(QWidget):
             if self._colorbar_cb.isChecked():
                 self._render_colorbar(vmin, vmax, cmap_name)
                 self._colorbar_label.setVisible(True)
+
+    def clear_eta_overlay(self) -> None:
+        """Remove only the η overlay — leaves ROI and mask intact."""
+        self._view.clear_eta_overlay()
+        self._eta_state = None
+        self._colorbar_label.setVisible(False)
+        self._colorbar_label.clear()
 
     def clear_overlays(self) -> None:
         self._view.clear_overlays()

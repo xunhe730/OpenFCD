@@ -26,6 +26,7 @@ class ThumbnailLoader(QThread):
         self._cancelled = False
 
     def run(self) -> None:
+        w, h = self._icon_size.width(), self._icon_size.height()
         for idx, fpath in enumerate(self._frames):
             if self._cancelled:
                 break
@@ -37,7 +38,16 @@ class ThumbnailLoader(QThread):
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
-                    self.image_ready.emit(idx, scaled)
+                    # Letterbox onto a fixed background so QIcon doesn't distort
+                    canvas = QImage(w, h, QImage.Format.Format_ARGB32)
+                    canvas.fill(0x00000000)
+                    x = (w - scaled.width()) // 2
+                    y = (h - scaled.height()) // 2
+                    from PyQt6.QtGui import QPainter
+                    p = QPainter(canvas)
+                    p.drawImage(x, y, scaled)
+                    p.end()
+                    self.image_ready.emit(idx, canvas)
                 else:
                     self.image_ready.emit(idx, None)
             except Exception:
@@ -90,8 +100,10 @@ class ImagePickerDialog(QDialog):
         self._list = QListWidget()
         self._list.setViewMode(QListWidget.ViewMode.IconMode)
         self._list.setIconSize(QSize(120, 90))
+        self._list.setGridSize(QSize(134, 118))  # icon(90) + text(~18) + padding
         self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self._list.setUniformItemSizes(True)
+        self._list.setWordWrap(True)
         self._list.setSpacing(4)
 
         for fpath in self._frames:

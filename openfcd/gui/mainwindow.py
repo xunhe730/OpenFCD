@@ -1367,7 +1367,7 @@ class MainWindow(QMainWindow):
         """
         preview_on = self._toolbar.preview_on() if hasattr(self._toolbar, "preview_on") else False
         if not preview_on:
-            self._preview.clear_overlays()
+            self._preview.clear_eta_overlay()
             return
 
         eta = None
