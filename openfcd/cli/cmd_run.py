@@ -270,7 +270,7 @@ class ComputeStage:
                     ref_img, deformed_img, geom, project,
                     roi_box=roi_box,
                     robot_poly=_resolve_frame_poly(frame_path.name),
-                    ref_invariants=ref_invariants,
+                    fast_preview=True,
                 )
                 return idx, eta_mm, None
             except Exception as exc:  # noqa: BLE001
@@ -841,10 +841,10 @@ def _compute_single_frame(
         eta_up = _zoom(filled, up, order=1)
         valid_up = _zoom(valid.astype(np.float32), up, order=0) > 0.5
         eta_mm = np.where(valid_up, eta_up, np.nan)
-        # Re-embed at the correct position within the original ROI so that
-        # _valid_crop offsets from scale_normalize_reference are preserved.
-        # Without this step each frame's η lands at a slightly different
-        # position in the full frame, creating a "multi-frame superimposed" artifact.
+        # Pad upsampled result to exact original ROI dimensions: integer
+        # truncation in roi_box scaling (e.g. int(1001*0.5)=500 → zoom*2=1000≠1001)
+        # can leave the result 1px short.  Also places the result at the
+        # correct offset if scale_normalize_reference ever applies a _valid_crop.
         if _orig_roi_shape is not None:
             r_off = _valid_crop_offset[0] * up
             c_off = _valid_crop_offset[1] * up

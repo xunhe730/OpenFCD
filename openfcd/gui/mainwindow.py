@@ -1318,24 +1318,22 @@ class MainWindow(QMainWindow):
                 self._run_eta_mean = None
 
             frame_ids = result_store.list_frames(batch)
-            # Guard against OOM: skip per-frame caching when total would
-            # exceed ~800 MB. GUI falls back to showing only eta_mean.
-            _guard_bytes = 800_000_000
+            # η arrays are full-frame with NaN outside ROI. For typical camera
+            # images (3712×5568 float64 ≈ 165 MB/frame), allow up to 4 GB so
+            # experiments with up to ~24 frames cache per-frame previews.
+            _guard_bytes = 4_000_000_000
             frames_list = []
-            _size_known = False
             _per_frame_bytes = 0
             for fid in frame_ids:
                 try:
                     arr = result_store.read_frame(batch, fid)
                     if arr.ndim == 2 and arr.size > 1:
-                        if not _size_known:
+                        if _per_frame_bytes == 0:
                             _per_frame_bytes = arr.nbytes
-                            _size_known = True
                         if _per_frame_bytes * len(frame_ids) > _guard_bytes:
-                            # Too large to cache all frames — skip per-frame stack
                             frames_list = []
                             break
-                        frames_list.append(np.asarray(arr))
+                        frames_list.append(np.asarray(arr, dtype=np.float64))
                     else:
                         frames_list.append(None)
                 except Exception:
