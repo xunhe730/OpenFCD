@@ -843,7 +843,7 @@ class MainWindow(QMainWindow):
         panel = self._properties.compute_panel
         proj = self._session.project
 
-        # Pattern period
+        # Checker cell side length (legacy project key: pattern_period_mm)
         try:
             val = float(panel._period_mm.text())
             if val > 0:

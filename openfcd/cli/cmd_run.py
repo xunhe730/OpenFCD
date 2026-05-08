@@ -4,7 +4,7 @@ from __future__ import annotations
 import signal
 import time
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -30,6 +30,8 @@ class FrameComputation:
     eta_mm: np.ndarray
     pixel_per_mm: float
     calibration: dict
+    qc_datasets: dict[str, np.ndarray] = field(default_factory=dict)
+    qc_attrs: dict[str, float] = field(default_factory=dict)
 
     @property
     def shape(self):
@@ -46,6 +48,8 @@ def _frame_calibration(pixel_per_mm: float, geom) -> dict:
     return {
         "pixel_per_mm": float(pixel_per_mm),
         "pattern_period_mm": float(geom.pattern_period_mm),
+        "checker_cell_mm": float(geom.pattern_period_mm),
+        "checker_cell_semantics": "single checker cell side length, not full black-white cycle",
         "alpha": float(geom.alpha),
         "h_p_eff_mm": float(geom.h_p_eff_mm),
         "eta_unit": "mm",
@@ -67,6 +71,8 @@ def _calibration_summary(frame_calibrations: list[dict] | None) -> dict:
         "pixel_per_mm_min": float(np.nanmin(px)),
         "pixel_per_mm_max": float(np.nanmax(px)),
         "pattern_period_mm": float(first["pattern_period_mm"]),
+        "checker_cell_mm": float(first.get("checker_cell_mm", first["pattern_period_mm"])),
+        "checker_cell_semantics": "single checker cell side length, not full black-white cycle",
         "alpha": float(first["alpha"]),
         "h_p_eff_mm": float(first["h_p_eff_mm"]),
         "eta_unit": "mm",
@@ -549,8 +555,14 @@ class ComputeStage:
             # Place eta_mm into a full-frame NaN overlay so all saved frames
             # share a consistent shape (ref_img.shape) and the GUI overlay
             # aligns correctly with the source image regardless of ROI/cropping.
+            qc_datasets = getattr(computation, "qc_datasets", None) if computation is not None else None
             if eta_mm is not None:
                 eta_mm = _embed_eta_in_frame(eta_mm, ref_img.shape, roi_box)
+                if qc_datasets:
+                    qc_datasets = {
+                        name: _embed_qc_in_frame(value, ref_img.shape, roi_box)
+                        for name, value in qc_datasets.items()
+                    }
 
             # Record result.
             if eta_mm is not None:
@@ -562,8 +574,15 @@ class ComputeStage:
                     calibration = getattr(computation, "calibration", None)
                     if calibration is not None:
                         attrs.update(calibration)
+                        if "pattern_period_mm" in calibration and "checker_cell_mm" not in attrs:
+                            attrs["checker_cell_mm"] = float(calibration["pattern_period_mm"])
+                            attrs["checker_cell_semantics"] = (
+                                "single checker cell side length, not full black-white cycle"
+                            )
+                    attrs.update(getattr(computation, "qc_attrs", {}) or {})
                     result_store.write_frame(
                         "default", frame_idx, eta_mm, attrs,
+                        qc_datasets=qc_datasets,
                     )
                     if calibration is not None:
                         ctx["frame_calibrations"].append(dict(calibration))
@@ -731,6 +750,36 @@ def _embed_eta_in_frame(
     return eta_full
 
 
+def _embed_qc_in_frame(
+    arr: np.ndarray,
+    ref_shape: tuple[int, int],
+    roi_box,
+) -> np.ndarray:
+    """Embed ROI-sized QC data using the same placement as eta output."""
+    data = np.asarray(arr)
+    if data.shape == ref_shape:
+        return data
+    h_ref, w_ref = ref_shape
+    fill = False if data.dtype == bool else np.nan
+    out = np.full((h_ref, w_ref), fill, dtype=data.dtype if data.dtype == bool else np.float64)
+    if roi_box is not None:
+        r0 = max(0, roi_box.row0)
+        c0 = max(0, roi_box.col0)
+        r1 = min(h_ref, roi_box.row0 + roi_box.height)
+        c1 = min(w_ref, roi_box.col0 + roi_box.width)
+    else:
+        r0, c0, r1, c1 = 0, 0, h_ref, w_ref
+    box_h, box_w = r1 - r0, c1 - c0
+    dh, dw = data.shape
+    dr = max(0, (box_h - dh) // 2)
+    dc = max(0, (box_w - dw) // 2)
+    ef_h = min(dh, box_h - dr)
+    ef_w = min(dw, box_w - dc)
+    if ef_h > 0 and ef_w > 0:
+        out[r0 + dr : r0 + dr + ef_h, c0 + dc : c0 + dc + ef_w] = data[:ef_h, :ef_w]
+    return out
+
+
 
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -808,7 +857,8 @@ def _compute_single_frame(
         calculate_carriers,
         carrier_amplitude,
         carriers_pixel_per_mm,
-        fcd as fcd_height,
+        fcd_displacement,
+        fftinvgrad,
     )
     from openfcd.core.flatfield import flatfield_normalize
     from openfcd.core.inpaint import inpaint_fft, synthesize_from_carriers
@@ -826,6 +876,7 @@ def _compute_single_frame(
         edge_margin_mask,
         eta_confidence_mask,
         fill_small_eta_holes,
+        poisson_residual_diagnostics,
         repair_eta_confidence_artifacts,
         suppress_nonphysical_eta_filaments,
     )
@@ -901,6 +952,13 @@ def _compute_single_frame(
     else:
         ref_ff = flatfield_normalize(ref_img, sigma=sigma)
     def_ff = flatfield_normalize(def_img, sigma=sigma, bg_src=ref_img)
+    finite_def = np.isfinite(def_img)
+    if finite_def.any():
+        max_level = 255.0 if float(np.nanmax(def_img)) > 1.5 else 1.0
+        saturated = finite_def & ((def_img <= 0.0) | (def_img >= 0.995 * max_level))
+        saturated_ratio = float(saturated.sum() / finite_def.size)
+    else:
+        saturated_ratio = 1.0
 
     # Find carriers in reference
     _report(30, "Carriers")
@@ -987,6 +1045,17 @@ def _compute_single_frame(
             )
         return eta, float(px_per_mm)
 
+    def _finalize_qc_map(arr: np.ndarray) -> np.ndarray:
+        if _original_shape is None:
+            return arr
+        from scipy.ndimage import zoom as _zoom
+        up = round(1.0 / _downsample_scale)
+        order = 0 if arr.dtype == bool else 1
+        out = _zoom(arr.astype(np.float32) if arr.dtype == bool else arr, up, order=order)
+        if arr.dtype == bool:
+            return out > 0.5
+        return out
+
     # Edge conditioning: taper OR Moisan periodic decomposition (mutually exclusive).
     # Combining them reintroduces a periodic→zero boundary jump that causes an
     # artifact ring, so exactly one method is applied.
@@ -1018,16 +1087,37 @@ def _compute_single_frame(
             em_px = int(edge_mm * px_per_mm)
             eta_mm[edge_margin_mask(eta_mm.shape, em_px)] = np.nan
         eta_mm, px_per_mm = _finalize_eta(eta_mm, px_per_mm)
+        valid_mask = np.isfinite(eta_mm)
+        qc_datasets = {
+            "carrier_amplitude": _finalize_qc_map(carrier_amp_map),
+            "valid_mask": valid_mask,
+            "artifact_mask": np.zeros_like(valid_mask, dtype=bool),
+            "phase_residual": np.zeros_like(eta_mm, dtype=np.float64),
+            "poisson_residual": np.zeros_like(eta_mm, dtype=np.float64),
+            "poisson_residual_x": np.zeros_like(eta_mm, dtype=np.float64),
+            "poisson_residual_y": np.zeros_like(eta_mm, dtype=np.float64),
+            "curl_inconsistency": np.zeros_like(eta_mm, dtype=np.float64),
+        }
+        qc_attrs = {
+            "saturated_ratio": saturated_ratio,
+            "invalid_ratio": float((~valid_mask).sum() / valid_mask.size),
+            "carrier_amp_median": float(np.nanmedian(qc_datasets["carrier_amplitude"])),
+            "poisson_residual_rms": 0.0,
+            "curl_inconsistency_rms": 0.0,
+        }
         _report(100, "Done")
         return FrameComputation(
             eta_mm=eta_mm,
             pixel_per_mm=px_per_mm,
             calibration=_frame_calibration(px_per_mm, geom),
+            qc_datasets=qc_datasets,
+            qc_attrs=qc_attrs,
         )
 
     # FCD: demodulate and integrate
     _report(70, "FCD demodulate")
-    raw_eta = fcd_height(def_clean - ref_clean.mean(), carriers, unwrap=False)
+    disp_u, disp_v = fcd_displacement(def_clean - ref_clean.mean(), carriers, unwrap=False)
+    raw_eta = fftinvgrad(-disp_u, -disp_v)
 
     # Apply occlusion mask (NaN over masked region)
     raw_eta[occlusion_mask] = np.nan
@@ -1087,12 +1177,47 @@ def _compute_single_frame(
         low_signal_mask=glint_anchor_mask,
     )
 
+    measured_sx = -disp_u / (geom.alpha * geom.h_p_eff_mm * px_per_mm)
+    measured_sy = -disp_v / (geom.alpha * geom.h_p_eff_mm * px_per_mm)
     eta_mm, px_per_mm = _finalize_eta(eta_mm, px_per_mm)
+    measured_sx = _finalize_qc_map(measured_sx)
+    measured_sy = _finalize_qc_map(measured_sy)
+    diagnostics = poisson_residual_diagnostics(
+        eta_mm,
+        measured_sx,
+        measured_sy,
+        px_per_mm=px_per_mm,
+    )
+
+    valid_mask = np.isfinite(eta_mm)
+    qc_datasets = {
+        "carrier_amplitude": _finalize_qc_map(carrier_amp_map),
+        "valid_mask": valid_mask,
+        "artifact_mask": _finalize_qc_map(artifact_mask),
+        "phase_residual": _finalize_qc_map(phase_residual),
+        "poisson_residual": _finalize_qc_map(np.asarray(diagnostics["poisson_residual"])),
+        "poisson_residual_x": _finalize_qc_map(np.asarray(diagnostics["poisson_residual_x"])),
+        "poisson_residual_y": _finalize_qc_map(np.asarray(diagnostics["poisson_residual_y"])),
+        "curl_inconsistency": _finalize_qc_map(np.asarray(diagnostics["curl_inconsistency"])),
+    }
+    curl = qc_datasets["curl_inconsistency"]
+    curl_valid = np.isfinite(curl)
+    qc_attrs = {
+        "saturated_ratio": saturated_ratio,
+        "invalid_ratio": float((~valid_mask).sum() / valid_mask.size),
+        "carrier_amp_median": float(np.nanmedian(qc_datasets["carrier_amplitude"])),
+        "poisson_residual_rms": float(diagnostics["poisson_residual_rms"]),
+        "curl_inconsistency_rms": (
+            float(np.sqrt(np.nanmean(curl[curl_valid] ** 2))) if curl_valid.any() else float("nan")
+        ),
+    }
     _report(100, "Done")
     return FrameComputation(
         eta_mm=eta_mm,
         pixel_per_mm=px_per_mm,
         calibration=_frame_calibration(px_per_mm, geom),
+        qc_datasets=qc_datasets,
+        qc_attrs=qc_attrs,
     )
 
 

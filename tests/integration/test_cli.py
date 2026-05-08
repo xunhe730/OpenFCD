@@ -343,6 +343,23 @@ def test_compute_stage_writes_frame_calibration_attrs(tmp_path: Path, monkeypatc
                 "eta_unit": "mm",
                 "spatial_calibration_source": "carrier_detected",
             },
+            qc_datasets={
+                "carrier_amplitude": np.full((4, 4), 3.0),
+                "valid_mask": np.ones((4, 4), dtype=bool),
+                "artifact_mask": np.zeros((4, 4), dtype=bool),
+                "phase_residual": np.zeros((4, 4)),
+                "poisson_residual": np.zeros((4, 4)),
+                "poisson_residual_x": np.zeros((4, 4)),
+                "poisson_residual_y": np.zeros((4, 4)),
+                "curl_inconsistency": np.zeros((4, 4)),
+            },
+            qc_attrs={
+                "saturated_ratio": 0.0,
+                "invalid_ratio": 0.0,
+                "carrier_amp_median": 3.0,
+                "poisson_residual_rms": 0.0,
+                "curl_inconsistency_rms": 0.0,
+            },
         )
 
     monkeypatch.setattr("openfcd.cli.cmd_run._compute_single_frame", fake_compute)
@@ -358,12 +375,23 @@ def test_compute_stage_writes_frame_calibration_attrs(tmp_path: Path, monkeypatc
     try:
         list(ComputeStage().run(ctx))
         attrs = result_store.read_frame_attrs("default", 0)
+        qc_names = result_store.list_frame_qc("default", 0)
+        carrier_amp = result_store.read_frame_qc("default", 0, "carrier_amplitude")
     finally:
         result_store.close()
         store.close()
 
     assert attrs["pixel_per_mm"] == 8.0
     assert attrs["eta_unit"] == "mm"
+    assert attrs["checker_cell_mm"] == 1.2
+    assert attrs["checker_cell_semantics"] == "single checker cell side length, not full black-white cycle"
+    assert attrs["carrier_amp_median"] == 3.0
+    assert attrs["poisson_residual_rms"] == 0.0
+    assert attrs["curl_inconsistency_rms"] == 0.0
+    assert "carrier_amplitude" in qc_names
+    assert "poisson_residual_x" in qc_names
+    assert "poisson_residual_y" in qc_names
+    np.testing.assert_allclose(carrier_amp, np.full((4, 4), 3.0))
     assert ctx["frame_calibrations"][0]["pixel_per_mm"] == 8.0
 
 

@@ -492,6 +492,42 @@ def fill_small_eta_holes(
     return out
 
 
+def poisson_residual_diagnostics(
+    eta_mm: np.ndarray,
+    measured_sx: np.ndarray,
+    measured_sy: np.ndarray,
+    *,
+    px_per_mm: float,
+) -> dict[str, np.ndarray | float]:
+    """Compare reconstructed eta gradients against measured physical slopes."""
+    eta = np.asarray(eta_mm, dtype=np.float64)
+    sx = np.asarray(measured_sx, dtype=np.float64)
+    sy = np.asarray(measured_sy, dtype=np.float64)
+    if eta.shape != sx.shape or eta.shape != sy.shape:
+        raise ValueError("eta_mm, measured_sx, and measured_sy must share shape")
+    if px_per_mm <= 0:
+        raise ValueError("px_per_mm must be positive")
+
+    spacing_mm = 1.0 / float(px_per_mm)
+    grad_y, grad_x = np.gradient(eta, spacing_mm, spacing_mm, edge_order=1)
+    residual_x = grad_x - sx
+    residual_y = grad_y - sy
+    residual_mag = np.sqrt(residual_x ** 2 + residual_y ** 2)
+    finite = np.isfinite(residual_mag)
+    residual_rms = float(np.sqrt(np.nanmean(residual_mag[finite] ** 2))) if finite.any() else float("nan")
+
+    dsy_dx = np.gradient(sy, spacing_mm, axis=1, edge_order=1)
+    dsx_dy = np.gradient(sx, spacing_mm, axis=0, edge_order=1)
+    curl_inconsistency = dsy_dx - dsx_dy
+    return {
+        "poisson_residual_x": residual_x,
+        "poisson_residual_y": residual_y,
+        "poisson_residual": residual_mag,
+        "curl_inconsistency": curl_inconsistency,
+        "poisson_residual_rms": residual_rms,
+    }
+
+
 def load_gray(path: Path | str) -> np.ndarray:
     img = imread(str(path))
     if img.ndim == 3:

@@ -4,7 +4,13 @@ import pytest
 import tempfile
 import os
 
-from openfcd.core.fcd import fftinvgrad, carrier_wavelength_mm
+from openfcd.core.fcd import (
+    calculate_carriers,
+    carrier_wavelength_mm,
+    displacement_from_phase_differences,
+    fcd_displacement,
+    fftinvgrad,
+)
 from openfcd.core.mask import polygon_mask, Polygon
 from openfcd.core.temporal import time_mean, time_rms
 from openfcd.core.flatfield import flatfield_normalize
@@ -47,6 +53,68 @@ def test_fftinvgrad_output_shape_and_real():
     assert result.shape == (h, w)
     assert result.dtype in (np.float64, np.float32, float)
     assert np.all(np.isfinite(result))
+
+
+def _sin_checkerboard(size: int = 256, period_px: int = 16) -> np.ndarray:
+    y, x = np.mgrid[:size, :size]
+    return np.sin(2 * np.pi * x / period_px) * np.sin(2 * np.pi * y / period_px)
+
+
+@pytest.mark.parametrize(
+    ("dx_px", "dy_px"),
+    [(0.25, 0.0), (0.0, -0.25), (0.3, -0.2)],
+)
+def test_fcd_displacement_recovers_synthetic_subpixel_translation(dx_px: float, dy_px: float) -> None:
+    """Carrier demodulation recovers known apparent checkerboard shifts."""
+    from scipy.ndimage import shift
+
+    ref = _sin_checkerboard()
+    measured = shift(ref, shift=(dy_px, dx_px), order=3, mode="wrap")
+    carriers = calculate_carriers(ref - ref.mean())
+
+    u, v = fcd_displacement(measured - ref.mean(), carriers, unwrap=False)
+
+    interior = (slice(40, -40), slice(40, -40))
+    assert float(np.median(u[interior])) == pytest.approx(dx_px, abs=2e-3)
+    assert float(np.median(v[interior])) == pytest.approx(dy_px, abs=2e-3)
+
+
+def test_known_eta_physical_chain_recovers_height_amplitude_and_sign() -> None:
+    """Synthetic η -> slopes -> displacement -> carrier phase -> η closes the loop."""
+    size = 128
+    px_per_mm = 8.0
+    alpha = 0.25
+    h_eff_mm = 12.0
+    amplitude_mm = 0.2
+    y, x = np.mgrid[:size, :size]
+    eta = amplitude_mm * np.sin(2 * np.pi * x / 64.0) * np.sin(2 * np.pi * y / 64.0)
+    eta_centered = eta - float(eta.mean())
+
+    spacing_mm = 1.0 / px_per_mm
+    slope_y, slope_x = np.gradient(eta, spacing_mm, spacing_mm, edge_order=2)
+    u_px = -alpha * h_eff_mm * slope_x * px_per_mm
+    v_px = -alpha * h_eff_mm * slope_y * px_per_mm
+
+    carriers = calculate_carriers(_sin_checkerboard(size=size) - 0.0)
+    delta_phis = [
+        -(c.k_loc[1] * u_px + c.k_loc[0] * v_px)
+        for c in carriers
+    ]
+    u_rec, v_rec = displacement_from_phase_differences(delta_phis, carriers)
+    raw_eta = fftinvgrad(-u_rec, -v_rec)
+    eta_rec = raw_eta / (alpha * h_eff_mm * px_per_mm ** 2)
+    eta_rec -= float(np.nanmean(eta_rec))
+
+    interior = (slice(10, -10), slice(10, -10))
+    expected = eta_centered[interior]
+    recovered = eta_rec[interior]
+    corr = np.corrcoef(expected.ravel(), recovered.ravel())[0, 1]
+    amp_ratio = np.ptp(recovered) / np.ptp(expected)
+
+    assert abs(float(np.nanmean(eta_rec))) < 1e-12
+    assert corr > 0.999
+    assert amp_ratio == pytest.approx(1.0, rel=0.01)
+    assert float(recovered[np.unravel_index(np.nanargmax(expected), expected.shape)]) > 0.0
 
 
 # ---------------------------------------------------------------------------

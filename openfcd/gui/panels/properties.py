@@ -528,7 +528,7 @@ class ComputePanel(QWidget):
         g1 = PropGroup("Required Parameters", accent=True)
         self._period_mm = PropInput("", mono=True)
         self._period_mm.setPlaceholderText("e.g. 1.2")
-        g1.add_row("Pattern period mm", self._period_mm)
+        g1.add_row("Checker cell side mm", self._period_mm)
         self._glass_mm = PropInput("3.0", mono=True)
         g1.add_row("Window glass mm", self._glass_mm)
         self._fluid_mm = PropInput("12.0", mono=True)

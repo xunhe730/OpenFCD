@@ -200,7 +200,7 @@ class NewProjectWizard(QDialog):
         self._pattern_period.setValue(self._prefs.last_pattern_period_mm or _FALLBACK_PERIOD_MM)
         self._pattern_period.setSuffix(" mm")
         self._pattern_period.setDecimals(2)
-        form.addRow("Pattern period:", self._pattern_period)
+        form.addRow("Checker cell side:", self._pattern_period)
 
         self._glass_thickness = QDoubleSpinBox()
         self._glass_thickness.setRange(0.0, 100.0)

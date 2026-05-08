@@ -5,6 +5,7 @@ import numpy as np
 from openfcd.pipeline.compute import (
     eta_confidence_mask,
     fill_small_eta_holes,
+    poisson_residual_diagnostics,
     repair_eta_confidence_artifacts,
     suppress_nonphysical_eta_filaments,
 )
@@ -225,3 +226,32 @@ def test_fill_small_eta_holes_zero_radius_is_noop() -> None:
     fixed = fill_small_eta_holes(eta, px_per_mm=8.0, radius_mm=0.0)
 
     np.testing.assert_array_equal(np.isnan(fixed), np.isnan(eta))
+
+
+def test_poisson_residual_diagnostics_reports_zero_for_consistent_slopes() -> None:
+    size = 96
+    px_per_mm = 8.0
+    y, x = np.mgrid[:size, :size]
+    eta = 0.2 * np.sin(2 * np.pi * x / 48.0) * np.sin(2 * np.pi * y / 48.0)
+    sy, sx = np.gradient(eta, 1.0 / px_per_mm, 1.0 / px_per_mm, edge_order=1)
+
+    diag = poisson_residual_diagnostics(eta, sx, sy, px_per_mm=px_per_mm)
+
+    interior = (slice(2, -2), slice(2, -2))
+    assert np.nanmax(diag["poisson_residual"][interior]) < 1e-12
+    assert abs(float(diag["poisson_residual_rms"])) < 1e-12
+    assert np.nanmax(np.abs(diag["curl_inconsistency"][interior])) < 0.02
+
+
+def test_poisson_residual_diagnostics_flags_inconsistent_slopes() -> None:
+    size = 64
+    px_per_mm = 8.0
+    y, x = np.mgrid[:size, :size]
+    eta = 0.1 * np.sin(2 * np.pi * x / 32.0) * np.sin(2 * np.pi * y / 32.0)
+    sy, sx = np.gradient(eta, 1.0 / px_per_mm, 1.0 / px_per_mm, edge_order=1)
+    sx_bad = sx + 0.05 * (y / size)
+
+    diag = poisson_residual_diagnostics(eta, sx_bad, sy, px_per_mm=px_per_mm)
+
+    assert float(diag["poisson_residual_rms"]) > 0.02
+    assert np.nanmax(np.abs(diag["curl_inconsistency"])) > 0.005

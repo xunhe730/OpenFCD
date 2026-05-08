@@ -62,7 +62,7 @@ python -m openfcd
 Workflow:
 
 1. **File → New Project** → point at a folder of image frames, set the
-   checkerboard pattern period (mm), window thickness, fluid depth.
+   checker cell side length (mm), window thickness, fluid depth.
 2. Click a frame in the tree → **Set as Reference** (pick a flat-water frame
    captured in the same session).
 3. Draw an ROI + optional occlusion polygon on the preview.
@@ -105,6 +105,11 @@ pattern seen through the water surface. The algorithm steps:
    apparent depth, then calibrate to mm using the optical stack geometry.
 8. **Post-processing** — plane detrend, filament suppression, optional
    high-pass filter, edge NaN margin.
+
+`geometry.pattern_period_mm` is the legacy project-file key, but its physical
+meaning is `checker_cell_mm`: the side length of one single checkerboard cell,
+not the full black-white cycle. The carrier calibration assumes
+`|k_phys| = π√2 / checker_cell_mm`.
 
 Physical correctness depends on the reference frame. Best results come from
 a flat-water reference captured in the same acquisition session as the

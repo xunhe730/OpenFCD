@@ -17,8 +17,14 @@ class OpticalStack(BaseModel):
 
 
 class GeometryConfig(BaseModel):
+    # Legacy serialized key; semantically this is the side length of one
+    # checkerboard cell, not a full black-white cycle.
     pattern_period_mm: float
     optical_stack: OpticalStack
+
+    @property
+    def checker_cell_mm(self) -> float:
+        return self.pattern_period_mm
 
 
 class DataConfig(BaseModel):

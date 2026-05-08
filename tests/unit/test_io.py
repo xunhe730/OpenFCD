@@ -69,6 +69,37 @@ def test_result_store_write_read_frame(tmp_path: Path) -> None:
         assert np.allclose(out, eta)
 
 
+def test_result_store_write_read_frame_qc_datasets(tmp_path: Path) -> None:
+    h5_path = tmp_path / "results.h5"
+    eta = np.ones((4, 4), dtype=np.float64)
+    qc = {
+        "carrier_amplitude": np.full((4, 4), 2.0),
+        "valid_mask": np.ones((4, 4), dtype=bool),
+        "artifact_mask": np.zeros((4, 4), dtype=bool),
+        "phase_residual": np.zeros((4, 4), dtype=np.float64),
+        "poisson_residual": np.zeros((4, 4), dtype=np.float64),
+        "poisson_residual_x": np.zeros((4, 4), dtype=np.float64),
+        "poisson_residual_y": np.zeros((4, 4), dtype=np.float64),
+        "curl_inconsistency": np.zeros((4, 4), dtype=np.float64),
+    }
+    attrs = {
+        "status": "ok",
+        "saturated_ratio": 0.125,
+        "invalid_ratio": 0.0,
+        "poisson_residual_rms": 0.01,
+        "curl_inconsistency_rms": 0.02,
+    }
+    with HDF5ResultStore.open(h5_path, mode="w") as store:
+        store.write_frame("b1", 7, eta, attrs, qc_datasets=qc)
+    with HDF5ResultStore.open(h5_path, mode="r") as store:
+        assert set(qc).issubset(store.list_frame_qc("b1", 7))
+        np.testing.assert_allclose(store.read_frame_qc("b1", 7, "carrier_amplitude"), qc["carrier_amplitude"])
+        np.testing.assert_array_equal(store.read_frame_qc("b1", 7, "valid_mask"), qc["valid_mask"])
+        assert store.read_frame_attrs("b1", 7)["saturated_ratio"] == 0.125
+        assert store.read_frame_attrs("b1", 7)["poisson_residual_rms"] == 0.01
+        assert store.read_frame_attrs("b1", 7)["curl_inconsistency_rms"] == 0.02
+
+
 def test_result_store_batch_status(tmp_path: Path) -> None:
     h5_path = tmp_path / "results.h5"
     with HDF5ResultStore.open(h5_path, mode="w") as store:

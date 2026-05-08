@@ -17,7 +17,7 @@ def project_info_cmd(
     typer.echo(f"Name: {project.name}")
     typer.echo(f"Created: {project.created}")
     typer.echo("Geometry:")
-    typer.echo(f"  Pattern period: {project.geometry.pattern_period_mm} mm")
+    typer.echo(f"  Checker cell side: {project.geometry.checker_cell_mm} mm")
     typer.echo(f"  Optical stack: {project.geometry.optical_stack.preset}")
     typer.echo("Data:")
     typer.echo(f"  Frames dir: {project.data.frames_dir}")

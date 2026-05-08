@@ -128,6 +128,7 @@ def test_optical_geometry_known_values():
     assert og.h_p_eff_mm == pytest.approx(expected_h)
     assert og.K_per_mm == pytest.approx(expected_K)
     assert og.pattern_period_mm == 0.5
+    assert geo.checker_cell_mm == 0.5
 
 
 def test_optical_geometry_empty_layers():

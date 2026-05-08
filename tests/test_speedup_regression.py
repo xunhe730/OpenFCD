@@ -119,6 +119,35 @@ def test_compute_ref_invariants_matches_inline(tmp_path: Path) -> None:
     np.testing.assert_array_equal(inv.ref_ff, flatfield_normalize(ref, sigma=sigma_expected))
 
 
+def test_compute_single_frame_returns_qc_datasets(tmp_path: Path) -> None:
+    proj, _ = _make_project(tmp_path, n_frames=1)
+    ref = _checkerboard(192, shift=0.0).astype(np.float64)
+    deformed = _checkerboard(192, shift=0.1).astype(np.float64)
+    from openfcd.cli.cmd_run import _build_geom_params
+
+    result = _compute_single_frame(ref, deformed, _build_geom_params(proj), proj, fast_preview=False)
+
+    required = {
+        "carrier_amplitude",
+        "valid_mask",
+        "artifact_mask",
+        "phase_residual",
+        "poisson_residual",
+        "poisson_residual_x",
+        "poisson_residual_y",
+        "curl_inconsistency",
+    }
+    assert required.issubset(result.qc_datasets)
+    for name in required:
+        assert result.qc_datasets[name].shape == result.eta_mm.shape
+    assert "saturated_ratio" in result.qc_attrs
+    assert "invalid_ratio" in result.qc_attrs
+    assert "carrier_amp_median" in result.qc_attrs
+    assert "poisson_residual_rms" in result.qc_attrs
+    assert "curl_inconsistency_rms" in result.qc_attrs
+    assert result.calibration["checker_cell_semantics"] == "single checker cell side length, not full black-white cycle"
+
+
 def test_serial_vs_parallel_bit_equal(tmp_path: Path, monkeypatch) -> None:
     """workers=1 vs workers=4 produce bit-equal eta_mm.
 

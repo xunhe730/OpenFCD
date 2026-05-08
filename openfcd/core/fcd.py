@@ -199,11 +199,25 @@ def fcd_displacement(i_def: np.ndarray, carriers: list[Carrier],
                      unwrap: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v): apparent checkerboard displacement field, in pixels."""
     phis = fcd_phases(i_def, carriers, unwrap=unwrap)
+    return displacement_from_phases(phis, carriers)
+
+
+def displacement_from_phases(phis: list[np.ndarray],
+                             carriers: list[Carrier]) -> tuple[np.ndarray, np.ndarray]:
+    """Solve carrier phase shifts for (u, v) apparent displacement in pixels."""
     c0, c1 = carriers
     det = c0.k_loc[1] * c1.k_loc[0] - c0.k_loc[0] * c1.k_loc[1]
     u = (c1.k_loc[0] * phis[0] - c0.k_loc[0] * phis[1]) / det
     v = (c0.k_loc[1] * phis[1] - c1.k_loc[1] * phis[0]) / det
     return u, v
+
+
+def displacement_from_phase_differences(
+    delta_phis: list[np.ndarray],
+    carriers: list[Carrier],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Solve physical phase differences Δφ=-k·u for displacement in pixels."""
+    return displacement_from_phases([-phi for phi in delta_phis], carriers)
 
 
 def fftinvgrad(fx: np.ndarray, fy: np.ndarray) -> np.ndarray:
@@ -229,7 +243,7 @@ def fftinvgrad(fx: np.ndarray, fy: np.ndarray) -> np.ndarray:
     fx_hat = fft2(fx)
     fy_hat = fft2(fy)
     k2[0, 0] = 1
-    f_hat = (-1j * kx * fx_hat - 1j * ky * fy_hat) / k2
+    f_hat = (-1j * kx * fx_hat - 1j * ky * fy_hat) / (2.0 * np.pi * k2)
     f = np.real(ifft2(f_hat))
     y, x = np.meshgrid(range(size[0]), range(size[1]), indexing='ij')
     f = f + mx * x + my * y
@@ -247,7 +261,7 @@ def fcd(i_def: np.ndarray, carriers: list[Carrier],
 
 
 def carriers_pixel_per_mm(carriers: list[Carrier],
-                           pattern_period_mm: float) -> float:
+                           checker_cell_mm: float) -> float:
     """Estimate pixel_per_mm from the two detected carriers.
 
     For an axis-aligned checkerboard with cell side p_mm, both carriers have
@@ -257,13 +271,13 @@ def carriers_pixel_per_mm(carriers: list[Carrier],
     so pixel_per_mm = k_phys / k_pix.
     """
     import math
-    k_phys_per_mm = math.pi * math.sqrt(2) / pattern_period_mm
+    k_phys_per_mm = math.pi * math.sqrt(2) / checker_cell_mm
     k_pix = [float(np.linalg.norm(c.k_loc)) for c in carriers]
     return k_phys_per_mm / float(np.mean(k_pix))
 
 
-def carrier_wavelength_mm(pattern_period_mm: float) -> float:
-    return pattern_period_mm / 2.0
+def carrier_wavelength_mm(checker_cell_mm: float) -> float:
+    return checker_cell_mm / 2.0
 
 
 # ---------------------------------------------------------------------------

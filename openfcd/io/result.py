@@ -105,13 +105,37 @@ class HDF5ResultStore:
             n, h, w = stack.shape
             grp.create_dataset("eta_stack", data=stack, chunks=(1, h, w))
 
-    def write_frame(self, batch: str, frame_id: int, eta: np.ndarray, attrs: dict) -> None:
+    def read_frame_qc(self, batch: str, frame_id: int, name: str) -> np.ndarray:
+        return self._file[f"batches/{batch}/qc/{frame_id}/{name}"][:]
+
+    def list_frame_qc(self, batch: str, frame_id: int) -> list[str]:
+        grp = self._file.get(f"batches/{batch}/qc/{frame_id}", None)
+        if grp is None:
+            return []
+        return sorted(grp.keys())
+
+    def write_frame(
+        self,
+        batch: str,
+        frame_id: int,
+        eta: np.ndarray,
+        attrs: dict,
+        *,
+        qc_datasets: dict[str, np.ndarray] | None = None,
+    ) -> None:
         grp = self._file.require_group(f"batches/{batch}/frames")
         if str(frame_id) in grp:
             del grp[str(frame_id)]
         ds = grp.create_dataset(str(frame_id), data=np.asarray(eta, dtype=np.float64))
         for k, v in attrs.items():
             ds.attrs[k] = v
+        qc_root = self._file.require_group(f"batches/{batch}/qc")
+        if str(frame_id) in qc_root:
+            del qc_root[str(frame_id)]
+        if qc_datasets is not None:
+            qc_grp = qc_root.create_group(str(frame_id))
+            for name, arr in qc_datasets.items():
+                qc_grp.create_dataset(name, data=np.asarray(arr))
 
     def close(self) -> None:
         if self._file is not None:
