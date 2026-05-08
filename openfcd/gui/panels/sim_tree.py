@@ -314,6 +314,14 @@ class SimTree(QTreeWidget):
             item.setToolTip(0, tooltip)
         scenes_parent.setExpanded(True)
 
+    def find_scene_item(self, scene_id: str) -> QTreeWidgetItem | None:
+        scenes_parent = self._find_or_create_parent("Scenes")
+        for i in range(scenes_parent.childCount()):
+            child = scenes_parent.child(i)
+            if child.data(0, ROLE_DATA) == scene_id:
+                return child
+        return None
+
     @staticmethod
     def _reveal_label() -> str:
         import sys

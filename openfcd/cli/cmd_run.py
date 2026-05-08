@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import signal
 import time
+import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -19,6 +21,100 @@ from openfcd.pipeline.base import CancelToken, CancelledError, Stage, StageEvent
 from openfcd.pipeline.runner import PipelineRunner
 
 from openfcd.cli._output import format_progress, stage_event_to_json
+
+
+@dataclass(frozen=True)
+class FrameComputation:
+    """Single-frame compute output plus the calibration used to create it."""
+
+    eta_mm: np.ndarray
+    pixel_per_mm: float
+    calibration: dict
+
+    @property
+    def shape(self):
+        return self.eta_mm.shape
+
+    def __array__(self, dtype=None):
+        return np.asarray(self.eta_mm, dtype=dtype)
+
+    def __getitem__(self, key):
+        return self.eta_mm[key]
+
+
+def _frame_calibration(pixel_per_mm: float, geom) -> dict:
+    return {
+        "pixel_per_mm": float(pixel_per_mm),
+        "pattern_period_mm": float(geom.pattern_period_mm),
+        "alpha": float(geom.alpha),
+        "h_p_eff_mm": float(geom.h_p_eff_mm),
+        "eta_unit": "mm",
+        "spatial_calibration_source": "carrier_detected",
+    }
+
+
+def _calibration_summary(frame_calibrations: list[dict] | None) -> dict:
+    valid = [
+        c for c in (frame_calibrations or [])
+        if c.get("pixel_per_mm") is not None and float(c.get("pixel_per_mm", 0.0)) > 0
+    ]
+    if not valid:
+        return {"calibration_status": "missing"}
+    px = np.asarray([float(c["pixel_per_mm"]) for c in valid], dtype=np.float64)
+    first = valid[0]
+    calibration = {
+        "pixel_per_mm_median": float(np.nanmedian(px)),
+        "pixel_per_mm_min": float(np.nanmin(px)),
+        "pixel_per_mm_max": float(np.nanmax(px)),
+        "pattern_period_mm": float(first["pattern_period_mm"]),
+        "alpha": float(first["alpha"]),
+        "h_p_eff_mm": float(first["h_p_eff_mm"]),
+        "eta_unit": "mm",
+        "spatial_calibration_source": "carrier_detected",
+        "n_calibrated_frames": len(valid),
+    }
+    return {
+        "calibration_status": "ok",
+        "pixel_per_mm_median": calibration["pixel_per_mm_median"],
+        "calibration": calibration,
+    }
+
+
+def _batch_calibration_meta(frame_calibrations: list[dict] | None) -> dict:
+    summary = _calibration_summary(frame_calibrations)
+    if summary.get("calibration_status") != "ok":
+        return {"calibration_status": "missing"}
+    calibration = summary["calibration"]
+    return {
+        "calibration_status": "ok",
+        "pixel_per_mm_median": calibration["pixel_per_mm_median"],
+        "pixel_per_mm_min": calibration["pixel_per_mm_min"],
+        "pixel_per_mm_max": calibration["pixel_per_mm_max"],
+        "calibration_json": json.dumps(calibration, sort_keys=True),
+    }
+
+
+def build_run_manifest(
+    project: ProjectModel,
+    run_id: str,
+    frames_filter,
+    workers: int,
+    status: str,
+    ctx: dict,
+) -> dict:
+    manifest = {
+        "project_name": project.name,
+        "run_id": run_id,
+        "frames_filter": frames_filter,
+        "workers": workers,
+        "status": status,
+    }
+    summary = _calibration_summary(ctx.get("frame_calibrations", []))
+    manifest["calibration_status"] = summary["calibration_status"]
+    if summary.get("calibration_status") == "ok":
+        manifest["pixel_per_mm_median"] = summary["pixel_per_mm_median"]
+        manifest["calibration"] = summary["calibration"]
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +288,13 @@ class PreprocessStage:
             )
             return
 
-        # 1. Scan frames
-        frames = scan_frames(frames_dir, pattern)
+        # 1. Resolve frame set. GUI runs pass the currently imported/visible
+        # frame list explicitly; CLI runs continue to scan project.data.
+        override = ctx.get("frame_paths_override")
+        if override is not None:
+            frames = [Path(p) for p in override]
+        else:
+            frames = scan_frames(frames_dir, pattern)
         if frames_filter:
             frames = _filter_frames(frames, frames_filter)
         total = len(frames)
@@ -220,8 +321,8 @@ class PreprocessStage:
         geom = _build_geom_params(project)
         ctx["geom_params"] = geom
 
-        # 4. Skip auto-detect on reference — mask priority is per-frame polygon
-        #    → global annotation.polygons → None (per-frame auto-mask).
+        # 4. Manual masks are resolved in ComputeStage. Frames without visible
+        #    per-frame polygons fall through to per-frame auto-mask.
 
         # 5. Store frame paths and count
         ctx["frame_paths"] = frames
@@ -263,7 +364,7 @@ class ComputeStage:
     def run(
         self, ctx: dict, cancel: CancelToken | None = None
     ) -> Iterator[StageEvent]:
-        from openfcd.pipeline.compute import process, GeomParams, load_gray
+        from openfcd.pipeline.compute import GeomParams, load_gray
 
         run_id: str = ctx.get("run_id", "")
         frame_paths: list[Path] = ctx.get("frame_paths", [])
@@ -273,10 +374,14 @@ class ComputeStage:
         result_store: HDF5ResultStore | None = ctx.get("result_store")
         project: ProjectModel = ctx["project"]
 
-        # Filter out disabled frames before processing.
+        # Filter out disabled frames before processing, while preserving GUI
+        # frame indices as HDF5 frame ids. Scene specs and the GUI tree use
+        # those original indices.
         disabled = set(ctx.get("disabled_frame_indices", []))
+        frame_items = list(enumerate(frame_paths))
         if disabled:
-            frame_paths = [fp for i, fp in enumerate(ctx["frame_paths"]) if i not in disabled]
+            frame_items = [(i, fp) for i, fp in frame_items if i not in disabled]
+            frame_paths = [fp for _, fp in frame_items]
             frame_count = len(frame_paths)
             ctx["frame_count"] = frame_count
             ctx["frame_paths"] = frame_paths
@@ -311,33 +416,32 @@ class ComputeStage:
             polygon_map = annotation.frame_polygons
 
         def _resolve_frame_poly(name: str):
-            """Per-frame mask → global polygons → None (auto-mask per frame)."""
+            """Return the visible mask explicitly drawn for this frame."""
             polys = polygon_map.get(name, [])
             if polys and polys[0].vertices:
                 from openfcd.core.mask import Polygon
                 return Polygon([(float(v[0]), float(v[1])) for v in polys[0].vertices])
-            # Fall back to explicit global annotation polygons only
-            global_polys = getattr(annotation, "polygons", None) or []
-            for gp in global_polys:
-                if gp.vertices:
-                    from openfcd.core.mask import Polygon
-                    return Polygon([(float(v[0]), float(v[1])) for v in gp.vertices])
-            return None  # let _compute_single_frame do per-frame auto-mask
+            return None
 
         # Single-frame body shared by serial and parallel paths.
-        def _process_one(idx: int, frame_path: Path) -> tuple[int, np.ndarray | None, str | None]:
-            """Returns (idx, eta_mm, error_msg). eta_mm is None on error."""
+        ctx["frame_calibrations"] = []
+
+        def _process_one(idx: int, frame_path: Path) -> tuple[int, FrameComputation | None, str | None]:
+            """Returns (idx, computation, error_msg). computation is None on error."""
             try:
                 deformed_img = load_gray(frame_path)
                 if deformed_img.shape != ref_img.shape:
                     return idx, None, "shape_mismatch"
-                eta_mm = _compute_single_frame(
+                computation = _compute_single_frame(
                     ref_img, deformed_img, geom, project,
                     roi_box=roi_box,
                     robot_poly=_resolve_frame_poly(frame_path.name),
                     fast_preview=True,
+                    cancel=cancel,
                 )
-                return idx, eta_mm, None
+                return idx, computation, None
+            except CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 return idx, None, str(exc)
 
@@ -385,18 +489,18 @@ class ComputeStage:
         # Simple serial loop — direct call, no per-frame thread overhead.
         # Sub-step events are collected during compute and yielded immediately
         # after; the bar still shows per-step movement at each frame boundary.
-        for idx, frame_path in enumerate(frame_paths):
+        for ordinal, (frame_idx, frame_path) in enumerate(frame_items):
             if cancel and cancel.is_cancelled:
                 break
 
             # Pre-frame: show which frame we're starting.
             yield StageEvent(
                 kind="progress", stage=self.name, batch="default",
-                frame_idx=idx, substage="loading",
-                progress=idx / max(frame_count, 1),
+                frame_idx=frame_idx, substage="loading",
+                progress=ordinal / max(frame_count, 1),
                 total=frame_count, completed=processed,
                 metrics={"frame": frame_path.name,
-                         "frame_no": f"{idx + 1}/{frame_count}"},
+                         "frame_no": f"{ordinal + 1}/{frame_count}"},
                 run_id=run_id,
             )
 
@@ -404,9 +508,10 @@ class ComputeStage:
             # the bar animates through the frame's slice without thread overhead.
             _sub_events: list[tuple[float, str]] = []
 
-            def _cb(pct: int, lbl: str, _i=idx) -> None:
+            def _cb(pct: int, lbl: str, _i=ordinal) -> None:
                 _sub_events.append((_i + pct / 100.0, lbl))
 
+            computation: FrameComputation | None = None
             eta_mm: np.ndarray | None = None
             err: str | None = None
             try:
@@ -414,13 +519,17 @@ class ComputeStage:
                 if def_img.shape != ref_img.shape:
                     err = "shape_mismatch"
                 else:
-                    eta_mm = _compute_single_frame(
+                    computation = _compute_single_frame(
                         ref_img, def_img, geom, project,
                         roi_box=roi_box,
                         robot_poly=_resolve_frame_poly(frame_path.name),
                         progress_cb=_cb,
                         fast_preview=True,
+                        cancel=cancel,
                     )
+                    eta_mm = getattr(computation, "eta_mm", computation)
+            except CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
 
@@ -429,11 +538,11 @@ class ComputeStage:
             for local_prog, label in _sub_events:
                 yield StageEvent(
                     kind="progress", stage=self.name, batch="default",
-                    frame_idx=idx, substage=label,
+                    frame_idx=frame_idx, substage=label,
                     progress=local_prog / max(frame_count, 1),
                     total=frame_count, completed=processed,
                     metrics={"frame": frame_path.name,
-                             "frame_no": f"{idx + 1}/{frame_count}"},
+                             "frame_no": f"{ordinal + 1}/{frame_count}"},
                     run_id=run_id,
                 )
 
@@ -446,12 +555,20 @@ class ComputeStage:
             # Record result.
             if eta_mm is not None:
                 if result_store is not None:
+                    attrs = {
+                        "status": "ok",
+                        "frame_path": str(frame_path.name),
+                    }
+                    calibration = getattr(computation, "calibration", None)
+                    if calibration is not None:
+                        attrs.update(calibration)
                     result_store.write_frame(
-                        "default", idx, eta_mm,
-                        {"status": "ok", "frame_path": str(frame_path.name)},
+                        "default", frame_idx, eta_mm, attrs,
                     )
+                    if calibration is not None:
+                        ctx["frame_calibrations"].append(dict(calibration))
                 if not stream_results:
-                    eta_list[idx] = eta_mm
+                    eta_list[ordinal] = eta_mm
                 processed += 1
                 # Update incremental running mean.
                 if _eta_sum is None:
@@ -465,13 +582,13 @@ class ComputeStage:
                 errors += 1
                 if result_store is not None:
                     result_store.write_frame(
-                        "default", idx,
+                        "default", frame_idx,
                         np.zeros((1, 1), dtype=np.float64),
                         {"status": "error", "message": err or "",
                          "frame_path": str(frame_path.name)},
                     )
 
-            yield _emit_frame_progress(idx, frame_path.name)
+            yield _emit_frame_progress(frame_idx, frame_path.name)
 
         # Compute and store precomputed mean in ctx for PostprocessStage.
         if _eta_sum is not None and _eta_count is not None:
@@ -544,6 +661,13 @@ class PostprocessStage:
                     run_id=run_id,
                 )
 
+                meta = {
+                    "n_frames": n_valid,
+                    "n_errors": ctx.get("compute_errors", 0),
+                    "project_name": project.name,
+                    "config_fingerprint": _quick_fingerprint(project),
+                }
+                meta.update(_batch_calibration_meta(ctx.get("frame_calibrations", [])))
                 result_store.write_batch(
                     "default",
                     data={
@@ -551,12 +675,7 @@ class PostprocessStage:
                         "eta_median": eta_median,
                         "eta_rms": eta_rms,
                     },
-                    meta={
-                        "n_frames": n_valid,
-                        "n_errors": ctx.get("compute_errors", 0),
-                        "project_name": project.name,
-                        "config_fingerprint": _quick_fingerprint(project),
-                    },
+                    meta=meta,
                 )
 
         # Write metadata
@@ -663,7 +782,8 @@ def _compute_single_frame(
     progress_cb=None,
     *,
     ref_invariants: "_RefInvariants | None" = None,
-) -> np.ndarray:
+    cancel: CancelToken | None = None,
+) -> FrameComputation:
     """Run the FCD pipeline on a single (reference, deformed) pair.
 
     Uses core functions directly rather than the file-based process() API,
@@ -673,16 +793,23 @@ def _compute_single_frame(
         roi_box:      optional Box for ROI crop (from annotation)
         robot_poly:   optional Polygon for occlusion mask (from annotation mask)
         robot_pad_px: pixels to dilate the occlusion mask
-        fast_preview: if True, auto-downsample images >3000px on longest side and
-                      skip suppress_nonphysical_eta_filaments (2–4× speedup)
+        fast_preview: if True, auto-downsample images >3000px on longest side;
+                      cleanup still runs before upsampling.
         progress_cb:  optional callable(pct: int, label: str) for progress updates
         ref_invariants: precomputed ROI-cropped ref + flatfield (run-loop hoist).
                         Mutually exclusive with fast_preview.
     """
     def _report(pct: int, label: str) -> None:
+        if cancel is not None:
+            cancel.check()
         if progress_cb is not None:
             progress_cb(pct, label)
-    from openfcd.core.fcd import calculate_carriers, carriers_pixel_per_mm, fcd as fcd_height
+    from openfcd.core.fcd import (
+        calculate_carriers,
+        carrier_amplitude,
+        carriers_pixel_per_mm,
+        fcd as fcd_height,
+    )
     from openfcd.core.flatfield import flatfield_normalize
     from openfcd.core.inpaint import inpaint_fft, synthesize_from_carriers
     from openfcd.core.mask import (
@@ -694,8 +821,12 @@ def _compute_single_frame(
     )
     from openfcd.pipeline.compute import (
         cosine_taper,
+        carrier_phase_residual,
         detrend_plane,
         edge_margin_mask,
+        eta_confidence_mask,
+        fill_small_eta_holes,
+        repair_eta_confidence_artifacts,
         suppress_nonphysical_eta_filaments,
     )
 
@@ -713,6 +844,7 @@ def _compute_single_frame(
         sigma = project.process.flatfield_sigma
     taper_alpha = project.process.taper.alpha
     edge_mm = project.process.edge_nan_mm
+    small_hole_radius_mm = float(getattr(project.process, "small_hole_fill_radius_mm", 1.0))
     same_input = np.array_equal(ref_img, def_img)
 
     # Fast-preview: auto-downsample images wider/taller than 3000px.
@@ -791,6 +923,8 @@ def _compute_single_frame(
                 robot_poly = robot_poly.shifted(-r0v, -c0v)
 
     filament_mask = detect_filament_occluders(def_ff, carriers0)
+    carrier_loss_mask = auto_mask(def_ff, carriers0, threshold_ratio=0.2, dilate_px=4)
+    carrier_amp_map = carrier_amplitude(def_ff, carriers0)
 
     # Build occlusion mask
     _report(45, "Inpaint")
@@ -806,10 +940,9 @@ def _compute_single_frame(
         def_clean = inpaint_fft(def_ff, occlusion_mask, syn2 + ref_clean.mean())
     else:
         # Auto-detect occlusion (may fail if scene is clean)
-        scout = auto_mask(def_ff, carriers0, threshold_ratio=0.2, dilate_px=4)
-        auto_poly = find_oriented_polygon(scout, edge_margin=20)
+        auto_poly = find_oriented_polygon(carrier_loss_mask, edge_margin=20)
         if auto_poly is None:
-            auto_box = find_largest_interior_blob(scout, edge_margin=20)
+            auto_box = find_largest_interior_blob(carrier_loss_mask, edge_margin=20)
             if auto_box is not None:
                 from openfcd.core.mask import Polygon
                 auto_poly = Polygon.from_box(auto_box)
@@ -827,6 +960,32 @@ def _compute_single_frame(
             ref_clean = ref_ff
             def_clean = def_ff
             carriers = carriers0
+    glint_anchor_mask = occlusion_mask | filament_mask | carrier_loss_mask
+
+    def _finalize_eta(eta: np.ndarray, px_per_mm: float) -> tuple[np.ndarray, float]:
+        # Upsample back to ROI-resolution (undo the fast-preview downsample).
+        # _original_shape is the full image shape but eta is at cropped+downsampled
+        # resolution; use the exact downscale factor instead of stretching to
+        # the full camera shape.
+        if _original_shape is not None:
+            _report(97, "Upsample")
+            from scipy.ndimage import zoom as _zoom
+            valid = np.isfinite(eta)
+            filled = np.where(valid, eta, 0.0)
+            up = round(1.0 / _downsample_scale)
+            eta_up = _zoom(filled, up, order=1)
+            valid_up = _zoom(valid.astype(np.float32), up, order=0) > 0.5
+            eta = np.where(valid_up, eta_up, np.nan)
+            px_per_mm = px_per_mm / _downsample_scale
+
+        if small_hole_radius_mm > 0:
+            _report(98, "Fill holes")
+            eta = fill_small_eta_holes(
+                eta,
+                px_per_mm=px_per_mm,
+                radius_mm=small_hole_radius_mm,
+            )
+        return eta, float(px_per_mm)
 
     # Edge conditioning: taper OR Moisan periodic decomposition (mutually exclusive).
     # Combining them reintroduces a periodic→zero boundary jump that causes an
@@ -858,8 +1017,13 @@ def _compute_single_frame(
         if edge_mm > 0:
             em_px = int(edge_mm * px_per_mm)
             eta_mm[edge_margin_mask(eta_mm.shape, em_px)] = np.nan
+        eta_mm, px_per_mm = _finalize_eta(eta_mm, px_per_mm)
         _report(100, "Done")
-        return eta_mm
+        return FrameComputation(
+            eta_mm=eta_mm,
+            pixel_per_mm=px_per_mm,
+            calibration=_frame_calibration(px_per_mm, geom),
+        )
 
     # FCD: demodulate and integrate
     _report(70, "FCD demodulate")
@@ -885,13 +1049,6 @@ def _compute_single_frame(
         em_px = int(edge_mm * px_per_mm)
         eta_mm[edge_margin_mask(eta_mm.shape, em_px)] = np.nan
 
-    if not fast_preview:
-        _report(90, "Filament suppress")
-        eta_mm = suppress_nonphysical_eta_filaments(
-            eta_mm,
-            low_signal_mask=occlusion_mask,
-        )
-
     # Optional spatial high-pass: remove large-scale drift (non-physical waves
     # from ref/def mismatch) while preserving short-wavelength surface waves.
     hp_sigma = float(getattr(project.process, "highpass_sigma_px", 0.0)) * _downsample_scale
@@ -911,24 +1068,32 @@ def _compute_single_frame(
         if hp_margin > 0:
             eta_mm[edge_margin_mask(eta_mm.shape, hp_margin)] = np.nan
 
-    # Upsample back to ROI-resolution (undo the fast-preview downsample).
-    # _original_shape is the full image shape but eta_mm is at cropped+downsampled
-    # resolution; using (h0/eta_h, w0/eta_w) as zoom factors would wrongly stretch
-    # the ROI content to fill the full image.  Use the exact downscale factor instead.
-    if _original_shape is not None:
-        _report(97, "Upsample")
-        from scipy.ndimage import zoom as _zoom
-        valid = np.isfinite(eta_mm)
-        filled = np.where(valid, eta_mm, 0.0)
-        up = round(1.0 / _downsample_scale)  # invert the fast-preview downsample
-        eta_up = _zoom(filled, up, order=1)
-        valid_up = _zoom(valid.astype(np.float32), up, order=0) > 0.5
-        eta_mm = np.where(valid_up, eta_up, np.nan)
+    _report(94, "Confidence mask")
+    phase_residual = carrier_phase_residual(def_clean - ref_clean.mean(), carriers)
+    artifact_mask = eta_confidence_mask(
+        eta_mm,
+        carrier_amplitude_map=carrier_amp_map,
+        phase_residual=phase_residual,
+        anchor_mask=glint_anchor_mask,
+        occlusion_mask=occlusion_mask,
+    )
+    if artifact_mask.any():
+        eta_mm = repair_eta_confidence_artifacts(eta_mm, artifact_mask)
+        glint_anchor_mask = glint_anchor_mask | artifact_mask
 
-    _report(100, "Done")
+    _report(95, "Glint suppress")
+    eta_mm = suppress_nonphysical_eta_filaments(
+        eta_mm,
+        low_signal_mask=glint_anchor_mask,
+    )
 
+    eta_mm, px_per_mm = _finalize_eta(eta_mm, px_per_mm)
     _report(100, "Done")
-    return eta_mm
+    return FrameComputation(
+        eta_mm=eta_mm,
+        pixel_per_mm=px_per_mm,
+        calibration=_frame_calibration(px_per_mm, geom),
+    )
 
 
 def _filter_frames(frames: list[Path], filt: str) -> list[Path]:
@@ -1156,6 +1321,9 @@ def run_cmd(
             if event.kind == "cancel":
                 exit_code = 1
 
+        if cancel_token.is_cancelled:
+            exit_code = 1
+
     except CancelledError:
         exit_code = 1
     except Exception as exc:
@@ -1167,14 +1335,14 @@ def run_cmd(
         if exit_code == 1:
             cancel_token.wait(3.0)
 
-        manifest = {
-            "project_name": project.name,
-            "run_id": run_id,
-            "frames_filter": frames,
-            "workers": workers,
-            "status": "success" if exit_code == 0
-            else ("cancelled" if exit_code == 1 else "error"),
-        }
+        manifest = build_run_manifest(
+            project,
+            run_id,
+            frames,
+            workers,
+            "success" if exit_code == 0 else ("cancelled" if exit_code == 1 else "error"),
+            ctx,
+        )
         store.record_run(run_id, manifest)
 
         # Close stores if still open

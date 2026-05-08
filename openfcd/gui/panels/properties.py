@@ -231,6 +231,7 @@ class ImagePropertiesPanel(QWidget):
     highpass_sigma_changed = pyqtSignal(float)
     taper_alpha_changed = pyqtSignal(float)
     edge_nan_changed = pyqtSignal(float)
+    small_hole_fill_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -407,6 +408,26 @@ class ImagePropertiesPanel(QWidget):
         )
         g_tune.add_row("Edge NaN mm", self._edge_nan_spin)
 
+        # Small enclosed NaN hole fill radius (mm)
+        self._small_hole_spin = QDoubleSpinBox()
+        self._small_hole_spin.setRange(0.0, 2.0)
+        self._small_hole_spin.setSingleStep(0.1)
+        self._small_hole_spin.setDecimals(1)
+        self._small_hole_spin.setValue(1.0)
+        self._small_hole_spin.setFixedHeight(24)
+        self._small_hole_spin.setToolTip(
+            "Fill small enclosed NaN holes in eta; 0 disables. Capped at 2 mm to preserve robot masks."
+        )
+        self._small_hole_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background: {tokens.BG_TERTIARY}; "
+            f"border: 1px solid {tokens.BORDER_SUBTLE}; border-radius: 4px; "
+            f"padding: 2px 4px; color: {tokens.TEXT_PRIMARY}; font-size: 11.5px; }}"
+        )
+        self._small_hole_spin.valueChanged.connect(
+            lambda v: self.small_hole_fill_changed.emit(float(v))
+        )
+        g_tune.add_row("Small hole fill mm", self._small_hole_spin)
+
         layout.addWidget(g_tune)
 
         # ── Compute actions ──
@@ -462,6 +483,14 @@ class ImagePropertiesPanel(QWidget):
 
     def edge_nan_mm(self) -> float:
         return float(self._edge_nan_spin.value())
+
+    def set_small_hole_fill_radius(self, v: float) -> None:
+        self._small_hole_spin.blockSignals(True)
+        self._small_hole_spin.setValue(float(v))
+        self._small_hole_spin.blockSignals(False)
+
+    def small_hole_fill_radius(self) -> float:
+        return float(self._small_hole_spin.value())
 
     def set_frame_info(self, name: str, size: str, index: int, total: int) -> None:
         self._name_input.setText(name)
@@ -585,6 +614,7 @@ class VizSettingsPanel(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._scene_type = "eta_map"
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -679,9 +709,28 @@ class VizSettingsPanel(QWidget):
         p_prof = QWidget()
         ppl = QVBoxLayout(p_prof)
         ppl.setContentsMargins(0, 0, 0, 0)
-        self._line_color = PropInput("#CC785C")
-        ppl.addWidget(QLabel("Line color"))
-        ppl.addWidget(self._line_color)
+        self._line_color = PropInput("red")
+        self._profile_color = PropInput("blue")
+        self._strip_mm = PropInput("2.0", mono=True)
+        self._y_range_mm = PropInput("30.0", mono=True)
+        self._min_roi_width_mm = PropInput("160.0", mono=True)
+        self._min_roi_height_mm = PropInput("50.0", mono=True)
+        self._x_padding_mm = PropInput("5.0", mono=True)
+        self._auto_crop = QCheckBox("auto")
+        self._auto_crop.setChecked(True)
+        self._x_range_mm = PropInput("", mono=True)
+        self._x_range_mm.setPlaceholderText("auto or min:max")
+        prof_group = PropGroup("Profile Composite")
+        prof_group.add_row("Line color", self._line_color)
+        prof_group.add_row("Profile color", self._profile_color)
+        prof_group.add_row("Strip mm", self._strip_mm)
+        prof_group.add_row("y range mm", self._y_range_mm)
+        prof_group.add_row("min ROI width mm", self._min_roi_width_mm)
+        prof_group.add_row("min ROI height mm", self._min_roi_height_mm)
+        prof_group.add_row("x padding mm", self._x_padding_mm)
+        prof_group.add_row("Auto crop", self._auto_crop)
+        prof_group.add_row("x range mm", self._x_range_mm)
+        ppl.addWidget(prof_group)
         self._type_stack.addWidget(p_prof)  # 1: profile
 
         # rms panel (index 2)
@@ -741,11 +790,29 @@ class VizSettingsPanel(QWidget):
 
         # Track dirty state
         self._dirty = False
-        for widget in [self._cmap, self._vmin, self._vmax, self._colorbar_pos, self._title_edit, self._dpi]:
+        for widget in [
+            self._cmap,
+            self._vmin,
+            self._vmax,
+            self._colorbar_pos,
+            self._title_edit,
+            self._dpi,
+            self._line_color,
+            self._profile_color,
+            self._strip_mm,
+            self._y_range_mm,
+            self._min_roi_width_mm,
+            self._min_roi_height_mm,
+            self._x_padding_mm,
+            self._auto_crop,
+            self._x_range_mm,
+        ]:
             if hasattr(widget, "currentIndexChanged"):
                 widget.currentIndexChanged.connect(self._mark_dirty)
             elif hasattr(widget, "textChanged"):
                 widget.textChanged.connect(self._mark_dirty)
+            elif hasattr(widget, "toggled"):
+                widget.toggled.connect(self._mark_dirty)
 
     def _mark_dirty(self) -> None:
         if not self._dirty:
@@ -757,7 +824,7 @@ class VizSettingsPanel(QWidget):
                 f"padding:4px 14px;font-size:12px;font-weight:600;"
             )
 
-    def _on_apply(self) -> None:
+    def _clear_dirty(self) -> None:
         self._dirty = False
         self._btn_apply.setText("Apply")
         self._btn_apply.setStyleSheet(
@@ -765,26 +832,103 @@ class VizSettingsPanel(QWidget):
             f"border:1px solid {tokens.BORDER_SUBTLE};border-radius:5px;"
             f"padding:4px 14px;font-size:12px;"
         )
+
+    def _on_apply(self) -> None:
+        self._clear_dirty()
         self.apply_clicked.emit(self.get_viz_params())
 
+    @staticmethod
+    def _parse_float(text: str, default: float | None = None) -> float | None:
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return default
+
+    def _current_defaults(self) -> dict:
+        from openfcd.gui.scenes.viz_defaults import scene_defaults
+        return scene_defaults(self._scene_type)
+
+    def _parse_profile_x_range_value(self) -> tuple[float, float] | None:
+        from openfcd.core.profile_composite import parse_profile_x_range
+
+        raw = self._x_range_mm.text().strip()
+        parsed = parse_profile_x_range(raw)
+        if raw and parsed is None:
+            self._x_range_mm.setText("")
+            return None
+        return parsed
+
+    @staticmethod
+    def _positive(value: float | None, default: float) -> float:
+        if value is None or value <= 0:
+            return default
+        return value
+
+    @staticmethod
+    def _nonnegative(value: float | None, default: float) -> float:
+        if value is None or value < 0:
+            return default
+        return value
+
     def get_viz_params(self) -> dict:
-        return {
+        defaults = self._current_defaults()
+        default_dpi = int(defaults.get("dpi", 150))
+        params = {
             "cmap": self._cmap.currentText(),
             "vmin": None if self._vmin_auto.isChecked() else self._vmin.text(),
             "vmax": None if self._vmax_auto.isChecked() else self._vmax.text(),
             "colorbar": self._colorbar_pos.currentText(),
             "title": self._title_edit.text() or None,
-            "dpi": int(self._dpi.text()) if self._dpi.text().isdigit() else 150,
+            "dpi": int(self._dpi.text()) if self._dpi.text().isdigit() and int(self._dpi.text()) > 0 else default_dpi,
             "alpha": self._alpha_spin.value(),
+            "line_color": self._line_color.text() or "red",
+            "profile_color": self._profile_color.text() or "blue",
+            "strip_mm": self._nonnegative(
+                self._parse_float(self._strip_mm.text()),
+                float(defaults.get("strip_mm", 0.0)),
+            ),
+            "y_range_mm": self._positive(
+                self._parse_float(self._y_range_mm.text()),
+                float(defaults.get("y_range_mm", 30.0)),
+            ),
+            "min_roi_width_mm": self._positive(
+                self._parse_float(self._min_roi_width_mm.text()),
+                float(defaults.get("min_roi_width_mm", 160.0)),
+            ),
+            "min_roi_height_mm": self._positive(
+                self._parse_float(self._min_roi_height_mm.text()),
+                float(defaults.get("min_roi_height_mm", 50.0)),
+            ),
+            "x_padding_mm": self._nonnegative(
+                self._parse_float(self._x_padding_mm.text()),
+                float(defaults.get("x_padding_mm", 0.0)),
+            ),
+            "auto_crop": self._auto_crop.isChecked(),
+            "show_measurements": False,
         }
+        x_range = self._parse_profile_x_range_value()
+        params["x_range_mm"] = list(x_range) if x_range is not None else None
+        return params
 
     def set_scene_type(self, scene_type: str) -> None:
         """Switch type-specific panel based on scene type."""
+        self._scene_type = scene_type
         idx_map = {"eta_map": 0, "profile": 1, "rms": 2}
         self._type_stack.setCurrentIndex(idx_map.get(scene_type, 0))
 
-    def load_viz_params(self, params: dict) -> None:
+    def load_viz_params(self, scene_type_or_params, params: dict | None = None) -> None:
         """Populate fields from a viz_params dict."""
+        if params is None:
+            scene_type = self._scene_type
+            user_params = dict(scene_type_or_params or {})
+        else:
+            scene_type = str(scene_type_or_params)
+            self.set_scene_type(scene_type)
+            user_params = dict(params or {})
+        from openfcd.gui.scenes.viz_defaults import scene_defaults
+        params = scene_defaults("profile")
+        params.update(scene_defaults(scene_type))
+        params.update(user_params)
         if "cmap" in params:
             idx = self._cmap.findText(params["cmap"])
             if idx >= 0:
@@ -801,8 +945,30 @@ class VizSettingsPanel(QWidget):
             self._vmax_auto.setChecked(True)
         if "dpi" in params:
             self._dpi.setText(str(params["dpi"]))
-        self._dirty = False
-        self._btn_apply.setText("Apply")
+        if "colorbar" in params:
+            idx = self._colorbar_pos.findText(str(params["colorbar"]))
+            if idx >= 0:
+                self._colorbar_pos.setCurrentIndex(idx)
+        self._title_edit.setText(str(params.get("title") or ""))
+        if "line_color" in params:
+            self._line_color.setText(str(params["line_color"]))
+        if "profile_color" in params:
+            self._profile_color.setText(str(params["profile_color"]))
+        if "strip_mm" in params:
+            self._strip_mm.setText(str(params["strip_mm"]))
+        if "y_range_mm" in params:
+            self._y_range_mm.setText(str(params["y_range_mm"]))
+        if "min_roi_width_mm" in params:
+            self._min_roi_width_mm.setText(str(params["min_roi_width_mm"]))
+        if "min_roi_height_mm" in params:
+            self._min_roi_height_mm.setText(str(params["min_roi_height_mm"]))
+        if "x_padding_mm" in params:
+            self._x_padding_mm.setText(str(params["x_padding_mm"]))
+        if "auto_crop" in params:
+            self._auto_crop.setChecked(bool(params["auto_crop"]))
+        from openfcd.core.profile_composite import format_profile_x_range
+        self._x_range_mm.setText(format_profile_x_range(params.get("x_range_mm")))
+        self._clear_dirty()
 
 
 class ImportPanel(QWidget):
@@ -851,6 +1017,7 @@ class PropertiesPanel(QStackedWidget):
     highpass_sigma_changed = pyqtSignal(float)
     taper_alpha_changed = pyqtSignal(float)
     edge_nan_changed = pyqtSignal(float)
+    small_hole_fill_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -884,6 +1051,7 @@ class PropertiesPanel(QStackedWidget):
         self._image_properties.highpass_sigma_changed.connect(self.highpass_sigma_changed)
         self._image_properties.taper_alpha_changed.connect(self.taper_alpha_changed)
         self._image_properties.edge_nan_changed.connect(self.edge_nan_changed)
+        self._image_properties.small_hole_fill_changed.connect(self.small_hole_fill_changed)
 
         self._compute.run_all_clicked.connect(self.run_all_clicked)
 

@@ -95,3 +95,14 @@ def test_rms_nan_frames_handled(tmp_path):
     assert rms is not None
     assert np.isnan(rms[0, 0])
     np.testing.assert_allclose(rms[1:, 1:], 1.0, atol=1e-10)
+
+
+def test_rms_replaced_worker_does_not_update_current_scene(rms_view):
+    rms_view._generation = 2
+    rms_view._cached_rms = None
+    stale = np.ones((3, 3))
+    current = np.ones((3, 3)) * 2
+    rms_view._on_result(1, stale)
+    assert rms_view._cached_rms is None
+    rms_view._on_result(2, current)
+    np.testing.assert_allclose(rms_view._cached_rms, current)

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator, Optional, Sequence, TYPE_CHECKING
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, median_filter
+from scipy.ndimage import gaussian_filter, median_filter, uniform_filter
 from skimage.io import imread
 from skimage.color import rgb2gray
 
@@ -94,12 +94,14 @@ def suppress_nonphysical_eta_filaments(
     min_length_px: int = 10,
     max_width_px: int = 6,
     min_aspect: float = 4.0,
+    glint_max_area_px: int = 2500,
+    glint_max_size_px: int = 96,
 ) -> np.ndarray:
-    """Suppress narrow non-physical jump lines in eta.
+    """Suppress non-physical finite eta artifacts near low-signal regions.
 
-    The target is not broad wave structure, but thin elongated discontinuities
-    caused by local carrier corruption (wires, glints, tiny occluders) that
-    leak through the global gradient integration.
+    The target is not broad wave structure, but narrow discontinuities and
+    compact red/blue dipoles caused by local carrier corruption (wires, glints,
+    tiny occluders) that leak through the global gradient integration.
     """
     from skimage.draw import line
     from skimage.measure import label, regionprops
@@ -174,6 +176,22 @@ def suppress_nonphysical_eta_filaments(
             continue
         candidate |= region_mask
 
+    if anchor_region is not None:
+        # Reflective pinholes often produce compact red/blue dipoles rather
+        # than long line-like jumps. Repair only small residual components that
+        # are attached to a low-carrier/occlusion anchor, so real wave bands
+        # away from glints are left alone.
+        glint_lab = label((seed & anchor_region).astype(np.uint8))
+        for region in regionprops(glint_lab):
+            minr, minc, maxr, maxc = region.bbox
+            h = maxr - minr
+            w = maxc - minc
+            if region.area > glint_max_area_px:
+                continue
+            if max(h, w) > glint_max_size_px:
+                continue
+            candidate |= glint_lab == region.label
+
     candidate |= line_mask
     candidate &= finite
     if not candidate.any():
@@ -183,9 +201,294 @@ def suppress_nonphysical_eta_filaments(
 
     fill_value = float(np.nanmedian(work[finite]))
     filled = np.where(finite, work, fill_value)
-    repaired = inpaint_biharmonic(filled, candidate, channel_axis=None)
     out = work.copy()
-    out[candidate] = repaired[candidate]
+    repair_lab = label(candidate.astype(np.uint8))
+    pad = max(8, median_window_px * 2)
+    for region in regionprops(repair_lab):
+        minr, minc, maxr, maxc = region.bbox
+        r0 = max(0, minr - pad)
+        c0 = max(0, minc - pad)
+        r1 = min(work.shape[0], maxr + pad)
+        c1 = min(work.shape[1], maxc + pad)
+        target_crop = repair_lab[r0:r1, c0:c1] == region.label
+        finite_crop = finite[r0:r1, c0:c1]
+        mask_crop = target_crop | ~finite_crop
+        crop = filled[r0:r1, c0:c1]
+        repaired = inpaint_biharmonic(crop, mask_crop, channel_axis=None)
+        out_crop = out[r0:r1, c0:c1]
+        out_crop[target_crop] = repaired[target_crop]
+        out[r0:r1, c0:c1] = out_crop
+    return out
+
+
+def carrier_phase_residual(
+    img: np.ndarray,
+    carriers: Sequence[Carrier],
+    *,
+    window_px: int = 11,
+) -> np.ndarray:
+    """Local circular phase inconsistency for carrier-demodulated images.
+
+    Values near zero mean the carrier phase is locally coherent. Large values
+    flag phase jumps from glints, saturation, and occluder edges.
+    """
+    from openfcd.core.fcd import fcd_phases
+
+    size = max(3, int(window_px))
+    if size % 2 == 0:
+        size += 1
+    residual = np.zeros(np.asarray(img).shape, dtype=np.float64)
+    for phi in fcd_phases(img, list(carriers), unwrap=False):
+        c = uniform_filter(np.cos(phi), size=size, mode="nearest")
+        s = uniform_filter(np.sin(phi), size=size, mode="nearest")
+        local = np.arctan2(s, c)
+        delta = np.angle(np.exp(1j * (phi - local)))
+        residual = np.maximum(residual, np.abs(delta))
+    return residual
+
+
+def _robust_high_threshold(values: np.ndarray, percentile: float, sigma: float) -> float:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("inf")
+    med = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - med))) + 1e-12
+    return max(float(np.percentile(finite, percentile)), med + sigma * mad)
+
+
+def eta_confidence_mask(
+    eta: np.ndarray,
+    *,
+    carrier_amplitude_map: np.ndarray | None = None,
+    phase_residual: np.ndarray | None = None,
+    anchor_mask: np.ndarray | None = None,
+    occlusion_mask: np.ndarray | None = None,
+    median_window_px: int = 11,
+    residual_percentile: float = 98.5,
+    phase_percentile: float = 97.5,
+    carrier_low_ratio: float = 0.55,
+    anchor_dilate_px: int = 18,
+    occlusion_boundary_px: int = 28,
+    max_component_area_px: int = 6000,
+    max_component_size_px: int = 180,
+    return_debug: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Detect finite eta artifacts caused by locally unreliable carriers.
+
+    The output mask marks only finite eta pixels that should be locally
+    repaired. Broad, unanchored wave structure is left untouched.
+    """
+    from skimage.measure import label, regionprops
+    from skimage.morphology import dilation, disk
+
+    work = np.asarray(eta, dtype=np.float64)
+    finite = np.isfinite(work)
+    empty = np.zeros(work.shape, dtype=bool)
+    if finite.sum() < 100:
+        if return_debug:
+            return empty, {
+                "eta_residual": np.zeros(work.shape, dtype=np.float64),
+                "eta_seed": empty,
+                "carrier_bad": empty,
+                "phase_bad": empty,
+                "anchor": empty,
+            }
+        return empty
+
+    size = max(3, int(median_window_px))
+    if size % 2 == 0:
+        size += 1
+    fill_value = float(np.nanmedian(work[finite]))
+    filled = np.where(finite, work, fill_value)
+    local = median_filter(filled, size=size, mode="nearest")
+    eta_residual = np.abs(work - local)
+    eta_residual[~finite] = 0.0
+    residual_valid = eta_residual[finite]
+    hard_thr = _robust_high_threshold(residual_valid, residual_percentile, 6.0)
+    soft_thr = _robust_high_threshold(residual_valid, 95.0, 4.0)
+    eta_seed = eta_residual > hard_thr
+    eta_seed_soft = eta_residual > soft_thr
+
+    carrier_bad = empty.copy()
+    if carrier_amplitude_map is not None and carrier_amplitude_map.shape == work.shape:
+        amp = np.asarray(carrier_amplitude_map, dtype=np.float64)
+        amp_pos = amp[np.isfinite(amp) & (amp > 0)]
+        if amp_pos.size:
+            amp_ref = float(np.median(amp_pos))
+            carrier_bad = amp < carrier_low_ratio * amp_ref
+
+    phase_bad = empty.copy()
+    if phase_residual is not None and phase_residual.shape == work.shape:
+        phase = np.asarray(phase_residual, dtype=np.float64)
+        phase_values = phase[finite & np.isfinite(phase)]
+        if phase_values.size:
+            phase_thr = max(_robust_high_threshold(phase_values, phase_percentile, 4.0), 0.45)
+            phase_bad = phase > phase_thr
+
+    anchor = carrier_bad | phase_bad
+    if anchor_mask is not None and anchor_mask.shape == work.shape:
+        anchor |= np.asarray(anchor_mask, dtype=bool)
+    anchor &= finite | carrier_bad | phase_bad
+
+    if anchor.any():
+        anchor_region = dilation(anchor, footprint=disk(max(1, int(anchor_dilate_px))))
+    else:
+        anchor_region = empty.copy()
+
+    candidate = eta_seed & anchor_region & finite
+
+    near_occlusion = empty.copy()
+    if occlusion_mask is not None and occlusion_mask.shape == work.shape:
+        occ = np.asarray(occlusion_mask, dtype=bool)
+        if occ.any():
+            near_occlusion = dilation(
+                occ, footprint=disk(max(1, int(occlusion_boundary_px)))
+            ) & ~occ
+            candidate |= eta_seed_soft & near_occlusion & finite
+
+    if candidate.any():
+        candidate = dilation(candidate, footprint=disk(1)) & finite
+
+    accepted = empty.copy()
+    lab = label(candidate.astype(np.uint8), connectivity=1)
+    for region in regionprops(lab):
+        minr, minc, maxr, maxc = region.bbox
+        h = maxr - minr
+        w = maxc - minc
+        if region.area > max_component_area_px:
+            continue
+        if max(h, w) > max_component_size_px:
+            continue
+        accepted |= lab == region.label
+
+    if return_debug:
+        return accepted, {
+            "eta_residual": eta_residual,
+            "eta_seed": eta_seed,
+            "eta_seed_soft": eta_seed_soft,
+            "carrier_bad": carrier_bad,
+            "phase_bad": phase_bad,
+            "anchor": anchor_region,
+            "near_occlusion": near_occlusion,
+        }
+    return accepted
+
+
+def repair_eta_confidence_artifacts(
+    eta: np.ndarray,
+    artifact_mask: np.ndarray,
+    *,
+    pad_px: int = 24,
+) -> np.ndarray:
+    """Locally inpaint finite eta artifact pixels selected by a confidence mask."""
+    from skimage.measure import label, regionprops
+    from skimage.restoration import inpaint_biharmonic
+
+    work = np.asarray(eta, dtype=np.float64)
+    mask = np.asarray(artifact_mask, dtype=bool)
+    finite = np.isfinite(work)
+    mask &= finite
+    if not mask.any() or finite.sum() < 100:
+        return work.copy()
+
+    fill_value = float(np.nanmedian(work[finite]))
+    filled = np.where(finite, work, fill_value)
+    out = work.copy()
+    lab = label(mask.astype(np.uint8), connectivity=1)
+    for region in regionprops(lab):
+        minr, minc, maxr, maxc = region.bbox
+        r0 = max(0, minr - pad_px)
+        c0 = max(0, minc - pad_px)
+        r1 = min(work.shape[0], maxr + pad_px)
+        c1 = min(work.shape[1], maxc + pad_px)
+        target_crop = lab[r0:r1, c0:c1] == region.label
+        finite_crop = finite[r0:r1, c0:c1]
+        mask_crop = target_crop | ~finite_crop
+        crop = filled[r0:r1, c0:c1]
+        repaired = inpaint_biharmonic(crop, mask_crop, channel_axis=None)
+        out_crop = out[r0:r1, c0:c1]
+        out_crop[target_crop] = repaired[target_crop]
+        out[r0:r1, c0:c1] = out_crop
+    return out
+
+
+def fill_small_eta_holes(
+    eta: np.ndarray,
+    *,
+    px_per_mm: float,
+    radius_mm: float,
+    max_aspect_ratio: float = 2.5,
+    hard_max_radius_mm: float = 2.0,
+) -> np.ndarray:
+    """Fill small enclosed NaN holes in a final eta field.
+
+    This targets small round glint holes accidentally marked as invalid. Large
+    occluders, edge/ROI margins, and wire-like NaN regions are intentionally
+    left untouched.
+    """
+    if radius_mm <= 0 or px_per_mm <= 0:
+        return np.asarray(eta, dtype=np.float64)
+
+    from scipy.ndimage import binary_dilation
+    from skimage.measure import label, regionprops
+    from skimage.restoration import inpaint_biharmonic
+
+    work = np.asarray(eta, dtype=np.float64)
+    finite = np.isfinite(work)
+    if finite.sum() < 100:
+        return work.copy()
+
+    invalid = ~finite
+    if not invalid.any():
+        return work.copy()
+
+    effective_radius_mm = min(float(radius_mm), float(hard_max_radius_mm))
+    radius_px = max(1, int(round(effective_radius_mm * float(px_per_mm))))
+    max_area = np.pi * float(radius_px ** 2)
+    max_bbox = max(1, 2 * radius_px)
+    pad = max(8, radius_px)
+    out = work.copy()
+
+    lab = label(invalid.astype(np.uint8), connectivity=1)
+    h_img, w_img = work.shape
+    for region in regionprops(lab):
+        minr, minc, maxr, maxc = region.bbox
+        if minr == 0 or minc == 0 or maxr == h_img or maxc == w_img:
+            continue
+
+        height = maxr - minr
+        width = maxc - minc
+        long_axis = max(height, width)
+        short_axis = max(1, min(height, width))
+        if region.area > max_area:
+            continue
+        if long_axis > max_bbox:
+            continue
+        if long_axis / short_axis > max_aspect_ratio:
+            continue
+
+        component = lab == region.label
+        ring = binary_dilation(component, iterations=1) & ~component
+        if not ring.any() or not np.all(finite[ring]):
+            continue
+
+        r0 = max(0, minr - pad)
+        c0 = max(0, minc - pad)
+        r1 = min(h_img, maxr + pad)
+        c1 = min(w_img, maxc + pad)
+        crop = out[r0:r1, c0:c1]
+        crop_finite = np.isfinite(crop)
+        if crop_finite.sum() < 16:
+            continue
+
+        fill_value = float(np.nanmedian(crop[crop_finite]))
+        filled = np.where(crop_finite, crop, fill_value)
+        mask_crop = component[r0:r1, c0:c1]
+        repaired = inpaint_biharmonic(filled, mask_crop, channel_axis=None)
+        crop_out = crop.copy()
+        crop_out[mask_crop] = repaired[mask_crop]
+        out[r0:r1, c0:c1] = crop_out
+
     return out
 
 

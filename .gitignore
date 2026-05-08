@@ -46,3 +46,6 @@ progress.txt
 scratch/
 tmp/
 tests/scratch/
+.gitnexus
+*.bak
+~$*

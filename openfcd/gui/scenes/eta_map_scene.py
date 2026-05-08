@@ -69,16 +69,17 @@ class EtaMapSceneView(QWidget):
         self._spec = spec
         self._frame_indices = list(spec.frame_indices)
         self._eta_frames = []
-        self._title.setText(f"η Map — {spec.name}")
+        title = (spec.viz_params or {}).get("title") or spec.name or "η Map"
+        self._title.setText(str(title))
 
         run_id = spec.run_id or self._latest_run_id(project_path)
         if run_id is None or not self._frame_indices:
-            self._eta_map.set_data(np.array([]))
+            self._eta_map.clear("No run selected")
             return
 
         h5_path = project_path / "runs" / run_id / "results.h5"
         if not h5_path.exists():
-            self._eta_map.set_data(np.array([]))
+            self._eta_map.clear("Results file not found")
             return
 
         from openfcd.io.result import HDF5ResultStore
@@ -123,7 +124,29 @@ class EtaMapSceneView(QWidget):
         n = len(self._eta_frames)
         self._slider_lbl.setText(f"frame {idx + 1}/{n}")
         if 0 <= idx < n and self._eta_frames[idx] is not None:
-            cmap = (self._spec.viz_params or {}).get("cmap", "RdBu_r")
-            self._eta_map.set_data(self._eta_frames[idx], colormap=cmap)
+            params = self._spec.viz_params or {}
+            cmap = params.get("cmap", "RdBu_r")
+            self._eta_map.set_data(
+                self._eta_frames[idx],
+                colormap=cmap,
+                vmin=self._parse_float(params.get("vmin")),
+                vmax=self._parse_float(params.get("vmax")),
+                colorbar=params.get("colorbar", "right"),
+            )
         else:
-            self._eta_map.set_data(np.array([]))
+            self._eta_map.clear("No data")
+
+    def apply_viz(self, params: dict) -> None:
+        if self._spec is not None:
+            self._spec = self._spec.model_copy(update={"viz_params": dict(params)})
+            self._title.setText(str(params.get("title") or self._spec.name or "η Map"))
+        self._show_frame(self._slider.value())
+
+    @staticmethod
+    def _parse_float(value) -> float | None:
+        if value in (None, "", "auto"):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None

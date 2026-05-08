@@ -58,6 +58,9 @@ class HDF5ResultStore:
     def read_frame(self, batch: str, frame_id: int) -> np.ndarray:
         return self._file[f"batches/{batch}/frames/{frame_id}"][:]
 
+    def read_frame_attrs(self, batch: str, frame_id: int) -> dict:
+        return dict(self._file[f"batches/{batch}/frames/{frame_id}"].attrs)
+
     def read_stack(self, batch: str, frame_ids: list[int] | None = None) -> np.ndarray:
         ds = self._file[f"batches/{batch}/eta_stack"]
         if frame_ids is None:

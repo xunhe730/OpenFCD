@@ -91,6 +91,8 @@ class RmsSceneView(QWidget):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._worker: _RmsWorker | None = None
+        self._old_workers: list[_RmsWorker] = []
+        self._generation = 0
         self._cached_rms: np.ndarray | None = None
         self._cached_spec_id: str | None = None
         layout = QVBoxLayout(self)
@@ -112,7 +114,10 @@ class RmsSceneView(QWidget):
         layout.addWidget(self._eta_map, 1)
 
     def load(self, spec, project_path: Path, annotation=None) -> None:
+        self._generation += 1
+        generation = self._generation
         self._title.setText(f"RMS — {spec.name}  ({len(spec.frame_indices)} frames)")
+        self._retire_current_worker()
         # Use cached result if spec hasn't changed
         if self._cached_spec_id == spec.id and self._cached_rms is not None:
             self._show_rms(self._cached_rms)
@@ -122,33 +127,53 @@ class RmsSceneView(QWidget):
         self._status.setText("Computing RMS…")
         self._status.setVisible(True)
         self._eta_map.setVisible(False)
-        if self._worker is not None:
-            # Disconnect before abandoning so a stale emit doesn't hit this view.
-            try:
-                self._worker.result_ready.disconnect()
-                self._worker.failed.disconnect()
-            except Exception:
-                pass
-            self._worker = None
-
         self._worker = _RmsWorker(project_path, spec, annotation)
-        self._worker.result_ready.connect(self._on_result)
-        self._worker.failed.connect(self._on_failed)
+        self._worker.result_ready.connect(lambda rms, gen=generation: self._on_result(gen, rms))
+        self._worker.failed.connect(lambda msg, gen=generation: self._on_failed(gen, msg))
+        self._worker.finished.connect(lambda worker=self._worker: self._on_worker_finished(worker))
         self._worker.start()
 
-    def _on_result(self, rms) -> None:
+    def _retire_current_worker(self) -> None:
+        if self._worker is None:
+            return
+        worker = self._worker
         self._worker = None
+        worker.requestInterruption()
+        self._old_workers.append(worker)
+
+    def _on_worker_finished(self, worker: _RmsWorker) -> None:
+        if worker is self._worker:
+            self._worker = None
+        if worker in self._old_workers:
+            self._old_workers.remove(worker)
+        worker.deleteLater()
+
+    def _on_result(self, generation: int, rms) -> None:
+        if generation != self._generation:
+            return
         if rms is None:
             self._status.setText("No data — run a computation first.")
             return
         self._cached_rms = rms
         self._show_rms(rms)
 
-    def _on_failed(self, msg: str) -> None:
-        self._worker = None
+    def _on_failed(self, generation: int, msg: str) -> None:
+        if generation != self._generation:
+            return
         self._status.setText(f"Failed: {msg[:80]}")
 
     def _show_rms(self, rms: np.ndarray) -> None:
         self._status.setVisible(False)
         self._eta_map.setVisible(True)
         self._eta_map.set_data(rms, colormap="magma")
+
+    def apply_viz(self, params: dict) -> None:
+        cmap = params.get("cmap", "magma")
+        if self._cached_rms is not None:
+            self._eta_map.set_data(self._cached_rms, colormap=cmap)
+
+    def closeEvent(self, event) -> None:
+        self._retire_current_worker()
+        for worker in list(self._old_workers):
+            worker.requestInterruption()
+        super().closeEvent(event)

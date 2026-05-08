@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 
 from openfcd.gui.scenes.scene_view_placeholder import SceneViewPlaceholder
@@ -10,6 +11,8 @@ from openfcd.gui.scenes.scene_view_placeholder import SceneViewPlaceholder
 
 class SceneContainer(QWidget):
     """Center-stack widget that holds all scene view types."""
+
+    scene_changed = pyqtSignal(object)
 
     _IDX_PLACEHOLDER = 0
     _IDX_ETA_MAP = 1
@@ -33,6 +36,7 @@ class SceneContainer(QWidget):
 
         from openfcd.gui.scenes.profile_scene import ProfileSceneView
         self._profile_view = ProfileSceneView()
+        self._profile_view.scene_changed.connect(self.scene_changed.emit)
         self._stack.addWidget(self._profile_view)  # 2
 
         from openfcd.gui.scenes.rms_scene import RmsSceneView
@@ -40,7 +44,7 @@ class SceneContainer(QWidget):
         self._rms_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._stack.addWidget(self._rms_view)  # 3
 
-    def show_scene(self, spec, project_path: Path) -> None:
+    def show_scene(self, spec, project_path: Path, slider_pos: int | None = None) -> None:
         from openfcd.io.scene import SceneType
         if spec is None:
             self._placeholder.set_scene("—", "—", "No scene selected", 0)
@@ -50,6 +54,7 @@ class SceneContainer(QWidget):
             self._eta_map_view.load(spec, project_path)
             self._stack.setCurrentIndex(self._IDX_ETA_MAP)
         elif spec.type == SceneType.PROFILE:
+            self._profile_view.set_preferred_frame_pos(slider_pos)
             self._profile_view.load(spec, project_path)
             self._stack.setCurrentIndex(self._IDX_PROFILE)
         elif spec.type == SceneType.RMS:
@@ -58,3 +63,20 @@ class SceneContainer(QWidget):
         else:
             self._placeholder.set_scene(spec.id, spec.type, spec.name, len(spec.frame_indices))
             self._stack.setCurrentIndex(self._IDX_PLACEHOLDER)
+
+    def apply_viz(self, params: dict) -> None:
+        current = self._stack.currentWidget()
+        if hasattr(current, "apply_viz"):
+            current.apply_viz(params)
+
+    def export_context(self) -> dict:
+        current = self._stack.currentWidget()
+        if hasattr(current, "export_context"):
+            return current.export_context()
+        return {}
+
+    def current_slider_value(self) -> int | None:
+        current = self._stack.currentWidget()
+        if hasattr(current, "current_slider_value"):
+            return int(current.current_slider_value())
+        return None

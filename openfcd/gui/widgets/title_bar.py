@@ -3,28 +3,26 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLabel
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPainter, QColor, QMouseEvent
+from PyQt6.QtGui import QMouseEvent, QPainter
+from PyQt6.QtSvg import QSvgRenderer
 
 from openfcd.gui import tokens
+from openfcd.gui.icons import LOGO_MARK_PATH
 
 
 class _Logo(QWidget):
-    """14x14 clay square with 8x8 inner cutout (paintEvent)."""
+    """Compact OpenFCD brand mark rendered from SVG."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(14, 14)
+        self.setFixedSize(18, 18)
+        self._renderer = QSvgRenderer(str(LOGO_MARK_PATH))
 
     def paintEvent(self, a0) -> None:  # noqa: ANN001
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Outer: 14x14, ACCENT_CLAY, 3px radius
-        painter.setBrush(QColor(tokens.ACCENT_CLAY))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(0, 0, 14, 14, 3, 3)
-        # Inner cutout: 8x8 centered, BG_PRIMARY, 1px radius
-        painter.setBrush(QColor(tokens.BG_PRIMARY))
-        painter.drawRoundedRect(3, 3, 8, 8, 1, 1)
+        self._renderer.render(painter)
+        painter.end()
 
 
 class _MenuLabel(QLabel):

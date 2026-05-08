@@ -5,8 +5,6 @@ from pathlib import Path
 
 import typer
 
-from openfcd.cli._output import format_progress, stage_event_to_json
-
 app = typer.Typer(name="openfcd", help="Fast Checkerboard Demodulation pipeline", no_args_is_help=True)
 
 
@@ -107,12 +105,47 @@ def replay(
     project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
     run: str | None = typer.Option(None, help="Run ID (default: latest)"),
     figure: str | None = typer.Option(None, help="Figure ID to render (eta_heatmap, etc.)"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Figure output path"),
     json_output: bool = typer.Option(False, "--json", help="Output results as JSON"),
 ) -> None:
     """Replay a previous run's results (no recomputation)."""
     from openfcd.cli.cmd_replay import replay_cmd as _replay_impl
 
-    _replay_impl(project_path=project_path, run=run, figure=figure, json_output=json_output)
+    _replay_impl(project_path=project_path, run=run, figure=figure, output=output, json_output=json_output)
+
+
+# ---------------------------------------------------------------------------
+# Manual grid calibration
+# ---------------------------------------------------------------------------
+
+@app.command("calibrate-grid")
+def calibrate_grid(
+    image: Path = typer.Argument(..., help="Checkerboard/reference image to mark"),
+    cells: float = typer.Option(..., "--cells", help="Number of checker cells between the two marked endpoints"),
+    cell_mm: float = typer.Option(1.2, "--cell-mm", help="Physical checker cell size in mm"),
+    points: str | None = typer.Option(None, "--points", help="Non-interactive endpoints: x1,y1,x2,y2"),
+    compare_px_per_mm: float | None = typer.Option(
+        None,
+        "--compare-px-per-mm",
+        help="Optional existing px/mm value to compare against",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+) -> None:
+    """Measure pixel/mm by marking a known checkerboard span."""
+    from openfcd.cli.cmd_calibrate import calibrate_grid_cmd
+
+    try:
+        calibrate_grid_cmd(
+            image=image,
+            cells=cells,
+            cell_mm=cell_mm,
+            points=points,
+            compare_px_per_mm=compare_px_per_mm,
+            json_output=json_output,
+        )
+    except Exception as exc:
+        typer.echo(f"Calibration error: {exc}", err=True)
+        raise typer.Exit(code=2)
 
 
 # ---------------------------------------------------------------------------

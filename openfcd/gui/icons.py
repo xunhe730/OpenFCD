@@ -70,6 +70,9 @@ ICON_NAMES: Final = [
 # ---------------------------------------------------------------------------
 
 ICONS_DIR: Final = Path(__file__).parent / "resources" / "icons"
+BRAND_DIR: Final = Path(__file__).parent / "resources" / "brand"
+APP_ICON_PATH: Final = BRAND_DIR / "app_icon.svg"
+LOGO_MARK_PATH: Final = BRAND_DIR / "logo_mark.svg"
 
 # ---------------------------------------------------------------------------
 # Caching
@@ -134,3 +137,8 @@ def get_icon(name: str) -> QIcon:
     if name not in _icon_cache:
         _icon_cache[name] = _create_icon(name)
     return _icon_cache[name]
+
+
+def get_app_icon() -> QIcon:
+    """Return the untinted OpenFCD application icon."""
+    return QIcon(str(APP_ICON_PATH))

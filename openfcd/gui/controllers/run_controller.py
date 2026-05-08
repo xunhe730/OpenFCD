@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
-import signal
 import subprocess
 from pathlib import Path
 
@@ -27,16 +24,28 @@ class _RunWorker(QThread):
     run_finished = pyqtSignal(str)    # run_id
     run_failed = pyqtSignal(str)      # error message
 
-    def __init__(self, project_path: Path, workers: int = -1, disabled_indices: frozenset[int] = frozenset()) -> None:
+    def __init__(
+        self,
+        project_path: Path,
+        workers: int = -1,
+        disabled_indices: frozenset[int] = frozenset(),
+        frame_paths: tuple[Path, ...] | None = None,
+    ) -> None:
         super().__init__()
         self._project_path = project_path
         self._workers = workers
         self._disabled_indices = disabled_indices
+        self._frame_paths = tuple(frame_paths) if frame_paths is not None else None
         self._process: subprocess.Popen | None = None
         self._cancelled = False
 
     def run(self) -> None:
-        from openfcd.cli.cmd_run import PreprocessStage, ComputeStage, PostprocessStage
+        from openfcd.cli.cmd_run import (
+            PreprocessStage,
+            ComputeStage,
+            PostprocessStage,
+            build_run_manifest,
+        )
         from openfcd.io.store import FileSessionStore
         from openfcd.io.result import HDF5ResultStore
         from openfcd.pipeline.runner import PipelineRunner
@@ -69,10 +78,12 @@ class _RunWorker(QThread):
                 "batches_processed": [],
                 "frame_count": 0,
                 "frame_paths": [],
-"annotation": store.annotation,  # pass annotation for ROI/mask
+                "annotation": store.annotation,  # pass annotation for ROI/mask
                 "workers": self._workers,
                 "disabled_frame_indices": self._disabled_indices,
-}
+            }
+            if self._frame_paths is not None:
+                ctx["frame_paths_override"] = list(self._frame_paths)
 
             stages = [PreprocessStage(), ComputeStage(), PostprocessStage()]
             runner = PipelineRunner(stages, workers=self._workers if self._workers > 0 else -1)
@@ -95,6 +106,9 @@ class _RunWorker(QThread):
                     exit_code = 1
                     break
 
+            if self._cancel_token.is_cancelled:
+                exit_code = 1
+
         except CancelledError:
             exit_code = 1
         except Exception as exc:
@@ -103,13 +117,14 @@ class _RunWorker(QThread):
         
         try:
             # Finalize run status
-            manifest = {
-                "project_name": project.name,
-                "run_id": run_id,
-                "frames_filter": None,
-                "workers": self._workers,
-                "status": "success" if exit_code == 0 else ("cancelled" if exit_code == 1 else "error"),
-            }
+            manifest = build_run_manifest(
+                project,
+                run_id,
+                None,
+                self._workers,
+                "success" if exit_code == 0 else ("cancelled" if exit_code == 1 else "error"),
+                ctx,
+            )
             store.record_run(run_id, manifest)
 
             if ctx.get("result_store") is not None:
@@ -151,14 +166,21 @@ class RunController(QObject):
     def is_running(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
-    def start_run(self, project_path: str | Path, workers: int = -1, disabled_indices: frozenset[int] = frozenset()) -> None:
+    def start_run(
+        self,
+        project_path: str | Path,
+        workers: int = -1,
+        disabled_indices: frozenset[int] = frozenset(),
+        frame_paths: tuple[Path, ...] | list[Path] | None = None,
+    ) -> None:
         """Start a pipeline run in background thread."""
         if self.is_running:
             self.run_failed.emit("Run already in progress")
             return
 
         path = Path(project_path)
-        self._worker = _RunWorker(path, workers, disabled_indices)
+        selected_paths = tuple(Path(p) for p in frame_paths) if frame_paths is not None else None
+        self._worker = _RunWorker(path, workers, disabled_indices, selected_paths)
         self._worker.stage_event.connect(self.stage_event)
         self._worker.run_finished.connect(self.run_finished)
         self._worker.run_failed.connect(self.run_failed)

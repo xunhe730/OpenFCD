@@ -11,10 +11,78 @@ from openfcd.io.result import HDF5ResultStore
 from openfcd.io.store import FileSessionStore
 
 
+def _profile_replay_context(store, result_store, requested_run: str):
+    """Build deterministic ProfileComposite context for CLI replay."""
+    from openfcd.core.profile_composite import (
+        build_profile_composite_context,
+        resolve_spatial_calibration,
+        resolve_body_polygon,
+    )
+    from openfcd.io.scene import SceneType
+
+    batch = "default"
+    frames = set(result_store.list_frames(batch))
+    run_manifest = next((r for r in store.list_runs() if r.get("run_id") == requested_run), None)
+    for scene in store.scenes:
+        if scene.type != SceneType.PROFILE:
+            continue
+        if scene.run_id is not None and scene.run_id != requested_run:
+            continue
+        lines = scene.profile_lines or {}
+        eligible = [idx for idx in scene.frame_indices if idx in lines and idx in frames]
+        if not eligible:
+            continue
+        requested_frame = scene.viz_params.get("frame_idx") if scene.viz_params else None
+        try:
+            requested_frame = int(requested_frame) if requested_frame is not None else None
+        except (TypeError, ValueError):
+            requested_frame = None
+        frame_idx = requested_frame if requested_frame in eligible else eligible[0]
+        eta = result_store.read_frame(batch, frame_idx)
+        try:
+            attrs = result_store.read_frame_attrs(batch, frame_idx)
+            frame_path = attrs.get("frame_path")
+            frame_name = Path(str(frame_path)).name if frame_path else None
+        except Exception:
+            frame_name = None
+        body_polygon, body_source = resolve_body_polygon(store.annotation, frame_name)
+        line = lines[frame_idx]
+        viz_params = dict(scene.viz_params or {})
+        viz_params.pop("px_per_mm", None)
+        spatial_calibration = resolve_spatial_calibration(
+            result_store,
+            batch,
+            frame_idx,
+            run_manifest,
+            store.project,
+        )
+        return build_profile_composite_context(
+            eta=eta,
+            profile_line=(tuple(line.p0), tuple(line.p1)),
+            viz_params=viz_params,
+            frame_idx=frame_idx,
+            frame_name=frame_name,
+            run_id=requested_run,
+            batch=batch,
+            body_polygon_rc=body_polygon,
+            body_source=body_source,
+            spatial_calibration=spatial_calibration,
+        )
+    return build_profile_composite_context(
+        eta=None,
+        profile_line=None,
+        viz_params={},
+        run_id=requested_run,
+        batch=batch,
+        degraded_reason="No compatible Profile scene with a saved line and replayable frame",
+    )
+
+
 def replay_cmd(
     project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
     run: str | None = typer.Option(None, help="Run ID (default: latest)"),
     figure: str | None = typer.Option(None, help="Figure ID to render (eta_heatmap, etc.)"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Figure output path"),
     json_output: bool = typer.Option(False, "--json", help="Output results as JSON"),
 ) -> None:
     """Replay a previous run's results (no recomputation)."""
@@ -68,9 +136,27 @@ def replay_cmd(
                     err=True,
                 )
                 raise typer.Exit(code=1)
-            typer.echo(f"[replay] Rendering figure '{figure}' for run '{run_id}'...")
-            typer.echo("[replay] Figure rendering not yet available (no renderers registered).")
-            raise typer.Exit(code=1)
+            import importlib
+            from openfcd.core.figures import RENDERERS
+
+            importlib.import_module("openfcd.gui.renderers")  # registers built-in matplotlib renderers
+            renderer = RENDERERS.get(figure)
+            if renderer is None:
+                typer.echo(f"No renderer registered for figure '{figure}'.", err=True)
+                raise typer.Exit(code=1)
+            if not batches:
+                typer.echo("No batches found in results file.", err=True)
+                raise typer.Exit(code=1)
+            out_path = output or (store._dir / "exports" / f"{run_id}_{figure}.png")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if figure == "wavelength_profile":
+                viz = _profile_replay_context(store, result_store, run_id)
+                fig = renderer.render(result_store, "default", viz)
+            else:
+                from types import SimpleNamespace
+                fig = renderer.render(result_store, batches[0], SimpleNamespace())
+            fig.savefig(out_path, bbox_inches="tight")
+            typer.echo(f"[replay] Wrote {out_path}")
         else:
             typer.echo(f"Run: {run_id}")
             typer.echo(f"Batches: {len(batches)}")

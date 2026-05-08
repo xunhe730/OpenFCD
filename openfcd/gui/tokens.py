@@ -5,8 +5,16 @@ class _ThemeSignals(QObject):
 
 _signals = _ThemeSignals()
 
+def _theme_signals() -> _ThemeSignals:
+    global _signals
+    try:
+        _signals.objectName()
+    except RuntimeError:
+        _signals = _ThemeSignals()
+    return _signals
+
 def on_theme_changed(slot):
-    _signals.changed.connect(slot)
+    _theme_signals().changed.connect(slot)
 
 is_dark = False
 
@@ -88,6 +96,7 @@ RADIUS_LG = 8
 
 def set_dark_mode(dark: bool) -> None:
     global is_dark, BG_PRIMARY, BG_SECONDARY, BG_TERTIARY, BG_DOCK, BORDER_SUBTLE, BORDER_STRONG, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_CLAY, ACCENT_CLAY_HOVER, ACCENT_CLAY_BG, ACCENT_CLAY_BG_STRONG, SUCCESS, SUCCESS_BG, WARNING, WARNING_BG, ERROR, ERROR_BG, SELECTION_BG
+    changed = bool(dark) != is_dark
     is_dark = dark
     palette = DARK_PALETTE if dark else LIGHT_PALETTE
     
@@ -95,4 +104,5 @@ def set_dark_mode(dark: bool) -> None:
     for k, v in palette.items():
         globals()[k] = v
         
-    _signals.changed.emit()
+    if changed:
+        _theme_signals().changed.emit()

@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from openfcd.gui import tokens
+from openfcd.gui.icons import get_app_icon
 from openfcd.gui.panels import SimTree, SceneTabs, PropertiesPanel
 from openfcd.gui.panels.sim_tree import NodeType
 from openfcd.gui.widgets.title_bar import TitleBarWidget
@@ -111,6 +112,12 @@ class _SingleFrameWorker(QThread):
         self._frame_path = frame_path
         self._annotation = annotation
         self._cached_reference = cached_reference
+        from openfcd.pipeline.base import CancelToken
+        self._cancel_token = CancelToken()
+
+    def cancel(self) -> None:
+        """Request cancellation of the current single-frame compute."""
+        self._cancel_token.cancel()
 
     def run(self) -> None:
         try:
@@ -121,16 +128,19 @@ class _SingleFrameWorker(QThread):
                 _resolve_reference,
             )
             from openfcd.core.mask import Box, Polygon
+            from openfcd.pipeline.base import CancelledError
             from openfcd.pipeline.compute import load_gray
 
             geom = _build_geom_params(self._project)
             self.frame_progress.emit(2, "Loading reference…")
+            self._cancel_token.check()
             if self._cached_reference is not None:
                 ref_img = self._cached_reference
             else:
                 ref_img = _resolve_reference(self._project, self._project_dir)
                 self.reference_resolved.emit(ref_img)
             self.frame_progress.emit(8, "Loading frame…")
+            self._cancel_token.check()
             def_img = load_gray(self._frame_path)
 
             if ref_img.shape != def_img.shape:
@@ -152,16 +162,12 @@ class _SingleFrameWorker(QThread):
                     )
 
                 polys = self._annotation.frame_polygons.get(self._frame_path.name, [])
-                if not polys or not polys[0].vertices:
-                    # Fall back to explicit global annotation polygons only
-                    global_polys = getattr(self._annotation, "polygons", None) or []
-                    polys = [p for p in global_polys if p.vertices]
                 if polys and polys[0].vertices:
                     frame_poly = Polygon(
                         [(float(v[0]), float(v[1])) for v in polys[0].vertices]
                     )
 
-            eta_mm = _compute_single_frame(
+            computation = _compute_single_frame(
                 ref_img,
                 def_img,
                 geom,
@@ -170,7 +176,9 @@ class _SingleFrameWorker(QThread):
                 robot_poly=frame_poly,
                 fast_preview=True,
                 progress_cb=lambda pct, lbl: self.frame_progress.emit(pct, lbl),
+                cancel=self._cancel_token,
             )
+            eta_mm = getattr(computation, "eta_mm", computation)
             # η may be smaller than ref_img when scale normalization cropped
             # (ref zoomed down to match def's carrier period).  Re-centre it
             # inside the ROI (or the full frame if no ROI) to preserve alignment
@@ -179,6 +187,8 @@ class _SingleFrameWorker(QThread):
 
             self.frame_done.emit(eta_overlay, eta_mm)
 
+        except CancelledError:
+            self.frame_failed.emit("Compute cancelled")
         except Exception as exc:
             self.frame_failed.emit(str(exc))
 
@@ -186,6 +196,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("OpenFCD")
+        self.setWindowIcon(get_app_icon())
         self.resize(1400, 900)
         
         tokens.set_dark_mode(tokens.is_dark)
@@ -220,7 +231,7 @@ class MainWindow(QMainWindow):
         self._toolbar.open_clicked.connect(self._on_open)
         self._toolbar.save_clicked.connect(self._session.save)
         self._toolbar.run_clicked.connect(self._on_run)
-        self._toolbar.cancel_clicked.connect(self._run_ctrl.cancel)
+        self._toolbar.cancel_clicked.connect(self._on_cancel)
         root.addWidget(self._toolbar)
 
         # ── Center splitter ──
@@ -304,6 +315,7 @@ class MainWindow(QMainWindow):
         self._sim_tree.duplicate_scene_requested.connect(self._on_duplicate_scene_requested)
         self._sim_tree.export_scene_requested.connect(self._on_export_scene_png)
         self._sim_tree.reveal_scene_requested.connect(self._on_reveal_scene)
+        self._scene_container.scene_changed.connect(self._on_scene_changed)
         self._sim_tree.frame_disabled_requested.connect(self._on_disable_frame)
         self._sim_tree.frame_enabled_requested.connect(self._on_enable_frame)
         self._title_bar.menu_requested.connect(self._on_menu_requested)
@@ -331,6 +343,12 @@ class MainWindow(QMainWindow):
             lambda: self._on_compute_frame(self._current_frame_idx)
         )
         self._properties.run_all_clicked.connect(self._on_run)
+        viz = self._properties.viz_settings_panel
+        viz.apply_clicked.connect(self._on_viz_apply)
+        viz.reset_clicked.connect(self._on_viz_reset)
+        viz.export_png_clicked.connect(lambda: self._export_current_scene_rendered("png"))
+        viz.export_pdf_clicked.connect(lambda: self._export_current_scene_rendered("pdf"))
+        viz.export_csv_clicked.connect(lambda: self._status_bar.set_items(["Ready", "CSV export not available for this scene"]))
         # Annotation buttons → preview annotation mode
         self._properties.draw_roi_clicked.connect(self._on_start_roi)
         self._properties.draw_mask_clicked.connect(self._on_start_mask)
@@ -343,6 +361,7 @@ class MainWindow(QMainWindow):
         self._properties.highpass_sigma_changed.connect(self._on_highpass_sigma_changed)
         self._properties.taper_alpha_changed.connect(self._on_taper_alpha_changed)
         self._properties.edge_nan_changed.connect(self._on_edge_nan_changed)
+        self._properties.small_hole_fill_changed.connect(self._on_small_hole_fill_changed)
 
         # ⌘N shortcut: New η Map when a Scene node is selected, else New Project
         from PyQt6.QtGui import QShortcut, QKeySequence
@@ -424,9 +443,10 @@ class MainWindow(QMainWindow):
         self._status_bar.set_items(["Ready", f"Scene created: {spec.name}"])
 
         # Navigate immediately to the new scene
-        self._scene_container.show_scene(spec, self._session.project_path)
+        self._scene_container.show_scene(spec, self._session.project_path, 0)
         self._center_stack.setCurrentWidget(self._scene_container)
         self._current_scene_id = spec.id
+        self._sync_viz_panel(spec)
         self._toolbar.set_preview_available(False)
 
     def _on_delete_scene_requested(self, scene_id: str) -> None:
@@ -472,6 +492,71 @@ class MainWindow(QMainWindow):
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _current_scene_spec(self):
+        if not self._current_scene_id:
+            return None
+        return next((s for s in self._session.scenes if s.id == self._current_scene_id), None)
+
+    def _persist_scene(self, spec) -> None:
+        self._session.update_scene(spec)
+        self._session.save()
+        self._sim_tree.populate_scenes(self._session.scenes)
+        if "_properties" in self.__dict__ and hasattr(self._properties, "show_figure_properties"):
+            self._properties.show_figure_properties("scene_item")
+        if spec is not None and hasattr(self._sim_tree, "find_scene_item"):
+            item = self._sim_tree.find_scene_item(spec.id)
+            if item is not None:
+                if hasattr(self._sim_tree, "blockSignals"):
+                    self._sim_tree.blockSignals(True)
+                if hasattr(self._sim_tree, "setCurrentItem"):
+                    self._sim_tree.setCurrentItem(item)
+                if hasattr(self._sim_tree, "blockSignals"):
+                    self._sim_tree.blockSignals(False)
+                self._current_scene_id = spec.id
+                if "_properties" in self.__dict__:
+                    self._sync_viz_panel(spec)
+
+    def _on_scene_changed(self, spec) -> None:
+        self._current_scene_id = spec.id
+        self._persist_scene(spec)
+        self._status_bar.set_items(["Ready", f"Scene updated: {spec.name}"])
+
+    def _sync_viz_panel(self, spec) -> None:
+        panel = self._properties.viz_settings_panel
+        scene_type = spec.type.value if hasattr(spec.type, "value") else str(spec.type)
+        panel.load_viz_params(scene_type, spec.viz_params or {})
+
+    def _on_viz_apply(self, params: dict) -> None:
+        spec = self._current_scene_spec()
+        if spec is None:
+            return
+        updated = spec.model_copy(update={"viz_params": dict(params)})
+        self._persist_scene(updated)
+        self._scene_container.apply_viz(params)
+        if "_center_stack" in self.__dict__:
+            self._center_stack.setCurrentWidget(self._scene_container)
+        self._status_bar.set_items(["Ready", f"Visualization updated: {updated.name}"])
+
+    def _on_viz_reset(self) -> None:
+        spec = self._current_scene_spec()
+        if spec is None:
+            return
+        from openfcd.gui.scenes.viz_defaults import scene_defaults
+        scene_type = spec.type.value if hasattr(spec.type, "value") else str(spec.type)
+        params = scene_defaults(scene_type)
+        self._properties.viz_settings_panel.load_viz_params(scene_type, params)
+        self._on_viz_apply(params)
+
+    @staticmethod
+    def _figure_id_for_scene(spec) -> str | None:
+        from openfcd.io.scene import SceneType
+        mapping = {
+            SceneType.ETA_MAP: "eta_heatmap",
+            SceneType.PROFILE: "wavelength_profile",
+            SceneType.RMS: "rms_map",
+        }
+        return mapping.get(spec.type)
 
     # ── Node routing ────────────────────────────────────────────────
     def _on_node_selected(self, key: str) -> None:
@@ -564,12 +649,20 @@ class MainWindow(QMainWindow):
 
         # Save previous scene slider pos
         if self._current_scene_id and self._current_scene_id != scene_id:
-            self._scene_slider_pos[self._current_scene_id] = self._preview.current_slider_value()
+            current_slider = self._scene_container.current_slider_value()
+            if current_slider is not None:
+                self._scene_slider_pos[self._current_scene_id] = current_slider
 
         self._current_scene_id = scene_id
 
         spec = next((s for s in self._session.scenes if s.id == scene_id), None)
-        self._scene_container.show_scene(spec, self._session.project_path)
+        self._scene_container.show_scene(
+            spec,
+            self._session.project_path,
+            self._scene_slider_pos.get(scene_id),
+        )
+        if spec is not None:
+            self._sync_viz_panel(spec)
         stack.setCurrentWidget(self._scene_container)
 
     def _on_preview_changed(self, on: bool) -> None:
@@ -732,6 +825,9 @@ class MainWindow(QMainWindow):
         """Single frame computation failed."""
         self._toolbar.set_running(False)
         self._status_bar.hide_progress()
+        if "cancel" in error.lower():
+            self._status_bar.set_items(["Cancelled", "Single frame"])
+            return
         self._status_bar.set_items(["Failed", error[:80]])
         QMessageBox.warning(self, "Compute Failed", f"单帧计算失败:\n{error}")
 
@@ -847,6 +943,9 @@ class MainWindow(QMainWindow):
         img_panel.set_highpass_sigma(float(getattr(proj.process, "highpass_sigma_px", 0.0)))
         img_panel.set_taper_alpha(float(proj.process.taper.alpha))
         img_panel.set_edge_nan_mm(float(proj.process.edge_nan_mm))
+        img_panel.set_small_hole_fill_radius(
+            float(getattr(proj.process, "small_hole_fill_radius_mm", 1.0))
+        )
 
     def _ensure_optical_config_ready(self, *, interactive: bool) -> bool:
         """Repair legacy preset-backed stacks and reject empty custom stacks."""
@@ -982,9 +1081,73 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Export Failed", f"Could not save PNG to:\n{path}")
 
+    def _export_current_scene_rendered(self, fmt: str = "png") -> None:
+        """Export the selected scene through the registered renderer."""
+        spec = self._current_scene_spec()
+        if spec is None or not self._session.project_path:
+            self._export_current_view_png()
+            return
+        figure_id = self._figure_id_for_scene(spec)
+        if figure_id is None:
+            QMessageBox.warning(self, "Export Failed", "No renderer for this scene type.")
+            return
+
+        default_name = f"{spec.name.replace(' ', '_')}.{fmt}"
+        start_dir = self._prefs.last_export_dir or self._prefs.last_project_dir or str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Export {fmt.upper()}",
+            str(Path(start_dir) / default_name),
+            f"{fmt.upper()} files (*.{fmt})",
+        )
+        if not path:
+            return
+        self._prefs.last_export_dir = str(Path(path).parent)
+        try:
+            import importlib
+            from types import SimpleNamespace
+            from openfcd.core.figures import RENDERERS
+            from openfcd.io.result import HDF5ResultStore
+
+            importlib.import_module("openfcd.gui.renderers")  # registers built-in renderers
+            run_id = spec.run_id
+            if run_id is None:
+                runs_dir = self._session.project_path / "runs"
+                dirs = sorted(d.name for d in runs_dir.iterdir() if d.is_dir()) if runs_dir.exists() else []
+                run_id = dirs[-1] if dirs else None
+            if run_id is None:
+                raise RuntimeError("No run available for this scene")
+            results_path = self._session.project_path / "runs" / run_id / "results.h5"
+            renderer = RENDERERS[figure_id]
+            with HDF5ResultStore.open(results_path, "r") as results:
+                batches = results.list_batches()
+                if not batches:
+                    raise RuntimeError("No batches in results.h5")
+                viz_params = dict(spec.viz_params or {})
+                if hasattr(self._scene_container, "export_context"):
+                    viz_params.update(self._scene_container.export_context())
+                viz_params["layout_mode"] = "export"
+                viz = SimpleNamespace(**viz_params)
+                fig = renderer.render(results, batches[0], viz)
+                fig.savefig(path, dpi=getattr(viz, "dpi", 150), bbox_inches="tight")
+            self._status_bar.set_items(["Exported", Path(path).name])
+            self._persist_scene(spec)
+            self._center_stack.setCurrentWidget(self._scene_container)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Failed", str(exc))
+
     def _on_export_scene_png(self, scene_id: str) -> None:
         self._current_scene_id = scene_id
-        self._export_current_view_png()
+        spec = self._current_scene_spec()
+        if spec is not None and self._session.project_path:
+            self._scene_container.show_scene(
+                spec,
+                self._session.project_path,
+                self._scene_slider_pos.get(scene_id),
+            )
+            self._center_stack.setCurrentWidget(self._scene_container)
+            self._sync_viz_panel(spec)
+        self._export_current_scene_rendered("png")
 
     def _build_file_menu(self, menu) -> None:
         menu.addAction("New Project...", self._on_new)
@@ -1290,8 +1453,8 @@ class MainWindow(QMainWindow):
         if not results_path.exists():
             return
 
-        # Load all per-frame η + the eta_mean summary into memory so the
-        # Preview toggle switches instantly without re-reading the h5.
+        # Load per-frame η by filename. HDF5 frame IDs are run-local ordinals;
+        # the GUI's image list can be filtered/reordered, so never bind by idx.
         self._run_eta_frames = None
         self._run_eta_mean = None
         result_store = None
@@ -1312,7 +1475,7 @@ class MainWindow(QMainWindow):
             # images (3712×5568 float64 ≈ 165 MB/frame), allow up to 4 GB so
             # experiments with up to ~24 frames cache per-frame previews.
             _guard_bytes = 4_000_000_000
-            frames_list = []
+            eta_by_name: dict[str, np.ndarray] = {}
             _per_frame_bytes = 0
             for fid in frame_ids:
                 try:
@@ -1321,21 +1484,26 @@ class MainWindow(QMainWindow):
                         if _per_frame_bytes == 0:
                             _per_frame_bytes = arr.nbytes
                         if _per_frame_bytes * len(frame_ids) > _guard_bytes:
-                            frames_list = []
+                            eta_by_name = {}
                             break
-                        frames_list.append(np.asarray(arr, dtype=np.float64))
-                    else:
-                        frames_list.append(None)
+                        attrs = result_store.read_frame_attrs(batch, fid)
+                        frame_name = Path(str(attrs.get("frame_path", ""))).name
+                        if frame_name:
+                            eta_by_name[frame_name] = np.asarray(arr, dtype=np.float64)
                 except Exception:
-                    frames_list.append(None)
+                    pass
 
-            valid = [a for a in frames_list if a is not None]
+            matched = [
+                eta_by_name.get(f.name)
+                for f in self._frames
+            ]
+            valid = [a for a in matched if a is not None]
             if valid:
                 shape = valid[0].shape
-                stack = np.full((len(frames_list),) + shape, np.nan, dtype=np.float64)
-                for i, a in enumerate(frames_list):
-                    if a is not None and a.shape == shape:
-                        stack[i] = a
+                stack = np.full((len(self._frames),) + shape, np.nan, dtype=np.float64)
+                for i, arr in enumerate(matched):
+                    if arr is not None and arr.shape == shape:
+                        stack[i] = arr
                 self._run_eta_frames = stack
         except Exception as e:
             import logging
@@ -1351,7 +1519,7 @@ class MainWindow(QMainWindow):
                     self._frame_eta_cache[i] = eta
 
         # Display in the preview widget.
-        if self._run_eta_frames is not None or self._run_eta_mean is not None:
+        if self._run_eta_frames is not None:
             self._center_stack.setCurrentWidget(self._preview)
             self._preview.set_preview_toggle_visible(self._run_eta_frames is not None)
             self._preview.set_preview_mode(True)
@@ -1370,13 +1538,13 @@ class MainWindow(QMainWindow):
             self._status_bar.set_items(["Ready", "Computation complete"])
 
     def _on_preview_mode_changed(self, enabled: bool) -> None:
-        """Preview toggle flipped — swap between per-frame η and eta_mean (instant)."""
+        """Preview toggle flipped — re-apply per-frame η if available."""
         self._reapply_run_eta()
 
     def _reapply_run_eta(self) -> None:
         """Apply η overlay for the current frame using unified cache.
 
-        Priority: Run per-frame stack > single-frame cache > Run mean.
+        Priority: unified per-frame cache > loaded run stack.
         Respects the toolbar Preview ON/OFF and Overlap toggle.
         """
         preview_on = self._toolbar.preview_on() if hasattr(self._toolbar, "preview_on") else False
@@ -1399,10 +1567,12 @@ class MainWindow(QMainWindow):
                 eta = candidate
 
         # 3. Run mean (fallback when per-frame unavailable)
-        if eta is None and self._run_eta_mean is not None:
-            eta = self._run_eta_mean
+        # Do not fall back to eta_mean for an individual frame. If a frame has
+        # no matching run result, showing the aggregate makes the frame look
+        # incorrectly computed.
 
         if eta is None:
+            self._preview.clear_eta_overlay()
             return
 
         overlap = self._toolbar.overlap_on() if hasattr(self._toolbar, "overlap_on") else True
@@ -1411,7 +1581,21 @@ class MainWindow(QMainWindow):
     def _on_run_failed(self, error: str) -> None:
         self._toolbar.set_running(False)
         self._status_bar.hide_progress()
-        self._status_bar.set_items(["Failed", error[:60]])
+        if "cancel" in error.lower():
+            self._status_bar.set_items(["Cancelled"])
+        else:
+            self._status_bar.set_items(["Failed", error[:60]])
+
+    def _on_cancel(self) -> None:
+        """Cancel whichever compute path currently owns the toolbar."""
+        single_worker = getattr(self, "_single_frame_worker", None)
+        if single_worker is not None and single_worker.isRunning():
+            single_worker.cancel()
+            self._status_bar.set_items(["Cancelling", "single frame"])
+            return
+        if self._run_ctrl.is_running:
+            self._run_ctrl.cancel()
+            self._status_bar.set_items(["Cancelling", "run"])
 
     # ── Actions ─────────────────────────────────────────────────────
     def _on_open(self) -> None:
@@ -1484,6 +1668,14 @@ class MainWindow(QMainWindow):
             self._status_bar.set_items(["Error", f"Invalid workers value: {workers_str}"])
             return
 
+        # A new Run invalidates all previously displayed η overlays, including
+        # single-frame preview cache entries. Otherwise frame navigation can
+        # show stale masks/results even after the HDF5 run has been replaced.
+        self._frame_eta_cache.clear()
+        self._run_eta_frames = None
+        self._run_eta_mean = None
+        self._preview.clear_eta_overlay()
+
         self._toolbar.set_running(True)
         self._status_bar.set_items(["Running", "Initializing..."])
         self._status_bar.show_progress(0, 100)
@@ -1498,7 +1690,12 @@ class MainWindow(QMainWindow):
             _os.environ.pop("OPENFCD_BLAS_THREADS", None)
             _os.environ.pop("OPENFCD_STREAM_RESULTS", None)
 
-        self._run_ctrl.start_run(str(self._session.project_path), workers=workers)
+        self._run_ctrl.start_run(
+            str(self._session.project_path),
+            workers=workers,
+            disabled_indices=self._sim_tree.disabled_indices,
+            frame_paths=tuple(self._frames),
+        )
 
     # ── Annotation handlers ────────────────────────────────────────
     def _on_start_roi(self) -> None:
@@ -1619,6 +1816,12 @@ class MainWindow(QMainWindow):
         """Live-update project.process.edge_nan_mm."""
         if self._session.has_project:
             self._session.project.process.edge_nan_mm = float(value)
+            self._session.mark_dirty()
+
+    def _on_small_hole_fill_changed(self, value: float) -> None:
+        """Live-update project.process.small_hole_fill_radius_mm."""
+        if self._session.has_project:
+            self._session.project.process.small_hole_fill_radius_mm = float(value)
             self._session.mark_dirty()
 
     def _on_point_placed(self, idx: int, row: int, col: int) -> None:

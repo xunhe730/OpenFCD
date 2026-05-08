@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import numpy as np
+import pytest
 
 from PyQt6.QtCore import QCoreApplication
 
@@ -93,6 +94,40 @@ def _capture_frame_done(results: list):
 class TestSingleFrameWorker:
     """Tests for _SingleFrameWorker background compute thread."""
 
+    def test_single_frame_worker_ignores_hidden_global_polygon(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Global polygons are not applied to frames with no visible per-frame mask."""
+        app = QCoreApplication.instance() or QCoreApplication([])
+
+        proj, project_dir, frame_path = _make_mock_project()
+        ann = AnnotationSchema(
+            polygons=[{
+                "vertices": [[40, 40], [40, 80], [90, 80], [90, 40]],
+                "label": "body",
+            }]
+        )
+        seen: list = []
+
+        def _fake_compute(ref_img, _def_img, *_args, **kwargs):
+            seen.append(kwargs.get("robot_poly"))
+            return np.zeros(ref_img.shape, dtype=np.float64)
+
+        monkeypatch.setattr("openfcd.cli.cmd_run._compute_single_frame", _fake_compute)
+
+        worker = _SingleFrameWorker(
+            project=proj,
+            project_dir=project_dir,
+            frame_path=frame_path,
+            annotation=ann,
+        )
+        errors: list = []
+        worker.frame_failed.connect(errors.append)
+        worker.run()
+
+        assert errors == []
+        assert seen == [None]
+
     def test_single_frame_worker_emits_frame_done(self) -> None:
         """Valid images and geometry → frame_done signal fires with eta_mm array."""
         app = QCoreApplication.instance() or QCoreApplication([])
@@ -122,6 +157,38 @@ class TestSingleFrameWorker:
         assert isinstance(eta_mm, np.ndarray)
         assert eta_mm.ndim == 2
         assert eta_mm.shape == (128, 128)
+
+    def test_single_frame_worker_passes_cancel_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-frame Cancel should interrupt the same compute path as Run."""
+        app = QCoreApplication.instance() or QCoreApplication([])
+
+        proj, project_dir, frame_path = _make_mock_project()
+        ann = _make_annotation()
+        seen_cancel = []
+
+        def _fake_compute(*_args, **kwargs):
+            cancel = kwargs["cancel"]
+            seen_cancel.append(cancel)
+            cancel.cancel()
+            cancel.check()
+
+        monkeypatch.setattr("openfcd.cli.cmd_run._compute_single_frame", _fake_compute)
+
+        worker = _SingleFrameWorker(
+            project=proj,
+            project_dir=project_dir,
+            frame_path=frame_path,
+            annotation=ann,
+        )
+        errors: list = []
+        worker.frame_failed.connect(errors.append)
+
+        worker.run()
+
+        assert seen_cancel
+        assert errors == ["Compute cancelled"]
 
     def test_single_frame_worker_emits_frame_failed_on_empty_layers(self) -> None:
         """preset=custom with layers=[] → frame_failed signal fires."""

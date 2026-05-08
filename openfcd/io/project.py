@@ -66,6 +66,9 @@ class ProcessConfig(BaseModel):
     # drift caused by ref/def illumination or pattern-position mismatch.  Keep
     # below the shortest physical wavelength of interest; 0 disables the step.
     highpass_sigma_px: float = 0.0
+    # Fill small enclosed NaN holes in final eta output, typically caused by
+    # tiny reflective glints being masked. 0 disables the cleanup.
+    small_hole_fill_radius_mm: float = 1.0
 
 
 class ProfileConfig(BaseModel):

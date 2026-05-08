@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="shell" x1="168" y1="112" x2="856" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#18222D"/>
+      <stop offset="1" stop-color="#080D12"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="236" y1="366" x2="790" y2="568" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#37E7D6"/>
+      <stop offset="1" stop-color="#68A8FF"/>
+    </linearGradient>
+    <clipPath id="tileClip">
+      <path d="M248 644L512 522L776 644L512 766Z"/>
+    </clipPath>
+  </defs>
+
+  <rect x="80" y="80" width="864" height="864" rx="216" fill="url(#shell)"/>
+  <rect x="112" y="112" width="800" height="800" rx="188" fill="none" stroke="#F4F7FA" stroke-width="10" opacity="0.12"/>
+
+  <g clip-path="url(#tileClip)">
+    <path d="M248 644L512 522L776 644L512 766Z" fill="#E9F0F5"/>
+    <path d="M292 624L358 594L422 624L356 654Z" fill="#0D141B"/>
+    <path d="M423 563L489 533L553 563L487 593Z" fill="#0D141B"/>
+    <path d="M554 624L620 594L685 624L619 654Z" fill="#0D141B"/>
+    <path d="M356 654L422 624L488 654L422 684Z" fill="#0D141B"/>
+    <path d="M488 654L554 624L619 654L553 684Z" fill="#0D141B"/>
+    <path d="M422 684L488 654L553 684L487 714Z" fill="#0D141B"/>
+  </g>
+  <path d="M248 644L512 522L776 644M314 675L578 553M380 705L644 583M446 736L710 614M314 614L578 736M380 584L644 706M446 553L710 675" fill="none" stroke="#26323D" stroke-width="8" opacity="0.36"/>
+
+  <path d="M224 438C318 332 403 314 500 392C592 466 666 508 800 382" fill="none" stroke="#EAF7FF" stroke-width="78" stroke-linecap="round" opacity="0.08"/>
+  <path d="M224 438C318 332 403 314 500 392C592 466 666 508 800 382" fill="none" stroke="#37E7D6" stroke-width="70" stroke-linecap="round" opacity="0.12"/>
+  <path d="M224 438C318 332 403 314 500 392C592 466 666 508 800 382" fill="none" stroke="url(#signal)" stroke-width="42" stroke-linecap="round"/>
+  <path d="M224 438C318 332 403 314 500 392C592 466 666 508 800 382" fill="none" stroke="#EAF7FF" stroke-width="10" stroke-linecap="round" opacity="0.9"/>
+
+  <circle cx="224" cy="438" r="28" fill="#37E7D6"/>
+  <circle cx="500" cy="392" r="22" fill="#EAF7FF"/>
+  <circle cx="800" cy="382" r="28" fill="#68A8FF"/>
+  <path d="M512 226V316M512 708V798M226 512H316M708 512H798" fill="none" stroke="#EAF7FF" stroke-width="14" stroke-linecap="round" opacity="0.16"/>
+</svg>

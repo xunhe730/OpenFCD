@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from openfcd.gui import tokens
-
 
 def eta_map_defaults(eta: np.ndarray | None = None) -> dict:
     """Auto vmin/vmax + bidirectional colormap for η data."""
@@ -52,10 +50,24 @@ def rms_defaults(rms: np.ndarray | None = None) -> dict:
 
 def profile_defaults() -> dict:
     return {
-        "line_color": tokens.ACCENT_CLAY,
-        "xlabel": "Distance [px]",
-        "ylabel": "η [mm]",
+        "cmap": "RdBu_r",
+        "vmin": None,
+        "vmax": None,
+        "colorbar": "bottom",
+        "line_color": "red",
+        "profile_color": "blue",
         "grid": True,
+        "xlabel": "x (mm)",
+        "ylabel": "Wave height η (mm)",
+        "strip_mm": 2.0,
+        "y_range_mm": 30.0,
+        "min_roi_width_mm": 160.0,
+        "min_roi_height_mm": 50.0,
+        "x_padding_mm": 5.0,
+        "auto_crop": True,
+        "show_measurements": False,
+        "x_range_mm": None,
+        "title": None,
         "dpi": 150,
     }
 

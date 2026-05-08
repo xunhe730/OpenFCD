@@ -149,7 +149,109 @@ def test_ref_invariants_hoist_bit_equal(tmp_path: Path) -> None:
     inv = _compute_ref_invariants(ref, proj, roi_box=None)
     hoisted = _compute_single_frame(ref, deformed, geom, proj, ref_invariants=inv)
 
+    assert inline.pixel_per_mm > 0
+    assert inline.calibration["eta_unit"] == "mm"
     assert inline.shape == hoisted.shape
     ni, nh = np.isnan(inline), np.isnan(hoisted)
     np.testing.assert_array_equal(ni, nh)
     np.testing.assert_allclose(inline[~ni], hoisted[~nh], rtol=0, atol=0)
+
+
+def test_unannotated_frame_uses_per_frame_auto_mask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unannotated frames should auto-detect masks instead of needing drawings."""
+    proj, _ = _make_project(tmp_path, n_frames=1)
+    ref = _checkerboard(192, shift=0.0).astype(np.float64)
+    deformed = _checkerboard(192, shift=0.4).astype(np.float64)
+    from openfcd.cli.cmd_run import _build_geom_params
+    geom = _build_geom_params(proj)
+
+    calls = []
+
+    def _auto_object_mask(img, *_args, **_kwargs):
+        calls.append(img.shape)
+        return np.zeros(img.shape, dtype=bool)
+
+    monkeypatch.setattr("openfcd.core.mask.auto_mask", _auto_object_mask)
+
+    eta = _compute_single_frame(ref, deformed, geom, proj, robot_poly=None)
+    assert eta.pixel_per_mm > 0
+    assert eta.shape == ref.shape
+    assert calls == [ref.shape]
+
+
+def test_reference_zero_field_fills_small_mask_holes(tmp_path: Path) -> None:
+    """Reference-vs-reference stays zero while small enclosed mask holes are filled."""
+    from openfcd.cli.cmd_run import _build_geom_params
+    from openfcd.core.mask import Polygon
+
+    proj, _ = _make_project(tmp_path, n_frames=1)
+    proj.process.small_hole_fill_radius_mm = 2.0
+    ref = _checkerboard(192, shift=0.0).astype(np.float64)
+    geom = _build_geom_params(proj)
+    small_poly = Polygon([(92, 92), (92, 93), (93, 93), (93, 92)])
+
+    eta = _compute_single_frame(ref, ref.copy(), geom, proj, robot_poly=small_poly)
+
+    assert eta.pixel_per_mm > 0
+    assert np.isfinite(eta[90:96, 90:96]).all()
+    assert np.nanmax(np.abs(eta)) == 0.0
+
+
+def test_reference_zero_field_keeps_large_mask_nan(tmp_path: Path) -> None:
+    """Small-hole cleanup must not fill the robot-body-sized mask."""
+    from openfcd.cli.cmd_run import _build_geom_params
+    from openfcd.core.mask import Polygon
+
+    proj, _ = _make_project(tmp_path, n_frames=1)
+    proj.process.small_hole_fill_radius_mm = 10.0
+    ref = _checkerboard(192, shift=0.0).astype(np.float64)
+    geom = _build_geom_params(proj)
+    large_poly = Polygon([(70, 70), (70, 120), (120, 120), (120, 70)])
+
+    eta = _compute_single_frame(ref, ref.copy(), geom, proj, robot_poly=large_poly)
+
+    assert np.isnan(eta[80:110, 80:110]).all()
+
+
+def test_compute_stage_ignores_hidden_global_polygon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run should not apply invisible global polygons to unannotated frames."""
+    from openfcd.io.annotation import AnnotationSchema
+    import openfcd.cli.cmd_run as cmd_run
+
+    proj, project_dir = _make_project(tmp_path, n_frames=2)
+    seen: list = []
+
+    def _fake_compute(ref_img, _def_img, *_args, **kwargs):
+        seen.append(kwargs.get("robot_poly"))
+        return np.zeros(ref_img.shape, dtype=np.float64)
+
+    monkeypatch.setattr(cmd_run, "_compute_single_frame", _fake_compute)
+
+    ctx: dict = {
+        "project": proj,
+        "project_dir": project_dir,
+        "frames_dir": Path(proj.data.frames_dir),
+        "pattern": proj.data.pattern,
+        "frames_filter": None,
+        "run_id": "run-global-hidden",
+        "result_store": None,
+        "batches_processed": [],
+        "frame_count": 0,
+        "frame_paths": [],
+        "annotation": AnnotationSchema(
+            polygons=[{
+                "vertices": [[40, 40], [40, 80], [90, 80], [90, 40]],
+                "label": "body",
+            }]
+        ),
+    }
+    cancel = CancelToken()
+    for stage in (PreprocessStage(), ComputeStage()):
+        for _event in stage.run(ctx, cancel):
+            pass
+
+    assert seen == [None, None]

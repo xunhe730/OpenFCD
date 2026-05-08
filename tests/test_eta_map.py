@@ -32,3 +32,16 @@ def test_eta_map_set_data_renders_heatmap() -> None:
     assert len(widget._ax.images) == 1
     rendered = widget._ax.images[0].get_array()
     assert rendered.shape == (10, 10)
+
+
+def test_eta_map_crops_full_frame_nan_canvas() -> None:
+    app = _app()
+    widget = EtaMap()
+
+    data = np.full((20, 30), np.nan)
+    data[5:15, 8:18] = 1.0
+    widget.set_data(data, colorbar="none")
+
+    rendered = widget._ax.images[0].get_array()
+    assert rendered.shape == (12, 12)
+    assert widget._cb is None

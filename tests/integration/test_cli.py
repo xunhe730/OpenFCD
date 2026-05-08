@@ -105,6 +105,268 @@ def test_project_info(tmp_path: Path) -> None:
     assert "my-cool-project" in result.output
 
 
+def test_replay_figure_writes_png(tmp_path: Path) -> None:
+    """`openfcd replay --figure` renders a registered figure."""
+    import numpy as np
+    from openfcd.io.result import HDF5ResultStore
+    from openfcd.io.store import FileSessionStore
+
+    project_dir = tmp_path / "replay.ofcd"
+    store = FileSessionStore.new(project_dir, "replay")
+    store.record_run("run-test", {})
+    store.close()
+    run_dir = project_dir / "runs" / "run-test"
+    results = HDF5ResultStore.open(run_dir / "results.h5", "w")
+    results.write_batch("default", {"eta_mean": np.ones((8, 8))}, {"status": "ok"})
+    results.close()
+
+    out = tmp_path / "eta.png"
+    result = runner.invoke(
+        app,
+        ["replay", str(project_dir), "--run", "run-test", "--figure", "eta_heatmap", "--output", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_profile_replay_context_is_run_safe_and_deterministic(tmp_path: Path) -> None:
+    import numpy as np
+    from openfcd.cli.cmd_replay import _profile_replay_context
+    from openfcd.io.result import HDF5ResultStore
+    from openfcd.io.scene import ProfileLine, SceneSpec, SceneType
+    from openfcd.io.store import FileSessionStore
+
+    project_dir = tmp_path / "profile-replay.ofcd"
+    store = FileSessionStore.new(project_dir, "profile-replay")
+    store.record_run("run-other", {})
+    store.record_run("run-test", {})
+    store.add_scene(
+        SceneSpec(
+            id="wrong",
+            name="wrong run",
+            type=SceneType.PROFILE,
+            frame_indices=[0],
+            run_id="run-other",
+            profile_lines={0: ProfileLine(p0=(2.0, 0.0), p1=(2.0, 7.0))},
+        )
+    )
+    store.add_scene(
+        SceneSpec(
+            id="right",
+            name="right run",
+            type=SceneType.PROFILE,
+            frame_indices=[1, 2],
+            run_id="run-test",
+            viz_params={"frame_idx": 2},
+            profile_lines={
+                1: ProfileLine(p0=(3.0, 0.0), p1=(3.0, 7.0)),
+                2: ProfileLine(p0=(4.0, 0.0), p1=(4.0, 7.0)),
+            },
+        )
+    )
+    store.save()
+    store.close()
+    run_dir = project_dir / "runs" / "run-test"
+    results = HDF5ResultStore.open(run_dir / "results.h5", "w")
+    results.write_frame("default", 1, np.ones((8, 8)), {"status": "ok", "frame_path": "Img000001.png"})
+    results.write_frame(
+        "default",
+        2,
+        np.ones((8, 8)) * 2,
+        {
+            "status": "ok",
+            "frame_path": "Img000002.png",
+            "pixel_per_mm": 8.0,
+            "spatial_calibration_source": "carrier_detected",
+        },
+    )
+    results.close()
+
+    reopened = FileSessionStore.open(project_dir, read_only=True)
+    result_store = HDF5ResultStore.open(run_dir / "results.h5", "r")
+    try:
+        ctx = _profile_replay_context(reopened, result_store, "run-test")
+    finally:
+        result_store.close()
+        reopened.close()
+
+    assert ctx.run_id == "run-test"
+    assert ctx.batch == "default"
+    assert ctx.frame_idx == 2
+    assert ctx.profile_line == ((4.0, 0.0), (4.0, 7.0))
+    assert ctx.px_per_mm == 8.0
+    assert ctx.spatial_calibration_source == "carrier_detected"
+
+
+def test_profile_replay_context_empty_when_no_eligible_scene(tmp_path: Path) -> None:
+    import numpy as np
+    from openfcd.cli.cmd_replay import _profile_replay_context
+    from openfcd.io.result import HDF5ResultStore
+    from openfcd.io.store import FileSessionStore
+
+    project_dir = tmp_path / "profile-replay-empty.ofcd"
+    store = FileSessionStore.new(project_dir, "profile-replay-empty")
+    store.record_run("run-test", {})
+    store.save()
+    store.close()
+    run_dir = project_dir / "runs" / "run-test"
+    results = HDF5ResultStore.open(run_dir / "results.h5", "w")
+    results.write_batch("default", {"eta_mean": np.ones((4, 4))}, {"status": "ok"})
+    results.close()
+
+    reopened = FileSessionStore.open(project_dir, read_only=True)
+    result_store = HDF5ResultStore.open(run_dir / "results.h5", "r")
+    try:
+        ctx = _profile_replay_context(reopened, result_store, "run-test")
+    finally:
+        result_store.close()
+        reopened.close()
+
+    assert ctx.eta is None
+    assert ctx.profile_line is None
+    assert ctx.degraded_reason
+
+
+def test_run_manifest_uses_frame_calibrations(tmp_path: Path) -> None:
+    from openfcd.cli.cmd_run import build_run_manifest
+    from openfcd.io.store import FileSessionStore
+
+    project_dir = tmp_path / "manifest.ofcd"
+    store = FileSessionStore.new(project_dir, "manifest")
+    try:
+        manifest = build_run_manifest(
+            store.project,
+            "run-test",
+            None,
+            2,
+            "success",
+            {
+                "frame_calibrations": [
+                    {
+                        "pixel_per_mm": 7.0,
+                        "pattern_period_mm": 1.2,
+                        "alpha": 0.25,
+                        "h_p_eff_mm": 14.0,
+                        "eta_unit": "mm",
+                        "spatial_calibration_source": "carrier_detected",
+                    },
+                    {
+                        "pixel_per_mm": 9.0,
+                        "pattern_period_mm": 1.2,
+                        "alpha": 0.25,
+                        "h_p_eff_mm": 14.0,
+                        "eta_unit": "mm",
+                        "spatial_calibration_source": "carrier_detected",
+                    },
+                ]
+            },
+        )
+    finally:
+        store.close()
+
+    assert manifest["calibration_status"] == "ok"
+    assert manifest["pixel_per_mm_median"] == 8.0
+    assert manifest["calibration"]["n_calibrated_frames"] == 2
+
+
+def test_run_manifest_missing_calibration_does_not_fake_median(tmp_path: Path) -> None:
+    from openfcd.cli.cmd_run import build_run_manifest
+    from openfcd.io.store import FileSessionStore
+
+    project_dir = tmp_path / "manifest-missing.ofcd"
+    store = FileSessionStore.new(project_dir, "manifest-missing")
+    try:
+        manifest = build_run_manifest(store.project, "run-test", None, 2, "error", {})
+    finally:
+        store.close()
+
+    assert manifest["calibration_status"] == "missing"
+    assert "pixel_per_mm_median" not in manifest
+
+
+def test_batch_calibration_meta_uses_successful_frames_only() -> None:
+    from openfcd.cli.cmd_run import _batch_calibration_meta
+
+    meta = _batch_calibration_meta(
+        [
+            {
+                "pixel_per_mm": 6.0,
+                "pattern_period_mm": 1.2,
+                "alpha": 0.25,
+                "h_p_eff_mm": 14.0,
+                "eta_unit": "mm",
+                "spatial_calibration_source": "carrier_detected",
+            },
+            {
+                "pixel_per_mm": 10.0,
+                "pattern_period_mm": 1.2,
+                "alpha": 0.25,
+                "h_p_eff_mm": 14.0,
+                "eta_unit": "mm",
+                "spatial_calibration_source": "carrier_detected",
+            },
+        ]
+    )
+
+    assert meta["pixel_per_mm_median"] == 8.0
+    assert meta["pixel_per_mm_min"] == 6.0
+    assert meta["pixel_per_mm_max"] == 10.0
+    assert json.loads(meta["calibration_json"])["n_calibrated_frames"] == 2
+
+
+def test_compute_stage_writes_frame_calibration_attrs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+    import numpy as np
+    from openfcd.cli.cmd_run import ComputeStage, FrameComputation
+    from openfcd.io.result import HDF5ResultStore
+    from openfcd.io.store import FileSessionStore
+
+    project_dir = tmp_path / "compute-stage.ofcd"
+    store = FileSessionStore.new(project_dir, "compute-stage")
+    project = store.project
+    (project_dir / "runs" / "run-test").mkdir(parents=True)
+    result_store = HDF5ResultStore.open(project_dir / "runs" / "run-test" / "results.h5", "w")
+    geom = SimpleNamespace(pattern_period_mm=1.2, alpha=0.25, h_p_eff_mm=14.0)
+
+    monkeypatch.setattr("openfcd.pipeline.compute.load_gray", lambda _path: np.ones((4, 4)))
+
+    def fake_compute(*_args, **_kwargs):
+        return FrameComputation(
+            eta_mm=np.ones((4, 4)),
+            pixel_per_mm=8.0,
+            calibration={
+                "pixel_per_mm": 8.0,
+                "pattern_period_mm": 1.2,
+                "alpha": 0.25,
+                "h_p_eff_mm": 14.0,
+                "eta_unit": "mm",
+                "spatial_calibration_source": "carrier_detected",
+            },
+        )
+
+    monkeypatch.setattr("openfcd.cli.cmd_run._compute_single_frame", fake_compute)
+    ctx = {
+        "run_id": "run-test",
+        "frame_paths": [tmp_path / "Img000001.png"],
+        "frame_count": 1,
+        "reference_image": np.ones((4, 4)),
+        "geom_params": geom,
+        "result_store": result_store,
+        "project": project,
+    }
+    try:
+        list(ComputeStage().run(ctx))
+        attrs = result_store.read_frame_attrs("default", 0)
+    finally:
+        result_store.close()
+        store.close()
+
+    assert attrs["pixel_per_mm"] == 8.0
+    assert attrs["eta_unit"] == "mm"
+    assert ctx["frame_calibrations"][0]["pixel_per_mm"] == 8.0
+
+
 # ---------------------------------------------------------------------------
 # Test 5: run --json produces valid JSON lines
 # ---------------------------------------------------------------------------
@@ -137,7 +399,6 @@ def test_run_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Patch cmd_run to use our dummy stages
     import openfcd.cli.cmd_run as cmd_run_mod
-    original_run = cmd_run_mod.run_cmd
 
     def patched_run_cmd(
         project_path: Path,
@@ -240,7 +501,6 @@ def test_project_runs_stale(tmp_path: Path) -> None:
     _write_minimal_project(tmp_path)
 
     # Create a fake run with a manifest
-    from datetime import datetime, timezone
     from openfcd.io.store import FileSessionStore
 
     store = FileSessionStore.open(tmp_path)
