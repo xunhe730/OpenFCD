@@ -1,7 +1,10 @@
 """Unit tests for openfcd.core.figures."""
 import pytest
-from typing import get_protocol_members, runtime_checkable
-from typing import Protocol
+from typing import Protocol, runtime_checkable
+try:
+    from typing import get_protocol_members
+except ImportError:
+    from typing_extensions import get_protocol_members
 
 from openfcd.core.figures import FigureRenderer, FIGURE_IDS, RENDERERS, COMPOSITE_LAYOUTS
 
@@ -39,14 +42,11 @@ def test_figure_renderer_is_protocol():
 
 
 def test_figure_renderer_has_render_method():
-    import inspect
-    members = FigureRenderer.__protocol_attrs__ if hasattr(FigureRenderer, '__protocol_attrs__') else dir(FigureRenderer)
-    assert "render" in members
+    assert "render" in get_protocol_members(FigureRenderer)
 
 
 def test_figure_renderer_has_figure_id():
-    members = FigureRenderer.__protocol_attrs__ if hasattr(FigureRenderer, '__protocol_attrs__') else dir(FigureRenderer)
-    assert "figure_id" in members
+    assert "figure_id" in get_protocol_members(FigureRenderer)
 
 
 def test_renderers_is_dict():

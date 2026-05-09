@@ -175,11 +175,53 @@ def polygon_mask(shape: tuple, poly: Polygon,
     return m
 
 
+def _min_area_rect_corners(points: np.ndarray) -> list[tuple[float, float]]:
+    """Minimum-area oriented bounding rectangle via rotating calipers on convex hull.
+
+    points: (N, 2) array of (row, col) coordinates.
+    Returns 4 (row, col) corner tuples.
+    """
+    from scipy.spatial import ConvexHull
+    if len(points) < 3:
+        r0, c0 = points.min(axis=0)
+        r1, c1 = points.max(axis=0)
+        return [(r0, c0), (r0, c1), (r1, c1), (r1, c0)]
+    try:
+        hull = ConvexHull(points)
+        hull_pts = points[hull.vertices]
+    except Exception:
+        hull_pts = points
+    n = len(hull_pts)
+    min_area = float("inf")
+    best: list[tuple[float, float]] = []
+    for i in range(n):
+        u = hull_pts[(i + 1) % n] - hull_pts[i]
+        edge_len = float(np.linalg.norm(u))
+        if edge_len < 1e-10:
+            continue
+        u = u / edge_len
+        v = np.array([-u[1], u[0]])
+        proj_u = hull_pts @ u
+        proj_v = hull_pts @ v
+        lo_u, hi_u = proj_u.min(), proj_u.max()
+        lo_v, hi_v = proj_v.min(), proj_v.max()
+        area = (hi_u - lo_u) * (hi_v - lo_v)
+        if area < min_area:
+            min_area = area
+            corners = np.array([
+                lo_u * u + lo_v * v,
+                hi_u * u + lo_v * v,
+                hi_u * u + hi_v * v,
+                lo_u * u + hi_v * v,
+            ])
+            best = [(float(c[0]), float(c[1])) for c in corners]
+    return best
+
+
 def find_oriented_polygon(mask: np.ndarray,
                            edge_margin: int = 20) -> Optional[Polygon]:
-    """OpenCV minAreaRect on the largest interior mask blob → oriented polygon."""
-    import cv2
-    from skimage.measure import label, regionprops
+    """Minimum-area oriented rectangle around the largest interior mask blob."""
+    from skimage.measure import label, regionprops, find_contours
     lab = label(mask.astype(np.uint8))
     h, w = mask.shape
     biggest = None
@@ -195,13 +237,11 @@ def find_oriented_polygon(mask: np.ndarray,
     if biggest is None:
         return None
     blob = (lab == biggest.label).astype(np.uint8)
-    contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = find_contours(blob, 0.5)
     if not contours:
         return None
-    big_contour = max(contours, key=cv2.contourArea)
-    (cx, cy), (rect_w, rect_h), angle = cv2.minAreaRect(big_contour)
-    pts = cv2.boxPoints(((cx, cy), (rect_w, rect_h), angle))
-    verts = [(float(p[1]), float(p[0])) for p in pts]   # (row, col)
+    big_contour = max(contours, key=len)
+    verts = _min_area_rect_corners(big_contour)
     return Polygon(verts)
 
 
