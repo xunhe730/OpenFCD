@@ -33,6 +33,7 @@ class _MenuLabel(QLabel):
     def __init__(self, text: str, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
 
     def mousePressEvent(self, ev: QMouseEvent | None) -> None:
         super().mousePressEvent(ev)
@@ -66,9 +67,11 @@ class TitleBarWidget(QWidget):
         for lbl in self._menus:
             lbl.setStyleSheet(
                 "color:" + tokens.TEXT_SECONDARY + ";font-size:12px;"
+                "background:transparent;border:none;padding:0 2px;"
             )
         self._title_label.setStyleSheet(
             "color:" + tokens.TEXT_SECONDARY + ";font-size:12px;"
+            "background:transparent;border:none;"
         )
         self._dirty_dot.setStyleSheet(
             "background:" + tokens.ACCENT_CLAY + ";border-radius:3px;"
@@ -136,21 +139,10 @@ class TitleBarWidget(QWidget):
 
         layout.addStretch()
 
-        # Right: Window controls
-        import sys
-        if sys.platform != "darwin":
-            right = QHBoxLayout()
-            right.setSpacing(10)
-            self._right_controls = []
-            for sym in ["—", "▢", "×"]:
-                lbl = QLabel(sym)
-                self._right_controls.append(lbl)
-                right.addWidget(lbl)
-            layout.addLayout(right)
-        else:
-            self._right_controls = []
-
-
+        # Native title bars already provide platform window controls.  Keep
+        # this custom strip focused on app navigation so Windows does not show
+        # a second set of inert minimize/maximize/close labels.
+        self._right_controls = []
 
     def set_project_title(self, title: str) -> None:
         """Set the project title shown in the bar."""

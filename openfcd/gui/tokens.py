@@ -106,3 +106,39 @@ def set_dark_mode(dark: bool) -> None:
         
     if changed:
         _theme_signals().changed.emit()
+
+
+def apply_qt_palette(app=None) -> None:
+    """Apply token colors to Qt's native palette-backed controls."""
+    try:
+        from PyQt6.QtGui import QColor, QPalette
+        from PyQt6.QtWidgets import QApplication
+    except ImportError:
+        return
+
+    app = app or QApplication.instance()
+    if app is None:
+        return
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(BG_PRIMARY))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(TEXT_PRIMARY))
+    palette.setColor(QPalette.ColorRole.Base, QColor(BG_TERTIARY))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(BG_SECONDARY))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(BG_TERTIARY))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(TEXT_PRIMARY))
+    palette.setColor(QPalette.ColorRole.Text, QColor(TEXT_PRIMARY))
+    palette.setColor(QPalette.ColorRole.Button, QColor(BG_TERTIARY))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(TEXT_PRIMARY))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(TEXT_MUTED))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(SELECTION_BG))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(TEXT_PRIMARY))
+    palette.setColor(QPalette.ColorRole.Link, QColor(ACCENT_CLAY))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(TEXT_MUTED))
+    palette.setColor(
+        QPalette.ColorGroup.Disabled,
+        QPalette.ColorRole.ButtonText,
+        QColor(TEXT_MUTED),
+    )
+    app.setPalette(palette)

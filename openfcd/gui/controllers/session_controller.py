@@ -217,6 +217,22 @@ class SessionController(QObject):
         self._store.remove_scene(scene_id)
         self.mark_dirty()
 
+    def flush_annotation_to_disk(self) -> "Path | None":
+        """Write live in-memory annotation to annotations/default.json.
+
+        Called on the main thread before _RunWorker starts so the worker's
+        fresh FileSessionStore.open() picks up the current in-memory state.
+        Returns the path written, or None if no project is open.
+        """
+        if self._store is None:
+            return None
+        from openfcd.io.annotation import save as save_annotation
+
+        ann_path = self._store._dir / "annotations" / "default.json"
+        ann_path.parent.mkdir(parents=True, exist_ok=True)
+        save_annotation(ann_path, self._store.annotation)
+        return ann_path
+
     def refresh_scenes(self, run_id: str) -> None:
         """Called after a Run completes. Update run_id on unbound scenes."""
         if self._store is None:
