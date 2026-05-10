@@ -858,28 +858,38 @@ class PreviewWidget(QWidget):
             bg_hex = _tok.BG_SECONDARY
             fg_hex = _tok.TEXT_SECONDARY
 
-            fig = Figure(figsize=(6, 0.52), dpi=100)
+            dpr = float(self.devicePixelRatioF() or 1.0)
+            label_w_px = max(self._colorbar_label.width(), 600)
+            label_h_px = max(self._colorbar_label.height(), 52)
+
+            dpi = 110.0
+            fig_w_in = label_w_px / dpi
+            fig_h_in = label_h_px / dpi
+
+            fig = Figure(figsize=(fig_w_in, fig_h_in), dpi=dpi)
             fig.patch.set_facecolor(bg_hex)
-            ax = fig.add_axes([0.03, 0.38, 0.94, 0.32])
+            ax = fig.add_axes([0.04, 0.42, 0.92, 0.30])
             ax.set_facecolor(bg_hex)
             sm = ScalarMappable(cmap=cmap_name, norm=Normalize(vmin=vmin, vmax=vmax))
             sm.set_array([])
             cb = fig.colorbar(sm, cax=ax, orientation="horizontal")
-            cb.set_label("η (mm)", color=fg_hex, fontsize=8)
-            ax.tick_params(labelsize=7, colors=fg_hex)
+            cb.set_label("η (mm)", color=fg_hex, fontsize=9)
+            ax.tick_params(labelsize=8, colors=fg_hex)
             for spine in ax.spines.values():
                 spine.set_edgecolor(fg_hex)
 
             buf = io.BytesIO()
-            fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), dpi=100)
+            fig.savefig(
+                buf,
+                format="png",
+                facecolor=fig.get_facecolor(),
+                dpi=dpi * dpr,
+            )
             buf.seek(0)
             qimg = QImage()
             qimg.loadFromData(buf.read())
-            pixmap = QPixmap.fromImage(qimg)
-            label_w = self._colorbar_label.width() or 600
-            self._colorbar_label.setPixmap(
-                pixmap.scaledToWidth(label_w, Qt.TransformationMode.SmoothTransformation)
-            )
+            qimg.setDevicePixelRatio(dpr)
+            self._colorbar_label.setPixmap(QPixmap.fromImage(qimg))
         except Exception:
             pass
 
