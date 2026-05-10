@@ -634,17 +634,31 @@ def measure_profile_sides(
 
 
 def _auto_limits(eta: np.ndarray, vmin: Any, vmax: Any) -> tuple[float | None, float | None]:
-    lo = _float_or_none(vmin)
-    hi = _float_or_none(vmax)
-    if lo is not None or hi is not None:
-        return lo, hi
-    finite = eta[np.isfinite(eta)]
-    if finite.size == 0:
-        return None, None
-    span = float(np.nanpercentile(np.abs(finite), 98))
-    if span <= 0:
-        span = 1.0
-    return -span, span
+    """Resolve symmetric (vmin, vmax) for the heatmap.
+
+    Delegates to :func:`openfcd.gui.renderers._eta_view.compute_eta_color_range`
+    so Profile heatmap and Run-monitor EtaMap share one color-range policy.
+    Caller is responsible for passing the same η pixel pool both views see
+    (i.e. the full per-frame η post-:func:`crop_to_valid`), so the auto-scale
+    98th-percentile is computed over identical inputs (AC-B2 / Phase 4).
+    """
+    from openfcd.gui.renderers._eta_view import compute_eta_color_range
+
+    user_vmin = _float_or_none(vmin)
+    user_vmax = _float_or_none(vmax)
+    viz_stub = type(
+        "_ProfileVizStub",
+        (),
+        {"eta_vmin_mm": user_vmin, "eta_vmax_mm": user_vmax},
+    )()
+    arr = np.asarray(eta) if eta is not None else np.empty(0)
+    if arr.size == 0:
+        return user_vmin, user_vmax
+    lo, hi = compute_eta_color_range(arr, viz_stub, diverging=True, cmap="RdBu_r")
+    if hi <= 0 and user_vmax is None:
+        # Defensive: keep historical "span <= 0 → 1.0" fallback.
+        return -1.0, 1.0
+    return lo, hi
 
 
 def _figure_size_from_widget(fig: matplotlib.figure.Figure, dpi: float) -> tuple[float, float] | None:
@@ -812,7 +826,13 @@ def render_profile_composite_context(
     measurement = measure_profile_sides(x_mm, y_mm, body_span_mm=body_span)
 
     cmap = context.viz_params.get("cmap", "RdBu_r") or "RdBu_r"
-    vmin, vmax = _auto_limits(window.eta, context.viz_params.get("vmin"), context.viz_params.get("vmax"))
+    # Color-range parity with Run-monitor EtaMap: the 98th-percentile must be
+    # computed over the same η pool both views see — the full per-frame η post
+    # `crop_to_valid` — not the line-aligned ROI ``window.eta``. Otherwise
+    # Profile and EtaMap render identical pixels with different saturation.
+    from openfcd.gui.renderers._eta_view import crop_to_valid as _eta_crop
+    color_eta = _eta_crop(np.asarray(context.eta, dtype=float))
+    vmin, vmax = _auto_limits(color_eta, context.viz_params.get("vmin"), context.viz_params.get("vmax"))
     title = context.viz_params.get("title") or frame_label or (
         f"Profile Composite - frame {context.frame_idx}" if context.frame_idx is not None else "Profile Composite"
     )

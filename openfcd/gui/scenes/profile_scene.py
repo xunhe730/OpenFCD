@@ -47,9 +47,22 @@ class _LineAnnotator(QWidget):
         try:
             from matplotlib import colormaps
             from matplotlib.colors import Normalize
-            finite = image[np.isfinite(image)]
-            vmax = float(np.nanpercentile(np.abs(finite), 98)) if finite.size else 1.0
-            norm = Normalize(vmin=-vmax, vmax=vmax)
+
+            from openfcd.gui.renderers._eta_view import (
+                compute_eta_color_range,
+                crop_to_valid,
+            )
+
+            # Share color-range policy with EtaMap so Profile annotation overlay
+            # never saturates differently from the Run-monitor view.
+            color_eta = crop_to_valid(np.asarray(image, dtype=float))
+            viz_stub = type(
+                "_AnnotatorVizStub",
+                (),
+                {"eta_vmin_mm": None, "eta_vmax_mm": None},
+            )()
+            vmin, vmax = compute_eta_color_range(color_eta, viz_stub, cmap="RdBu_r")
+            norm = Normalize(vmin=vmin, vmax=vmax)
             rgba = (colormaps.get_cmap("RdBu_r")(norm(np.nan_to_num(image))) * 255).astype(np.uint8)
             rgba[~np.isfinite(image), 3] = 0
             h, w, _ = rgba.shape
