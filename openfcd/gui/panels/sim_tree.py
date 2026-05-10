@@ -131,6 +131,7 @@ class SimTree(QTreeWidget):
         self.clear()
         self._frames = []
         self._ref_index = -1
+        self._disabled_indices = set()
         self._build_skeleton(project_name)
 
     def populate_from_session(
@@ -147,6 +148,9 @@ class SimTree(QTreeWidget):
         self.clear()
         self._frames = frames
         self._ref_index = ref_index
+        # Drop any disabled-frame state from the previous project — caller
+        # re-applies the new project's disabled set after we return.
+        self._disabled_indices = set()
 
         root = self._make_item(project_name, NodeType.ROOT)
         root.setExpanded(True)

@@ -1419,10 +1419,12 @@ class MainWindow(QMainWindow):
 
     # ── Session events ──────────────────────────────────────────────
     def _on_session_opened(self, path: str) -> None:
-        # New project → clear η caches from any previous session.
+        # New project → clear per-session state from any previous project.
         self._frame_eta_cache = {}
         self._run_eta_frames = None
         self._run_eta_mean = None
+        # Pending batch-compute queue is project-scoped; drop it.
+        self._compute_queue = []
         proj_path = Path(path)
         name = proj_path.name
         self._title_bar.set_project_title(f"{name} — OpenFCD")
