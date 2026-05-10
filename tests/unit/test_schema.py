@@ -50,7 +50,7 @@ def test_project_yaml_roundtrip(tmp_path):
     p.to_yaml(yaml_path)
     loaded = ProjectModel.from_yaml(yaml_path)
     expected = set(ProjectModel.model_fields.keys())
-    assert len(expected) == 14
+    assert len(expected) == 15
     for field in expected:
         assert getattr(loaded, field) == getattr(p, field)
 
@@ -138,3 +138,21 @@ def test_optical_geometry_empty_layers():
     )
     with pytest.raises(ValueError):
         OpticalGeometry(geo)
+
+
+def test_qc_defaults_are_present():
+    project = ProjectModel(
+        name="qc-defaults",
+        created="2026-04-22T10:00:00+00:00",
+        geometry={
+            "pattern_period_mm": 1.2,
+            "optical_stack": {"preset": "custom", "layers": []},
+        },
+        data={"frames_dir": ""},
+    )
+
+    assert project.qc.saturated_ratio_warning == pytest.approx(0.001)
+    assert project.qc.invalid_ratio_warning == pytest.approx(0.20)
+    assert project.qc.carrier_amp_median_min_warning == pytest.approx(1e-6)
+    assert project.qc.poisson_norm_warning == pytest.approx(0.10)
+    assert project.qc.poisson_norm_fail == pytest.approx(0.20)

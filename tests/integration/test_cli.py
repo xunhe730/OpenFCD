@@ -316,62 +316,81 @@ def test_batch_calibration_meta_uses_successful_frames_only() -> None:
 
 
 def test_compute_stage_writes_frame_calibration_attrs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from types import SimpleNamespace
     import numpy as np
-    from openfcd.cli.cmd_run import ComputeStage, FrameComputation
+    from openfcd.cli.cmd_run import ComputeStage
     from openfcd.io.result import HDF5ResultStore
     from openfcd.io.store import FileSessionStore
+    from openfcd.pipeline.frame import FrameResult
 
     project_dir = tmp_path / "compute-stage.ofcd"
     store = FileSessionStore.new(project_dir, "compute-stage")
     project = store.project
     (project_dir / "runs" / "run-test").mkdir(parents=True)
     result_store = HDF5ResultStore.open(project_dir / "runs" / "run-test" / "results.h5", "w")
-    geom = SimpleNamespace(pattern_period_mm=1.2, alpha=0.25, h_p_eff_mm=14.0)
 
-    monkeypatch.setattr("openfcd.pipeline.compute.load_gray", lambda _path: np.ones((4, 4)))
+    _calibration = {
+        "pixel_per_mm": 8.0,
+        "pattern_period_mm": 1.2,
+        "checker_cell_mm": 1.2,
+        "checker_cell_semantics": "single checker cell side length, not full black-white cycle",
+        "alpha": 0.25,
+        "h_p_eff_mm": 14.0,
+        "eta_unit": "mm",
+        "spatial_calibration_source": "carrier_detected",
+    }
+    _qc_attrs = {
+        "saturated_ratio": 0.0,
+        "invalid_ratio": 0.0,
+        "carrier_amp_median": 3.0,
+        "poisson_residual_rms": 0.0,
+        "curl_inconsistency_rms": 0.0,
+        "phase_residual_rms": 0.0,
+        "slope_rms": 0.0,
+    }
 
-    def fake_compute(*_args, **_kwargs):
-        return FrameComputation(
-            eta_mm=np.ones((4, 4)),
-            pixel_per_mm=8.0,
-            calibration={
+    def fake_compute_frame(inputs, *, progress_cb=None, cancel=None):
+        eta = np.ones(inputs.ref_shape, dtype=np.float64)
+        qc = {
+            "carrier_amplitude": np.full(inputs.ref_shape, 3.0),
+            "valid_mask": np.ones(inputs.ref_shape, dtype=bool),
+            "artifact_mask": np.zeros(inputs.ref_shape, dtype=bool),
+            "phase_residual": np.zeros(inputs.ref_shape),
+            "poisson_residual": np.zeros(inputs.ref_shape),
+            "poisson_residual_x": np.zeros(inputs.ref_shape),
+            "poisson_residual_y": np.zeros(inputs.ref_shape),
+            "curl_inconsistency": np.zeros(inputs.ref_shape),
+        }
+        return FrameResult(
+            eta_mm=eta,
+            qc_datasets=qc,
+            diagnostics={
                 "pixel_per_mm": 8.0,
-                "pattern_period_mm": 1.2,
-                "alpha": 0.25,
-                "h_p_eff_mm": 14.0,
-                "eta_unit": "mm",
-                "spatial_calibration_source": "carrier_detected",
-            },
-            qc_datasets={
-                "carrier_amplitude": np.full((4, 4), 3.0),
-                "valid_mask": np.ones((4, 4), dtype=bool),
-                "artifact_mask": np.zeros((4, 4), dtype=bool),
-                "phase_residual": np.zeros((4, 4)),
-                "poisson_residual": np.zeros((4, 4)),
-                "poisson_residual_x": np.zeros((4, 4)),
-                "poisson_residual_y": np.zeros((4, 4)),
-                "curl_inconsistency": np.zeros((4, 4)),
-            },
-            qc_attrs={
-                "saturated_ratio": 0.0,
-                "invalid_ratio": 0.0,
-                "carrier_amp_median": 3.0,
-                "poisson_residual_rms": 0.0,
-                "curl_inconsistency_rms": 0.0,
+                "calibration": _calibration,
+                "qc_attrs": _qc_attrs,
             },
         )
 
-    monkeypatch.setattr("openfcd.cli.cmd_run._compute_single_frame", fake_compute)
+    monkeypatch.setattr("openfcd.pipeline.frame.compute_frame", fake_compute_frame)
+
+    # Use a real tiny image so load_gray succeeds via build_frame_inputs
+    img_path = tmp_path / "Img000001.png"
+    from skimage.io import imsave
+    imsave(str(img_path), np.ones((4, 4), dtype=np.uint8) * 128)
+
+    from openfcd.pipeline.compute import GeomParams
+    geom = GeomParams(pattern_period_mm=1.2, alpha=0.25, h_p_eff_mm=14.0)
+
     ctx = {
         "run_id": "run-test",
-        "frame_paths": [tmp_path / "Img000001.png"],
+        "frame_paths": [img_path],
         "frame_count": 1,
-        "reference_image": np.ones((4, 4)),
+        "reference_image": np.ones((4, 4), dtype=np.float64),
         "geom_params": geom,
         "result_store": result_store,
         "project": project,
+        "annotation": None,
     }
+
     try:
         list(ComputeStage().run(ctx))
         attrs = result_store.read_frame_attrs("default", 0)
@@ -388,11 +407,75 @@ def test_compute_stage_writes_frame_calibration_attrs(tmp_path: Path, monkeypatc
     assert attrs["carrier_amp_median"] == 3.0
     assert attrs["poisson_residual_rms"] == 0.0
     assert attrs["curl_inconsistency_rms"] == 0.0
+    assert attrs["qc_verdict"] == "PASS"
     assert "carrier_amplitude" in qc_names
     assert "poisson_residual_x" in qc_names
     assert "poisson_residual_y" in qc_names
     np.testing.assert_allclose(carrier_amp, np.full((4, 4), 3.0))
     assert ctx["frame_calibrations"][0]["pixel_per_mm"] == 8.0
+
+
+def test_qc_cli_commands_write_reports(tmp_path: Path) -> None:
+    import numpy as np
+    from openfcd.io.result import HDF5ResultStore
+    from openfcd.io.store import FileSessionStore
+
+    project_dir = tmp_path / "qc.ofcd"
+    store = FileSessionStore.new(project_dir, "qc")
+    store.record_run("run-test", {})
+    store.close()
+    run_dir = project_dir / "runs" / "run-test"
+    qc = {
+        "valid_mask": np.ones((8, 8), dtype=bool),
+        "carrier_amplitude": np.ones((8, 8)) * 2.0,
+        "phase_residual": np.zeros((8, 8)),
+        "poisson_residual": np.zeros((8, 8)),
+        "curl_inconsistency": np.zeros((8, 8)),
+    }
+    results = HDF5ResultStore.open(run_dir / "results.h5", "w")
+    results.write_frame(
+        "default",
+        0,
+        np.ones((8, 8)) * 0.1,
+        {
+            "status": "ok",
+            "qc_verdict": "PASS",
+            "invalid_ratio": 0.0,
+            "checker_cell_mm": 1.2,
+            "pixel_per_mm": 8.0,
+            "h_p_eff_mm": 12.0,
+            "alpha": 0.25,
+        },
+        qc_datasets=qc,
+    )
+    results.close()
+
+    qc_png = tmp_path / "qc.png"
+    result = runner.invoke(
+        app,
+        ["qc-summary", str(project_dir), "--run", "run-test", "--frame", "0", "--output", str(qc_png)],
+    )
+    assert result.exit_code == 0, result.output
+    assert qc_png.exists()
+    assert qc_png.stat().st_size > 0
+
+    noise_json = tmp_path / "noise.json"
+    result = runner.invoke(
+        app,
+        ["noise-floor", str(project_dir), "--from-run", "run-test", "--output", str(noise_json)],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(noise_json.read_text())["valid_frame_count"] == 1
+
+    sens_json = tmp_path / "sensitivity.json"
+    result = runner.invoke(
+        app,
+        ["sensitivity", str(project_dir), "--run", "run-test", "--frame", "0", "--output", str(sens_json)],
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(sens_json.read_text())
+    assert report["frame_id"] == 0
+    assert report["perturbations"]
 
 
 # ---------------------------------------------------------------------------
