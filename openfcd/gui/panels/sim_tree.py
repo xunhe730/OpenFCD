@@ -55,6 +55,10 @@ class SimTree(QTreeWidget):
     compute_frame_requested = pyqtSignal(int)
     frame_disabled_requested = pyqtSignal(int)
     frame_enabled_requested = pyqtSignal(int)
+    # Batch variants — emitted from multi-selection context menu
+    frames_disabled_requested = pyqtSignal(list)
+    frames_enabled_requested = pyqtSignal(list)
+    frames_compute_requested = pyqtSignal(list)
     new_scene_requested = pyqtSignal(str)        # scene type string
     delete_scene_requested = pyqtSignal(str)     # scene id
     duplicate_scene_requested = pyqtSignal(str)  # scene id
@@ -88,6 +92,8 @@ class SimTree(QTreeWidget):
         self.setAnimated(True)
         self.setUniformRowHeights(True)
         self.setSelectionBehavior(self.SelectionBehavior.SelectRows)
+        # Allow Shift / Ctrl(Cmd) multi-select on IMAGE_FRAME rows.
+        self.setSelectionMode(self.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
         self.currentItemChanged.connect(self._on_selection_changed)
@@ -397,11 +403,45 @@ class SimTree(QTreeWidget):
 
         if node_type == NodeType.IMAGE_FRAME:
             frame_idx = item.data(0, ROLE_DATA)
-            if frame_idx is not None:
+            if frame_idx is None:
+                return
+            # Gather frame indices from current multi-selection. Right-clicking
+            # an unselected row falls back to the single clicked frame.
+            selected_idxs = self._selected_frame_indices()
+            if frame_idx not in selected_idxs:
+                selected_idxs = [frame_idx]
+            is_batch = len(selected_idxs) > 1
+
+            if is_batch:
+                # Set Reference / Anchor are inherently single-frame ops.
                 act_ref = menu.addAction("Set as Reference")
-                act_ref.triggered.connect(lambda: self.set_reference_requested.emit(frame_idx))
+                act_ref.setEnabled(False)
+                act_compute = menu.addAction(f"Compute {len(selected_idxs)} Frames")
+                act_compute.triggered.connect(
+                    lambda *_a, idxs=list(selected_idxs):
+                        self.frames_compute_requested.emit(idxs))
+                menu.addSeparator()
+                # Show a single toggle: if every selected frame is already
+                # disabled, offer Enable; otherwise offer Disable (which sets
+                # the whole selection to disabled).
+                all_disabled = all(i in self._disabled_indices for i in selected_idxs)
+                if all_disabled:
+                    act = menu.addAction(f"Enable {len(selected_idxs)} Frames")
+                    act.triggered.connect(
+                        lambda *_a, idxs=list(selected_idxs):
+                            self.frames_enabled_requested.emit(idxs))
+                else:
+                    act = menu.addAction(f"Disable {len(selected_idxs)} Frames")
+                    act.triggered.connect(
+                        lambda *_a, idxs=list(selected_idxs):
+                            self.frames_disabled_requested.emit(idxs))
+            else:
+                act_ref = menu.addAction("Set as Reference")
+                act_ref.triggered.connect(
+                    lambda: self.set_reference_requested.emit(frame_idx))
                 act_compute = menu.addAction("Compute This Frame")
-                act_compute.triggered.connect(lambda: self.compute_frame_requested.emit(frame_idx))
+                act_compute.triggered.connect(
+                    lambda: self.compute_frame_requested.emit(frame_idx))
                 menu.addSeparator()
                 if frame_idx in self._disabled_indices:
                     act_enable = menu.addAction("Enable Frame")
@@ -439,6 +479,19 @@ class SimTree(QTreeWidget):
         menu.exec(self.viewport().mapToGlobal(pos))
 
     # ── Selection ───────────────────────────────────────────────────
+
+    def _selected_frame_indices(self) -> list[int]:
+        """Return frame indices for IMAGE_FRAME items in the current selection."""
+        out: list[int] = []
+        for item in self.selectedItems():
+            if item.data(0, ROLE_NODE_TYPE) == NodeType.IMAGE_FRAME:
+                idx = item.data(0, ROLE_DATA)
+                if idx is not None:
+                    out.append(int(idx))
+        return sorted(set(out))
+
+    def selected_frame_indices(self) -> list[int]:
+        return self._selected_frame_indices()
 
     def _on_selection_changed(
         self, current: QTreeWidgetItem | None, _prev: QTreeWidgetItem | None

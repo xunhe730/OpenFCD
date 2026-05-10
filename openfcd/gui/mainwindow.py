@@ -287,6 +287,9 @@ class MainWindow(QMainWindow):
         self._scene_container.scene_changed.connect(self._on_scene_changed)
         self._sim_tree.frame_disabled_requested.connect(self._on_disable_frame)
         self._sim_tree.frame_enabled_requested.connect(self._on_enable_frame)
+        self._sim_tree.frames_disabled_requested.connect(self._on_disable_frames)
+        self._sim_tree.frames_enabled_requested.connect(self._on_enable_frames)
+        self._sim_tree.frames_compute_requested.connect(self._on_compute_frames)
         self._title_bar.menu_requested.connect(self._on_menu_requested)
         self._session.session_opened.connect(self._on_session_opened)
         self._session.session_modified.connect(self._on_session_dirty)
@@ -665,26 +668,40 @@ class MainWindow(QMainWindow):
             self._reapply_run_eta()
 
     def _on_disable_frame(self, idx: int) -> None:
-        self._sim_tree.set_frame_disabled(idx, True)
-        if self._session.has_project and self._session.project:
-            proj = self._session.project
-            disabled = list(proj.data.disabled_frame_indices)
-            if idx not in disabled:
-                disabled.append(idx)
-            proj.data.disabled_frame_indices = disabled
-            self._session.mark_dirty()
+        self._on_disable_frames([idx])
 
     def _on_enable_frame(self, idx: int) -> None:
-        self._sim_tree.set_frame_disabled(idx, False)
+        self._on_enable_frames([idx])
+
+    def _on_disable_frames(self, idxs: list[int]) -> None:
+        if not idxs:
+            return
+        for i in idxs:
+            self._sim_tree.set_frame_disabled(i, True)
         if self._session.has_project and self._session.project:
             proj = self._session.project
+            current = set(proj.data.disabled_frame_indices)
+            current.update(int(i) for i in idxs)
+            proj.data.disabled_frame_indices = sorted(current)
+            self._session.mark_dirty()
+
+    def _on_enable_frames(self, idxs: list[int]) -> None:
+        if not idxs:
+            return
+        for i in idxs:
+            self._sim_tree.set_frame_disabled(i, False)
+        if self._session.has_project and self._session.project:
+            proj = self._session.project
+            drop = {int(i) for i in idxs}
             proj.data.disabled_frame_indices = [
-                i for i in proj.data.disabled_frame_indices if i != idx
+                i for i in proj.data.disabled_frame_indices if i not in drop
             ]
             self._session.mark_dirty()
 
     def _on_set_reference(self, idx: int) -> None:
-        """Set frame as reference."""
+        """Set frame as reference. The reference frame is auto-disabled so it
+        does not participate in run/compute (it has zero deformation by
+        construction)."""
         if not self._session.has_project or idx < 0:
             return
         proj = self._session.project
@@ -694,6 +711,34 @@ class MainWindow(QMainWindow):
             self._sim_tree.update_ref_mark(idx)
             self._session.invalidate_reference_cache()
             self._session.mark_dirty()
+            # Auto-disable the chosen reference frame.
+            if idx not in proj.data.disabled_frame_indices:
+                self._on_disable_frames([idx])
+
+    def _on_compute_frames(self, idxs: list[int]) -> None:
+        """Queue a batch of single-frame computes, skipping disabled frames."""
+        if not idxs:
+            return
+        proj = self._session.project
+        disabled = set(proj.data.disabled_frame_indices) if proj else set()
+        queue = [int(i) for i in idxs if int(i) not in disabled]
+        skipped = len(idxs) - len(queue)
+        if skipped:
+            self._status_bar.set_items(
+                [f"Skipped {skipped} disabled frame(s)"]
+            )
+        if not queue:
+            return
+        self._compute_queue = list(queue)
+        self._drain_compute_queue()
+
+    def _drain_compute_queue(self) -> None:
+        if not getattr(self, "_compute_queue", None):
+            return
+        if getattr(self, "_single_frame_worker", None) is not None:
+            return
+        next_idx = self._compute_queue.pop(0)
+        self._on_compute_frame(next_idx)
 
     def _on_compute_frame(self, idx: int) -> None:
         """Compute a single frame in a background thread and show the result."""
@@ -707,6 +752,12 @@ class MainWindow(QMainWindow):
             )
             return
         if idx < 0 or idx >= len(self._frames):
+            return
+        # Disabled frames must not participate in compute.
+        if proj and idx in set(proj.data.disabled_frame_indices):
+            self._status_bar.set_items(
+                [f"Frame {idx + 1} is disabled — skipped"]
+            )
             return
 
         # Reflect "running" state immediately so the user gets instant feedback,
@@ -737,8 +788,13 @@ class MainWindow(QMainWindow):
         worker.frame_failed.connect(self._on_single_frame_failed)
         worker.frame_progress.connect(self._on_single_frame_progress)
         worker.reference_resolved.connect(self._session.cache_reference)
-        worker.finished.connect(lambda: setattr(self, "_single_frame_worker", None))
+        worker.finished.connect(self._on_single_frame_finished)
         worker.start()
+
+    def _on_single_frame_finished(self) -> None:
+        self._single_frame_worker = None
+        # Continue any pending batch compute queue.
+        self._drain_compute_queue()
 
     def _check_carrier_scale(self, proj, frame_path) -> str | None:
         """Return a warning string if ref/def carrier period mismatch >10%, else None."""

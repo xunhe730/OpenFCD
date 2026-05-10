@@ -63,7 +63,8 @@ class ThumbWorker(QThread):
 class ThumbCell(QWidget):
     """Single thumbnail cell with checkbox, badges, and frame label."""
 
-    clicked = pyqtSignal(int, bool)  # frame_idx, is_selected
+    # frame_idx, modifiers (Qt.KeyboardModifier as int)
+    clicked = pyqtSignal(int, int)
 
     BADGE_REF = "★"
     BADGE_ANCHOR = "⚑"
@@ -82,6 +83,7 @@ class ThumbCell(QWidget):
         self._is_ref = False
         self._is_anchor = False
         self._is_computed = False
+        self._is_disabled = False
         self._pixmap: QPixmap | None = None
 
         self.setFixedSize(140, 100)
@@ -98,11 +100,17 @@ class ThumbCell(QWidget):
         self.update()
 
     def set_badges(
-        self, *, ref: bool = False, anchor: bool = False, computed: bool = False
+        self,
+        *,
+        ref: bool = False,
+        anchor: bool = False,
+        computed: bool = False,
+        disabled: bool = False,
     ) -> None:
         self._is_ref = ref
         self._is_anchor = anchor
         self._is_computed = computed
+        self._is_disabled = disabled
         self.update()
 
     def set_pixmap(self, pm: QPixmap) -> None:
@@ -111,9 +119,10 @@ class ThumbCell(QWidget):
 
     # ── Events ──────────────────────────────────────────────────────
     def mousePressEvent(self, event) -> None:
-        self._selected = not self._selected
-        self.clicked.emit(self.frame_idx, self._selected)
-        self.update()
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        self.clicked.emit(self.frame_idx, int(event.modifiers().value))
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -196,6 +205,12 @@ class ThumbCell(QWidget):
         label_font = QFont(tokens.FONT_MONO.split(",")[0], 9)
         p.setFont(label_font)
         p.drawText(6, h - 6, self.filename)
+
+        if self._is_disabled:
+            p.fillRect(1, 1, w - 2, h - 2, QColor(0, 0, 0, 150))
+            p.setPen(QPen(QColor(tokens.DANGER if hasattr(tokens, "DANGER") else "#d04040"), 2.0))
+            p.drawLine(4, 4, w - 5, h - 5)
+            p.drawLine(w - 5, 4, 4, h - 5)
 
         p.end()
 
@@ -289,6 +304,9 @@ class _ImageListSummary(QWidget):
 
     invert_clicked = pyqtSignal()
     clear_clicked = pyqtSignal()
+    disable_clicked = pyqtSignal()
+    enable_clicked = pyqtSignal()
+    compute_clicked = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -307,6 +325,18 @@ class _ImageListSummary(QWidget):
 
         layout.addStretch()
 
+        self._disable_btn = QPushButton("Disable")
+        self._disable_btn.clicked.connect(self.disable_clicked.emit)
+        layout.addWidget(self._disable_btn)
+
+        self._enable_btn = QPushButton("Enable")
+        self._enable_btn.clicked.connect(self.enable_clicked.emit)
+        layout.addWidget(self._enable_btn)
+
+        self._compute_btn = QPushButton("Compute")
+        self._compute_btn.clicked.connect(self.compute_clicked.emit)
+        layout.addWidget(self._compute_btn)
+
         self._invert_btn = QPushButton("Invert")
         self._invert_btn.clicked.connect(self.invert_clicked.emit)
         layout.addWidget(self._invert_btn)
@@ -314,9 +344,14 @@ class _ImageListSummary(QWidget):
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.clicked.connect(self.clear_clicked.emit)
         layout.addWidget(self._clear_btn)
-        
+
+        self.set_action_enabled(False)
         tokens.on_theme_changed(self._apply_theme)
         self._apply_theme()
+
+    def set_action_enabled(self, has_selection: bool) -> None:
+        for b in (self._disable_btn, self._enable_btn, self._compute_btn):
+            b.setEnabled(has_selection)
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(f"""
@@ -332,7 +367,9 @@ class _ImageListSummary(QWidget):
             f"border: 1px solid {tokens.BORDER_SUBTLE}; "
             f"background: {tokens.BG_TERTIARY}; color: {tokens.TEXT_PRIMARY};"
         )
-        self._invert_btn.setStyleSheet(btn_style)
+        for b in (self._disable_btn, self._enable_btn,
+                  self._compute_btn, self._invert_btn):
+            b.setStyleSheet(btn_style)
         self._clear_btn.setStyleSheet(
             f"padding: 6px 12px; border-radius: 4px; font-size: 11.5px; "
             f"color: {tokens.TEXT_SECONDARY}; background: transparent; border: none;"
@@ -418,20 +455,25 @@ class ImageList(QWidget):
     role badges (★ reference, ⚑ anchor, ✓ computed), and batch actions.
     """
 
-    frame_selected = pyqtSignal(int)  # frame index
+    frame_selected = pyqtSignal(int)  # frame index (last clicked)
     selection_changed = pyqtSignal(list)  # list of selected frame indices
     new_project_requested = pyqtSignal()
     set_reference_requested = pyqtSignal(int)
     set_anchor_requested = pyqtSignal(int)
+    disable_requested = pyqtSignal(list)   # list[int] frame indices
+    enable_requested = pyqtSignal(list)
+    compute_requested = pyqtSignal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._frames: list[Path] = []
         self._cells: list[ThumbCell] = []
         self._selected_indices: set[int] = set()
+        self._disabled_indices: set[int] = set()
         self._ref_frame: int = -1
         self._anchor_frame: int = -1
         self._computed_until: int = -1
+        self._sel_anchor: int | None = None
         self._state = ImageListState.EMPTY
         self._cols = 10
 
@@ -479,6 +521,15 @@ class ImageList(QWidget):
         self._summary = _ImageListSummary(self)
         self._summary.invert_clicked.connect(self._invert_selection)
         self._summary.clear_clicked.connect(self._clear_selection)
+        self._summary.disable_clicked.connect(
+            lambda: self.disable_requested.emit(self.selected_indices())
+        )
+        self._summary.enable_clicked.connect(
+            lambda: self.enable_requested.emit(self.selected_indices())
+        )
+        self._summary.compute_clicked.connect(
+            lambda: self.compute_requested.emit(self.selected_indices())
+        )
         layout.addWidget(self._summary)
 
         self._thumb_worker = None
@@ -547,6 +598,11 @@ class ImageList(QWidget):
     def selected_indices(self) -> list[int]:
         return sorted(self._selected_indices)
 
+    def set_disabled_indices(self, indices) -> None:
+        """Replace the disabled-frame set; refresh visuals."""
+        self._disabled_indices = set(int(i) for i in indices)
+        self._refresh_badges()
+
     # ── Internal ────────────────────────────────────────────────────
     def _rebuild_grid(self) -> None:
         # Clear existing
@@ -588,8 +644,7 @@ class ImageList(QWidget):
     def _on_cell_context_menu(self, cell: ThumbCell, pos) -> None:
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
-        
-        # Style the menu to match dark mode theme
+
         menu.setStyleSheet(f"""
             QMenu {{
                 background-color: {tokens.BG_PRIMARY};
@@ -597,17 +652,53 @@ class ImageList(QWidget):
                 border: 1px solid {tokens.BORDER_SUBTLE};
             }}
             QMenu::item:selected {{ background-color: {tokens.BG_TERTIARY}; }}
+            QMenu::item:disabled {{ color: {tokens.TEXT_MUTED}; }}
         """)
-        
+
+        if cell.frame_idx in self._selected_indices and len(self._selected_indices) > 1:
+            targets = sorted(self._selected_indices)
+        else:
+            targets = [cell.frame_idx]
+        is_batch = len(targets) > 1
+
         ref_action = menu.addAction("Set as Reference")
+        ref_action.setEnabled(not is_batch)
         anch_action = menu.addAction("Set as Anchor (GUI)")
-        action = menu.exec(cell.mapToGlobal(pos))
-        if action == ref_action:
+        anch_action.setEnabled(not is_batch)
+        menu.addSeparator()
+        # Single toggle action: enable when all targets are disabled,
+        # otherwise disable (sets all targets to disabled).
+        all_disabled = bool(targets) and all(
+            i in self._disabled_indices for i in targets
+        )
+        toggle_label_n = (
+            f"{len(targets)} frame(s)" if is_batch else "frame"
+        )
+        if all_disabled:
+            enable_action = menu.addAction(f"Enable {toggle_label_n}")
+            disable_action = None
+        else:
+            disable_action = menu.addAction(f"Disable {toggle_label_n}")
+            enable_action = None
+        compute_action = menu.addAction(
+            f"Compute {len(targets)} frame(s)" if is_batch else "Compute frame"
+        )
+
+        chosen = menu.exec(cell.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == ref_action:
             self.set_ref_frame(cell.frame_idx)
             self.set_reference_requested.emit(cell.frame_idx)
-        elif action == anch_action:
+        elif chosen == anch_action:
             self.set_anchor_frame(cell.frame_idx)
             self.set_anchor_requested.emit(cell.frame_idx)
+        elif disable_action is not None and chosen == disable_action:
+            self.disable_requested.emit(targets)
+        elif enable_action is not None and chosen == enable_action:
+            self.enable_requested.emit(targets)
+        elif chosen == compute_action:
+            self.compute_requested.emit(targets)
 
     def _refresh_badges(self) -> None:
         for cell in self._cells:
@@ -615,6 +706,7 @@ class ImageList(QWidget):
                 ref=(cell.frame_idx == self._ref_frame),
                 anchor=(cell.frame_idx == self._anchor_frame),
                 computed=(cell.frame_idx <= self._computed_until),
+                disabled=(cell.frame_idx in self._disabled_indices),
             )
             cell.is_selected = cell.frame_idx in self._selected_indices
 
@@ -623,13 +715,39 @@ class ImageList(QWidget):
         self._scroll.setVisible(state in (ImageListState.IDLE, ImageListState.RUNNING))
         self._empty_zone.setVisible(state == ImageListState.EMPTY)
 
-    def _on_cell_clicked(self, idx: int, selected: bool) -> None:
-        if selected:
-            self._selected_indices.add(idx)
+    def _on_cell_clicked(self, idx: int, modifiers: int) -> None:
+        shift = bool(modifiers & int(Qt.KeyboardModifier.ShiftModifier.value))
+        ctrl_like = bool(
+            modifiers & (
+                int(Qt.KeyboardModifier.ControlModifier.value)
+                | int(Qt.KeyboardModifier.MetaModifier.value)
+            )
+        )
+
+        if shift and self._sel_anchor is not None:
+            lo, hi = sorted((self._sel_anchor, idx))
+            range_set = set(range(lo, hi + 1))
+            if ctrl_like:
+                self._selected_indices |= range_set
+            else:
+                self._selected_indices = range_set
+        elif ctrl_like:
+            if idx in self._selected_indices:
+                self._selected_indices.discard(idx)
+            else:
+                self._selected_indices.add(idx)
+            self._sel_anchor = idx
         else:
-            self._selected_indices.discard(idx)
-        self._summary.update_info(len(self._selected_indices), len(self._frames))
+            self._selected_indices = {idx}
+            self._sel_anchor = idx
+
+        self._refresh_badges()
+        self._emit_selection()
         self.frame_selected.emit(idx)
+
+    def _emit_selection(self) -> None:
+        self._summary.update_info(len(self._selected_indices), len(self._frames))
+        self._summary.set_action_enabled(bool(self._selected_indices))
         self.selection_changed.emit(sorted(self._selected_indices))
 
     def _on_filter(self, text: str) -> None:
@@ -668,8 +786,7 @@ class ImageList(QWidget):
             self._selected_indices = {i for i in range(0, len(self._frames), n)}
 
         self._refresh_badges()
-        self._summary.update_info(len(self._selected_indices), len(self._frames))
-        self.selection_changed.emit(sorted(self._selected_indices))
+        self._emit_selection()
 
     def _on_sort(self, mode: str) -> None:
         if mode.startswith("name"):
@@ -682,14 +799,13 @@ class ImageList(QWidget):
         all_indices = set(range(len(self._frames)))
         self._selected_indices = all_indices - self._selected_indices
         self._refresh_badges()
-        self._summary.update_info(len(self._selected_indices), len(self._frames))
-        self.selection_changed.emit(sorted(self._selected_indices))
+        self._emit_selection()
 
     def _clear_selection(self) -> None:
         self._selected_indices.clear()
+        self._sel_anchor = None
         self._refresh_badges()
-        self._summary.update_info(0, len(self._frames))
-        self.selection_changed.emit([])
+        self._emit_selection()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
