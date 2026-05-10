@@ -7,6 +7,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout,
     QStackedWidget, QFileDialog, QMessageBox, QProgressDialog, QApplication,
+    QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -25,7 +26,6 @@ from openfcd.gui.preferences import get_prefs
 
 def _apply_optical_preset(project, preset: str) -> bool:
     """Update preset and keep preset-backed layer defaults consistent."""
-    from openfcd.geometry.optical import get_default_layers
 
     valid_presets = {"pattern_below_window", "immersed_pattern", "custom"}
     if preset not in valid_presets:
@@ -166,11 +166,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("OpenFCD")
         self.setWindowIcon(get_app_icon())
-        self.resize(1400, 900)
-        
         tokens.set_dark_mode(tokens.is_dark)
-        
         self._prefs = get_prefs()
+        self._apply_initial_geometry()
         self._session = SessionController(self)
         self._run_ctrl = RunController(self)
         # Run-result state (populated on Run completion; used for per-frame η preview)
@@ -187,6 +185,7 @@ class MainWindow(QMainWindow):
     def _setup_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
+        central.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -204,13 +203,13 @@ class MainWindow(QMainWindow):
         root.addWidget(self._toolbar)
 
         # ── Center splitter ──
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
 
         # Left: SimTree (280px)
         self._sim_tree = SimTree(self)
         self._sim_tree.populate()
-        splitter.addWidget(self._sim_tree)
+        self._main_splitter.addWidget(self._sim_tree)
 
         # Center: Stacked preview area
         center_col = QWidget()
@@ -247,14 +246,18 @@ class MainWindow(QMainWindow):
         self._center_stack.addWidget(self._scene_container)  # index 3
 
         center_layout.addWidget(self._center_stack, 1)
-        splitter.addWidget(center_col)
+        self._main_splitter.addWidget(center_col)
 
         # Right: PropertiesPanel
         self._properties = PropertiesPanel(self)
-        splitter.addWidget(self._properties)
+        self._main_splitter.addWidget(self._properties)
 
-        splitter.setSizes([280, 770, 350])
-        root.addWidget(splitter, 1)
+        self._main_splitter.setSizes([280, 770, 350])
+        ss = self._prefs.splitter_state
+        if ss:
+            from PyQt6.QtCore import QByteArray
+            self._main_splitter.restoreState(QByteArray(ss))
+        root.addWidget(self._main_splitter, 1)
 
         # Track loaded frames for slider/preview
         self._frames: list[Path] = []
@@ -346,7 +349,7 @@ class MainWindow(QMainWindow):
         if item is None:
             self._on_new()  # no selection → fall back to New Project
             return
-        from openfcd.gui.panels.sim_tree import ROLE_NODE_TYPE, NodeType
+        from openfcd.gui.panels.sim_tree import ROLE_NODE_TYPE
         node_type = item.data(0, ROLE_NODE_TYPE)
         if node_type in (NodeType.SCENE_ITEM, NodeType.SCENES):
             self._on_new_scene_requested("eta_map")
@@ -376,11 +379,16 @@ class MainWindow(QMainWindow):
                 "Please run a computation first.")
             return
 
+        proj = self._session.project if self._session.has_project else None
+        disabled = list(proj.data.disabled_frame_indices) if proj else []
+        disabled_set = set(disabled)
+        preselected = [i for i in range(len(self._frames)) if i not in disabled_set]
         dialog = FramePickerDialog(
             self,
             frames=self._frames,
             run_exists=run_exists,
-            preselected=list(range(len(self._frames))),
+            preselected=preselected,
+            disabled=disabled,
         )
         if dialog.exec() != FramePickerDialog.DialogCode.Accepted:
             return
@@ -389,7 +397,8 @@ class MainWindow(QMainWindow):
         if not indices:
             return
 
-        import uuid, datetime
+        import uuid
+        import datetime
         from openfcd.io.scene import SceneSpec, SceneType
         type_map = {"eta_map": SceneType.ETA_MAP, "profile": SceneType.PROFILE, "rms": SceneType.RMS}
         name_map = {"eta_map": "η Map", "profile": "Profile", "rms": "RMS"}
@@ -1054,6 +1063,56 @@ class MainWindow(QMainWindow):
                 f"color: {t.TEXT_MUTED}; font-size: 14px; padding: 40px;"
             )
 
+    # ── Geometry helpers ────────────────────────────────────────────
+    def _apply_initial_geometry(self) -> None:
+        """Restore saved geometry or size/center to 90 % of the available screen."""
+        from PyQt6.QtCore import QByteArray
+        from PyQt6.QtGui import QGuiApplication
+        geo = self._prefs.window_geometry
+        if geo:
+            ok = self.restoreGeometry(QByteArray(geo))
+            if ok:
+                self._clamp_to_available_screen()
+                ws = self._prefs.window_state
+                if ws:
+                    self.restoreState(QByteArray(ws))
+                return
+        # First launch or corrupt state — fit-to-screen and center.
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        target_w = min(1400, int(avail.width() * 0.9))
+        target_h = min(900, int(avail.height() * 0.9))
+        self.resize(target_w, target_h)
+        self.move(
+            avail.x() + (avail.width() - target_w) // 2,
+            avail.y() + (avail.height() - target_h) // 2,
+        )
+
+    def _clamp_to_available_screen(self) -> None:
+        """Ensure the window frame is fully within the current screen's available area."""
+        from PyQt6.QtGui import QGuiApplication
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        g = self.frameGeometry()
+        if avail.contains(g):
+            return
+        new_w = min(g.width(), avail.width())
+        new_h = min(g.height(), avail.height())
+        self.resize(new_w, new_h)
+        nx = max(avail.x(), min(g.x(), avail.right() - new_w))
+        ny = max(avail.y(), min(g.y(), avail.bottom() - new_h))
+        self.move(nx, ny)
+
+    def _save_window_state(self) -> None:
+        """Persist geometry, window state, and splitter state to prefs."""
+        try:
+            self._prefs.window_geometry = bytes(self.saveGeometry())
+            self._prefs.window_state = bytes(self.saveState())
+            if hasattr(self, "_main_splitter"):
+                self._prefs.splitter_state = bytes(self._main_splitter.saveState())
+        except Exception:
+            pass  # never block app close on a settings-write failure
+
     # ── Application Events ──────────────────────────────────────────
     def closeEvent(self, event) -> None:
         """Handle window close event, prompting if there are unsaved changes."""
@@ -1066,12 +1125,15 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.StandardButton.Save:
                 self._session.save()
+                self._save_window_state()
                 event.accept()
             elif reply == QMessageBox.StandardButton.Cancel:
                 event.ignore()
             else:
+                self._save_window_state()
                 event.accept()
         else:
+            self._save_window_state()
             event.accept()
 
     def _on_menu_requested(self, menu_name: str) -> None:
@@ -1143,7 +1205,6 @@ class MainWindow(QMainWindow):
         current = self._center_stack.currentWidget()
         if current is None:
             return
-        from PyQt6.QtGui import QPixmap
         pixmap = current.grab()
         if pixmap.save(path, "PNG"):
             self._status_bar.set_items(["Exported", Path(path).name])
@@ -1438,8 +1499,8 @@ class MainWindow(QMainWindow):
         ann_path = proj_path / "annotations" / "default.json"
         if ann_path.exists():
             from openfcd.io.annotation import load as load_annotation
-            ann = load_annotation(ann_path)
-            # TODO: populate AnnotationPanel ROI/Mask from ann
+            _ann = load_annotation(ann_path)
+            # TODO: populate AnnotationPanel ROI/Mask from _ann
 
     def _auto_build_reference(
         self,
@@ -1515,7 +1576,6 @@ class MainWindow(QMainWindow):
 
         # Also save annotation
         if self._session.project_path:
-            from openfcd.io.annotation import save as save_annotation
             ann_dir = self._session.project_path / "annotations"
             ann_dir.mkdir(exist_ok=True)
             # TODO: get annotation from AnnotationPanel once built
@@ -1852,8 +1912,9 @@ class MainWindow(QMainWindow):
             self._center_stack.setCurrentWidget(self._preview)
             self._preview.start_roi_mode()
             self._status_bar.set_items(["ROI mode", "Click and drag to draw region of interest"])
-        except Exception as e:
-            import traceback, logging
+        except Exception:
+            import traceback
+            import logging
             logging.error(f"ROI mode error: {traceback.format_exc()}")
             print(f"ROI mode error: {traceback.format_exc()}")
 
@@ -1863,8 +1924,9 @@ class MainWindow(QMainWindow):
             self._center_stack.setCurrentWidget(self._preview)
             self._preview.start_mask_mode()
             self._status_bar.set_items(["Mask mode", "Click FL → FR → BR → BL (4 points clockwise)"])
-        except Exception as e:
-            import traceback, logging
+        except Exception:
+            import traceback
+            import logging
             logging.error(f"Mask mode error: {traceback.format_exc()}")
             print(f"Mask mode error: {traceback.format_exc()}")
 
@@ -1974,7 +2036,6 @@ class MainWindow(QMainWindow):
 
     def _on_point_placed(self, idx: int, row: int, col: int) -> None:
         """A single annotation point was placed — update status bar."""
-        mode_labels = {0: "1/2", 1: "2/2"}  # ROI
         if idx < 4:
             mask_labels = {0: "FL 1/4", 1: "FR 2/4", 2: "BR 3/4", 3: "BL 4/4"}
             label = mask_labels.get(idx, f"{idx+1}")
