@@ -6,7 +6,7 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout,
-    QStackedWidget, QFileDialog, QMessageBox,
+    QStackedWidget, QFileDialog, QMessageBox, QProgressDialog, QApplication,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -121,15 +121,13 @@ class _SingleFrameWorker(QThread):
 
     def run(self) -> None:
         try:
-            from openfcd.cli.cmd_run import (
-                _build_geom_params,
-                _compute_single_frame,
-                _embed_eta_in_frame,
-                _resolve_reference,
-            )
-            from openfcd.core.mask import Box, Polygon
+            from openfcd.cli.cmd_run import _build_geom_params, _resolve_reference
             from openfcd.pipeline.base import CancelledError
-            from openfcd.pipeline.compute import load_gray
+            from openfcd.pipeline.frame import (
+                FrameInputsSnapshot,
+                build_frame_inputs,
+                compute_frame,
+            )
 
             geom = _build_geom_params(self._project)
             self.frame_progress.emit(2, "Loading reference…")
@@ -141,51 +139,22 @@ class _SingleFrameWorker(QThread):
                 self.reference_resolved.emit(ref_img)
             self.frame_progress.emit(8, "Loading frame…")
             self._cancel_token.check()
-            def_img = load_gray(self._frame_path)
 
-            if ref_img.shape != def_img.shape:
+            snapshot = FrameInputsSnapshot.from_session(
+                self._annotation, self._project, geom, ref_img
+            )
+            inputs = build_frame_inputs(snapshot, self._frame_path, fast_preview=True)
+            if inputs.def_img.shape != ref_img.shape:
                 self.frame_failed.emit(
-                    f"Shape mismatch: ref={ref_img.shape}, frame={def_img.shape}"
+                    f"Shape mismatch: ref={ref_img.shape}, frame={inputs.def_img.shape}"
                 )
                 return
-
-            roi_box = None
-            frame_poly = None
-            if self._annotation is not None:
-                roi = self._annotation.roi
-                if not roi.is_empty:
-                    roi_box = Box(
-                        row0=int(roi.y),
-                        col0=int(roi.x),
-                        height=int(roi.height),
-                        width=int(roi.width),
-                    )
-
-                polys = self._annotation.frame_polygons.get(self._frame_path.name, [])
-                if polys and polys[0].vertices:
-                    frame_poly = Polygon(
-                        [(float(v[0]), float(v[1])) for v in polys[0].vertices]
-                    )
-
-            computation = _compute_single_frame(
-                ref_img,
-                def_img,
-                geom,
-                self._project,
-                roi_box=roi_box,
-                robot_poly=frame_poly,
-                fast_preview=True,
+            result = compute_frame(
+                inputs,
                 progress_cb=lambda pct, lbl: self.frame_progress.emit(pct, lbl),
                 cancel=self._cancel_token,
             )
-            eta_mm = getattr(computation, "eta_mm", computation)
-            # η may be smaller than ref_img when scale normalization cropped
-            # (ref zoomed down to match def's carrier period).  Re-centre it
-            # inside the ROI (or the full frame if no ROI) to preserve alignment
-            # with the original pixel grid.
-            eta_overlay = _embed_eta_in_frame(eta_mm, ref_img.shape, roi_box)
-
-            self.frame_done.emit(eta_overlay, eta_mm)
+            self.frame_done.emit(result.eta_mm, result.eta_mm)
 
         except CancelledError:
             self.frame_failed.emit("Compute cancelled")
@@ -973,12 +942,50 @@ class MainWindow(QMainWindow):
     # ── Theme ───────────────────────────────────────────────────────
     def _apply_theme(self) -> None:
         t = tokens
+        t.apply_qt_palette()
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
                 background: {t.BG_PRIMARY};
                 color: {t.TEXT_PRIMARY};
                 font-family: {t.FONT_UI};
                 font-size: 13px;
+            }}
+            QLabel {{
+                background: transparent;
+            }}
+            QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
+            QComboBox, QListView, QTreeView, QTableView {{
+                background: {t.BG_TERTIARY};
+                color: {t.TEXT_PRIMARY};
+                border: 1px solid {t.BORDER_SUBTLE};
+                selection-background-color: {t.SELECTION_BG};
+                selection-color: {t.TEXT_PRIMARY};
+            }}
+            QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled,
+            QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
+                color: {t.TEXT_MUTED};
+                background: {t.BG_SECONDARY};
+            }}
+            QComboBox QAbstractItemView {{
+                background: {t.BG_TERTIARY};
+                color: {t.TEXT_PRIMARY};
+                selection-background-color: {t.SELECTION_BG};
+                selection-color: {t.TEXT_PRIMARY};
+            }}
+            QMenu {{
+                background-color: {t.BG_TERTIARY};
+                color: {t.TEXT_PRIMARY};
+                border: 1px solid {t.BORDER_SUBTLE};
+                padding: 4px;
+            }}
+            QMenu::item {{
+                background: transparent;
+                color: {t.TEXT_PRIMARY};
+                padding: 5px 22px;
+            }}
+            QMenu::item:selected {{
+                background-color: {t.SELECTION_BG};
+                color: {t.TEXT_PRIMARY};
             }}
             QSplitter::handle {{
                 background: {t.BORDER_SUBTLE};
@@ -1019,13 +1026,19 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
-                background-color: {tokens.BG_PRIMARY};
+                background-color: {tokens.BG_TERTIARY};
                 color: {tokens.TEXT_PRIMARY};
                 border: 1px solid {tokens.BORDER_SUBTLE};
+                padding: 4px;
+            }}
+            QMenu::item {{
+                background: transparent;
+                color: {tokens.TEXT_PRIMARY};
+                padding: 5px 22px;
             }}
             QMenu::item:selected {{
-                background-color: {tokens.ACCENT_CLAY};
-                color: white;
+                background-color: {tokens.SELECTION_BG};
+                color: {tokens.TEXT_PRIMARY};
             }}
         """)
 
@@ -1306,6 +1319,16 @@ class MainWindow(QMainWindow):
                 picker = ImagePickerDialog(self, frames=frames)
                 if picker.exec() == ImagePickerDialog.DialogCode.Accepted:
                     frames = picker.selected_frames
+                    if picker.auto_ref_enabled and frames:
+                        self._auto_build_reference(
+                            proj=proj,
+                            project_dir=proj_path,
+                            frames=frames,
+                            reducer=picker.auto_ref_reducer,
+                        )
+                        synth_ref = proj_path / "reference_built.jpg"
+                        if synth_ref.exists():
+                            frames = [synth_ref] + frames
 
             # Find ref index
             if proj.reference.source:
@@ -1361,6 +1384,72 @@ class MainWindow(QMainWindow):
             from openfcd.io.annotation import load as load_annotation
             ann = load_annotation(ann_path)
             # TODO: populate AnnotationPanel ROI/Mask from ann
+
+    def _auto_build_reference(
+        self,
+        proj: object,
+        project_dir: Path,
+        frames: list[Path],
+        reducer: str,
+    ) -> None:
+        """Build and persist a synthetic reference from the selected frames."""
+        from openfcd.core.reference_builder import build_reference_from_paths
+
+        if len(frames) < 5:
+            QMessageBox.warning(
+                self,
+                "Auto-reference",
+                f"Need >=5 frames for a stable mean; got {len(frames)}. "
+                "Continuing anyway.",
+            )
+        progress = QProgressDialog(
+            f"Building reference ({reducer} of {len(frames)} frames)...",
+            None,
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            ref_img = build_reference_from_paths(frames, reducer=reducer)  # type: ignore[arg-type]
+            out_npy = Path(project_dir) / "reference_built.npy"
+            out_jpg = Path(project_dir) / "reference_built.jpg"
+            np.save(out_npy, ref_img)
+            # Also write an 8-bit JPG so the SimTree can show a thumbnail and
+            # the filename-based ref-index lookup in _on_session_opened picks
+            # this entry up. _resolve_reference prefers the sibling .npy
+            # (full float precision) when both exist.
+            # load_gray() may return float64 in [0, 1] (for RGB inputs via
+            # rgb2gray) or [0, 255] (for grayscale JPG/PNG cast direct to
+            # float). Normalize so the saved JPG always uses the full 8-bit
+            # range without saturating to white.
+            from skimage.io import imsave as _imsave
+            import warnings as _warnings
+            arr = ref_img.astype(np.float64, copy=False)
+            arr_u8 = (
+                np.clip(arr * 255.0, 0.0, 255.0)
+                if float(arr.max(initial=0.0)) <= 1.0 + 1e-6
+                else np.clip(arr, 0.0, 255.0)
+            ).astype(np.uint8)
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                _imsave(str(out_jpg), arr_u8)
+            proj.reference.mode = "build"  # type: ignore[union-attr]
+            proj.reference.source = "reference_built.jpg"  # type: ignore[union-attr]
+            proj.reference.build_params = {  # type: ignore[union-attr]
+                "reducer": reducer,
+                "n": len(frames),
+                "stride": 1,
+                "explicit": True,
+            }
+            self._session.save()
+            self._status_bar.set_items([
+                f"Auto-built reference: {reducer} of {len(frames)} frames",
+            ])
+        finally:
+            progress.close()
 
     def _on_session_dirty(self) -> None:
         self._title_bar.is_dirty = self._session.is_dirty
@@ -1576,6 +1665,8 @@ class MainWindow(QMainWindow):
             return
 
         overlap = self._toolbar.overlap_on() if hasattr(self._toolbar, "overlap_on") else True
+        if hasattr(self._toolbar, "colorbar_on") and hasattr(self._preview, "set_colorbar"):
+            self._preview.set_colorbar(self._toolbar.colorbar_on())
         self._preview.show_eta_overlay(np.asarray(eta), show_overlap=overlap)
 
     def _on_run_failed(self, error: str) -> None:
@@ -1695,6 +1786,7 @@ class MainWindow(QMainWindow):
             workers=workers,
             disabled_indices=self._sim_tree.disabled_indices,
             frame_paths=tuple(self._frames),
+            session_controller=self._session,
         )
 
     # ── Annotation handlers ────────────────────────────────────────

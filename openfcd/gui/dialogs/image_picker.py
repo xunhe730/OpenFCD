@@ -6,7 +6,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QFontMetrics
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QCheckBox, QComboBox, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QScrollArea, QWidget, QGridLayout, QInputDialog,
 )
 
@@ -222,6 +222,25 @@ class ImagePickerDialog(QDialog):
         self._count_lbl = QLabel()
         layout.addWidget(self._count_lbl)
 
+        # Auto-reference row
+        ref_row = QHBoxLayout()
+        self._auto_ref_cb = QCheckBox("Auto-build reference from selection")
+        self._auto_ref_cb.setChecked(True)
+        self._auto_ref_cb.setToolTip(
+            "Compute a temporal mean/median of the selected frames and use it as the "
+            "project reference image. Recommended when no dedicated ref shot exists or "
+            "when ref/work illumination drift is suspected."
+        )
+        ref_row.addWidget(self._auto_ref_cb)
+        ref_row.addWidget(QLabel("reducer:"))
+        self._reducer_cb = QComboBox()
+        self._reducer_cb.addItems(["mean", "median"])
+        self._reducer_cb.setCurrentText("mean")
+        ref_row.addWidget(self._reducer_cb)
+        self._auto_ref_cb.toggled.connect(self._reducer_cb.setEnabled)
+        ref_row.addStretch()
+        layout.addLayout(ref_row)
+
         # OK / Cancel buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -287,6 +306,16 @@ class ImagePickerDialog(QDialog):
     def selected_frames(self) -> list[Path]:
         """Return list of checked frame paths."""
         return [self._frames[i] for i in self.selected_indices()]
+
+    @property
+    def auto_ref_enabled(self) -> bool:
+        """Return whether the auto-build reference checkbox is checked."""
+        return self._auto_ref_cb.isChecked()
+
+    @property
+    def auto_ref_reducer(self) -> str:
+        """Return the selected reducer ('mean' or 'median')."""
+        return self._reducer_cb.currentText()
 
     def closeEvent(self, event) -> None:
         if self._worker is not None:
