@@ -380,15 +380,23 @@ class MainWindow(QMainWindow):
             return
 
         proj = self._session.project if self._session.has_project else None
-        disabled = list(proj.data.disabled_frame_indices) if proj else []
-        disabled_set = set(disabled)
-        preselected = [i for i in range(len(self._frames)) if i not in disabled_set]
+        excluded = set(proj.data.disabled_frame_indices) if proj else set()
+        # The reference frame produces zero η by construction (it IS the
+        # reference), and may not even be present in the run's results.h5.
+        # Always exclude it from scene selection so the slider does not show
+        # a phantom noise frame.
+        if proj and proj.reference.source:
+            for i, f in enumerate(self._frames):
+                if f.name == proj.reference.source:
+                    excluded.add(i)
+                    break
+        preselected = [i for i in range(len(self._frames)) if i not in excluded]
         dialog = FramePickerDialog(
             self,
             frames=self._frames,
             run_exists=run_exists,
             preselected=preselected,
-            disabled=disabled,
+            disabled=sorted(excluded),
         )
         if dialog.exec() != FramePickerDialog.DialogCode.Accepted:
             return
