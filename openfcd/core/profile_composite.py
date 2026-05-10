@@ -727,10 +727,29 @@ def _layout_rects(
     else:
         cbar_y = 0.0
         profile_y = top_y - gap_frac - profile_height_frac
+
+    # Pre-align with aspect='equal': if the assigned rect is wider than the
+    # equal-aspect map can fill given top_height_frac, matplotlib's
+    # adjustable='box' would shrink ax_map horizontally and leave ax_profile
+    # at the full rect width — breaking shared-x alignment. Compute the
+    # effective width the map will actually occupy and apply the same width
+    # (centered) to map+cbar+profile so all three axes share x0 and width.
+    rect_w_in = fig_width * width_frac
+    rect_h_in = fig_height * top_height_frac
+    if rect_h_in > 0 and y_span > 0:
+        equal_aspect_w_in = rect_h_in * (x_span / y_span)
+        effective_w_in = min(rect_w_in, equal_aspect_w_in)
+    else:
+        effective_w_in = rect_w_in
+    effective_w_frac = effective_w_in / max(fig_width, 1e-9)
+    left_frac = PROFILE_MARGIN_LEFT + (width_frac - effective_w_frac) / 2.0
+
+    cbar_w_frac = effective_w_frac * 0.40
+    cbar_left_frac = left_frac + (effective_w_frac - cbar_w_frac) / 2.0
     return {
-        "map": [PROFILE_MARGIN_LEFT, top_y, width_frac, top_height_frac],
-        "cbar": [PROFILE_MARGIN_LEFT + width_frac * 0.20, cbar_y, width_frac * 0.40, cbar_height_frac],
-        "profile": [PROFILE_MARGIN_LEFT, profile_y, width_frac, profile_height_frac],
+        "map": [left_frac, top_y, effective_w_frac, top_height_frac],
+        "cbar": [cbar_left_frac, cbar_y, cbar_w_frac, cbar_height_frac],
+        "profile": [left_frac, profile_y, effective_w_frac, profile_height_frac],
     }
 
 
