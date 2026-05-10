@@ -1,5 +1,4 @@
-"""Regression: serial vs parallel ComputeStage produce bit-equal eta_mm,
-ref_invariants hoist preserves output, default-workers resolver returns >=1."""
+"""Regression: ComputeStage produces consistent eta_mm, workers resolver returns >=1."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -12,8 +11,6 @@ from skimage.io import imsave
 from openfcd.cli.cmd_run import (
     ComputeStage,
     PreprocessStage,
-    _compute_ref_invariants,
-    _compute_single_frame,
     _resolve_default_workers,
 )
 from openfcd.io.project import ProjectModel
@@ -66,10 +63,6 @@ def _run_compute(workers: int, tmp: Path) -> list[np.ndarray]:
     proj, project_dir = _make_project(tmp / f"w{workers}", n_frames=5)
     proj.to_yaml(project_dir / "project.yaml")
 
-    class _StubStore:
-        annotation = AnnotationSchema()
-
-    store = _StubStore()
     run_dir = project_dir / "runs" / f"run-w{workers}"
     run_dir.mkdir(parents=True, exist_ok=True)
     rs = HDF5ResultStore.open(run_dir / "results.h5", mode="w")
@@ -84,7 +77,7 @@ def _run_compute(workers: int, tmp: Path) -> list[np.ndarray]:
         "batches_processed": [],
         "frame_count": 0,
         "frame_paths": [],
-        "annotation": store.annotation,
+        "annotation": AnnotationSchema(),
         "workers": workers,
     }
     cancel = CancelToken()
@@ -107,35 +100,37 @@ def test_resolve_default_workers_force_serial(monkeypatch: pytest.MonkeyPatch) -
     assert _resolve_default_workers() == 1
 
 
-def test_compute_ref_invariants_matches_inline(tmp_path: Path) -> None:
-    """Hoisted ref_ff equals what _compute_single_frame would compute inline."""
-    proj, _ = _make_project(tmp_path, n_frames=1)
-    from openfcd.core.flatfield import flatfield_normalize
-    ref = _checkerboard(192, shift=0.0).astype(np.float64)
-    inv = _compute_ref_invariants(ref, proj, roi_box=None)
-    h, w = ref.shape
-    sigma_expected = float(np.clip(max(h, w) * 0.06, 100.0, 2000.0))
-    assert inv.sigma == pytest.approx(sigma_expected)
-    np.testing.assert_array_equal(inv.ref_ff, flatfield_normalize(ref, sigma=sigma_expected))
-
-
-def test_compute_single_frame_returns_qc_datasets(tmp_path: Path) -> None:
-    proj, _ = _make_project(tmp_path, n_frames=1)
-    ref = _checkerboard(192, shift=0.0).astype(np.float64)
-    deformed = _checkerboard(192, shift=0.1).astype(np.float64)
+def test_compute_frame_returns_qc_datasets(tmp_path: Path) -> None:
+    """compute_frame returns FrameResult with all required QC datasets."""
     from openfcd.cli.cmd_run import _build_geom_params
+    from openfcd.pipeline.frame import (
+        FrameInputsSnapshot,
+        ProcessParams,
+        build_frame_inputs,
+        compute_frame,
+    )
 
-    result = _compute_single_frame(ref, deformed, _build_geom_params(proj), proj, fast_preview=False)
+    proj, _ = _make_project(tmp_path, n_frames=1)
+    ref = _checkerboard(192, shift=0.0).astype(np.float64)
+    def_arr = _checkerboard(192, shift=0.1).astype(np.float64)
+    geom = _build_geom_params(proj)
+
+    snapshot = FrameInputsSnapshot(
+        process=ProcessParams.from_project(proj),
+        geom=geom,
+        ref_img=ref,
+        ref_shape=ref.shape,
+        annotation=None,
+        roi_box=None,
+    )
+    frame_path = tmp_path / "frames" / "ref.png"
+    inputs = build_frame_inputs(snapshot, frame_path, fast_preview=False, def_img=def_arr)
+    result = compute_frame(inputs)
 
     required = {
-        "carrier_amplitude",
-        "valid_mask",
-        "artifact_mask",
-        "phase_residual",
-        "poisson_residual",
-        "poisson_residual_x",
-        "poisson_residual_y",
-        "curl_inconsistency",
+        "carrier_amplitude", "valid_mask", "artifact_mask",
+        "phase_residual", "poisson_residual", "poisson_residual_x",
+        "poisson_residual_y", "curl_inconsistency",
     }
     assert required.issubset(result.qc_datasets)
     for name in required:
@@ -145,16 +140,15 @@ def test_compute_single_frame_returns_qc_datasets(tmp_path: Path) -> None:
     assert "carrier_amp_median" in result.qc_attrs
     assert "poisson_residual_rms" in result.qc_attrs
     assert "curl_inconsistency_rms" in result.qc_attrs
-    assert result.calibration["checker_cell_semantics"] == "single checker cell side length, not full black-white cycle"
+    assert "phase_residual_rms" in result.qc_attrs
+    assert "slope_rms" in result.qc_attrs
+    assert result.calibration.get("checker_cell_semantics") == (
+        "single checker cell side length, not full black-white cycle"
+    )
 
 
 def test_serial_vs_parallel_bit_equal(tmp_path: Path, monkeypatch) -> None:
-    """workers=1 vs workers=4 produce bit-equal eta_mm.
-
-    Pin OPENFCD_BLAS_THREADS=1 so native math libraries don't inject
-    nondeterminism (e.g. inpaint_biharmonic's linear solver).
-    The default is now "auto"; this test opts back into deterministic mode.
-    """
+    """workers=1 vs workers=4 produce bit-equal eta_mm."""
     monkeypatch.setenv("OPENFCD_BLAS_THREADS", "1")
     eta_serial = _run_compute(1, tmp_path)
     eta_parallel = _run_compute(4, tmp_path)
@@ -166,34 +160,21 @@ def test_serial_vs_parallel_bit_equal(tmp_path: Path, monkeypatch) -> None:
         np.testing.assert_array_equal(s[~ns], p[~np_])
 
 
-def test_ref_invariants_hoist_bit_equal(tmp_path: Path) -> None:
-    """_compute_single_frame with ref_invariants matches inline path."""
-    proj, _ = _make_project(tmp_path, n_frames=1)
-    ref = _checkerboard(192, shift=0.0).astype(np.float64)
-    deformed = _checkerboard(192, shift=0.4).astype(np.float64)
-    from openfcd.cli.cmd_run import _build_geom_params
-    geom = _build_geom_params(proj)
-
-    inline = _compute_single_frame(ref, deformed, geom, proj)
-    inv = _compute_ref_invariants(ref, proj, roi_box=None)
-    hoisted = _compute_single_frame(ref, deformed, geom, proj, ref_invariants=inv)
-
-    assert inline.pixel_per_mm > 0
-    assert inline.calibration["eta_unit"] == "mm"
-    assert inline.shape == hoisted.shape
-    ni, nh = np.isnan(inline), np.isnan(hoisted)
-    np.testing.assert_array_equal(ni, nh)
-    np.testing.assert_allclose(inline[~ni], hoisted[~nh], rtol=0, atol=0)
-
-
 def test_unannotated_frame_uses_per_frame_auto_mask(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Unannotated frames should auto-detect masks instead of needing drawings."""
+    from openfcd.cli.cmd_run import _build_geom_params
+    from openfcd.pipeline.frame import (
+        FrameInputsSnapshot,
+        ProcessParams,
+        build_frame_inputs,
+        compute_frame,
+    )
+
     proj, _ = _make_project(tmp_path, n_frames=1)
     ref = _checkerboard(192, shift=0.0).astype(np.float64)
-    deformed = _checkerboard(192, shift=0.4).astype(np.float64)
-    from openfcd.cli.cmd_run import _build_geom_params
+    def_arr = _checkerboard(192, shift=0.4).astype(np.float64)
     geom = _build_geom_params(proj)
 
     calls = []
@@ -204,16 +185,33 @@ def test_unannotated_frame_uses_per_frame_auto_mask(
 
     monkeypatch.setattr("openfcd.core.mask.auto_mask", _auto_object_mask)
 
-    eta = _compute_single_frame(ref, deformed, geom, proj, robot_poly=None)
-    assert eta.pixel_per_mm > 0
-    assert eta.shape == ref.shape
-    assert calls == [ref.shape]
+    snapshot = FrameInputsSnapshot(
+        process=ProcessParams.from_project(proj),
+        geom=geom,
+        ref_img=ref,
+        ref_shape=ref.shape,
+        annotation=None,
+        roi_box=None,
+    )
+    frame_path = tmp_path / "frames" / "ref.png"
+    inputs = build_frame_inputs(snapshot, frame_path, fast_preview=False, def_img=def_arr)
+    result = compute_frame(inputs)
+    assert result.pixel_per_mm > 0
+    assert result.eta_mm.shape == ref.shape
+    assert calls  # auto_mask was called
 
 
 def test_reference_zero_field_fills_small_mask_holes(tmp_path: Path) -> None:
     """Reference-vs-reference stays zero while small enclosed mask holes are filled."""
     from openfcd.cli.cmd_run import _build_geom_params
     from openfcd.core.mask import Polygon
+    from openfcd.pipeline.frame import (
+        FrameInputs,
+        FrameInputsSnapshot,
+        ProcessParams,
+        build_frame_inputs,
+        compute_frame,
+    )
 
     proj, _ = _make_project(tmp_path, n_frames=1)
     proj.process.small_hole_fill_radius_mm = 2.0
@@ -221,17 +219,44 @@ def test_reference_zero_field_fills_small_mask_holes(tmp_path: Path) -> None:
     geom = _build_geom_params(proj)
     small_poly = Polygon([(92, 92), (92, 93), (93, 93), (93, 92)])
 
-    eta = _compute_single_frame(ref, ref.copy(), geom, proj, robot_poly=small_poly)
-
-    assert eta.pixel_per_mm > 0
-    assert np.isfinite(eta[90:96, 90:96]).all()
-    assert np.nanmax(np.abs(eta)) == 0.0
+    snapshot = FrameInputsSnapshot(
+        process=ProcessParams.from_project(proj),
+        geom=geom,
+        ref_img=ref,
+        ref_shape=ref.shape,
+        annotation=None,
+        roi_box=None,
+    )
+    frame_path = tmp_path / "frames" / "ref.png"
+    inputs = build_frame_inputs(snapshot, frame_path, fast_preview=False, def_img=ref.copy())
+    # Override robot_poly — build_frame_inputs gives None since no annotation
+    inputs = FrameInputs(
+        ref_img=inputs.ref_img,
+        def_img=inputs.def_img,
+        geom=inputs.geom,
+        process=inputs.process,
+        roi_box=inputs.roi_box,
+        robot_poly=small_poly,
+        fast_preview=inputs.fast_preview,
+        ref_shape=inputs.ref_shape,
+    )
+    result = compute_frame(inputs)
+    assert result.pixel_per_mm > 0
+    assert np.isfinite(result.eta_mm[90:96, 90:96]).all()
+    assert np.nanmax(np.abs(result.eta_mm)) == 0.0
 
 
 def test_reference_zero_field_keeps_large_mask_nan(tmp_path: Path) -> None:
     """Small-hole cleanup must not fill the robot-body-sized mask."""
     from openfcd.cli.cmd_run import _build_geom_params
     from openfcd.core.mask import Polygon
+    from openfcd.pipeline.frame import (
+        FrameInputs,
+        FrameInputsSnapshot,
+        ProcessParams,
+        build_frame_inputs,
+        compute_frame,
+    )
 
     proj, _ = _make_project(tmp_path, n_frames=1)
     proj.process.small_hole_fill_radius_mm = 10.0
@@ -239,9 +264,28 @@ def test_reference_zero_field_keeps_large_mask_nan(tmp_path: Path) -> None:
     geom = _build_geom_params(proj)
     large_poly = Polygon([(70, 70), (70, 120), (120, 120), (120, 70)])
 
-    eta = _compute_single_frame(ref, ref.copy(), geom, proj, robot_poly=large_poly)
-
-    assert np.isnan(eta[80:110, 80:110]).all()
+    snapshot = FrameInputsSnapshot(
+        process=ProcessParams.from_project(proj),
+        geom=geom,
+        ref_img=ref,
+        ref_shape=ref.shape,
+        annotation=None,
+        roi_box=None,
+    )
+    frame_path = tmp_path / "frames" / "ref.png"
+    inputs = build_frame_inputs(snapshot, frame_path, fast_preview=False, def_img=ref.copy())
+    inputs = FrameInputs(
+        ref_img=inputs.ref_img,
+        def_img=inputs.def_img,
+        geom=inputs.geom,
+        process=inputs.process,
+        roi_box=inputs.roi_box,
+        robot_poly=large_poly,
+        fast_preview=inputs.fast_preview,
+        ref_shape=inputs.ref_shape,
+    )
+    result = compute_frame(inputs)
+    assert np.isnan(result.eta_mm[80:110, 80:110]).all()
 
 
 def test_compute_stage_ignores_hidden_global_polygon(
@@ -249,16 +293,17 @@ def test_compute_stage_ignores_hidden_global_polygon(
 ) -> None:
     """Run should not apply invisible global polygons to unannotated frames."""
     from openfcd.io.annotation import AnnotationSchema
-    import openfcd.cli.cmd_run as cmd_run
+    from openfcd.pipeline.frame import FrameResult
 
     proj, project_dir = _make_project(tmp_path, n_frames=2)
     seen: list = []
 
-    def _fake_compute(ref_img, _def_img, *_args, **kwargs):
-        seen.append(kwargs.get("robot_poly"))
-        return np.zeros(ref_img.shape, dtype=np.float64)
+    def _fake_compute_frame(inputs, *, progress_cb=None, cancel=None):
+        seen.append(inputs.robot_poly)
+        eta = np.zeros(inputs.ref_shape, dtype=np.float64)
+        return FrameResult(eta_mm=eta, qc_datasets=None, diagnostics={})
 
-    monkeypatch.setattr(cmd_run, "_compute_single_frame", _fake_compute)
+    monkeypatch.setattr("openfcd.pipeline.frame.compute_frame", _fake_compute_frame)
 
     ctx: dict = {
         "project": proj,

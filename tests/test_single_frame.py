@@ -98,6 +98,7 @@ class TestSingleFrameWorker:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Global polygons are not applied to frames with no visible per-frame mask."""
+        from openfcd.pipeline.frame import FrameResult
         app = QCoreApplication.instance() or QCoreApplication([])
 
         proj, project_dir, frame_path = _make_mock_project()
@@ -109,11 +110,12 @@ class TestSingleFrameWorker:
         )
         seen: list = []
 
-        def _fake_compute(ref_img, _def_img, *_args, **kwargs):
-            seen.append(kwargs.get("robot_poly"))
-            return np.zeros(ref_img.shape, dtype=np.float64)
+        def _fake_compute_frame(inputs, *, progress_cb=None, cancel=None):
+            seen.append(inputs.robot_poly)
+            eta = np.zeros(inputs.ref_shape, dtype=np.float64)
+            return FrameResult(eta_mm=eta, qc_datasets=None, diagnostics={})
 
-        monkeypatch.setattr("openfcd.cli.cmd_run._compute_single_frame", _fake_compute)
+        monkeypatch.setattr("openfcd.pipeline.frame.compute_frame", _fake_compute_frame)
 
         worker = _SingleFrameWorker(
             project=proj,
@@ -168,13 +170,13 @@ class TestSingleFrameWorker:
         ann = _make_annotation()
         seen_cancel = []
 
-        def _fake_compute(*_args, **kwargs):
-            cancel = kwargs["cancel"]
+        def _fake_compute_frame(inputs, *, progress_cb=None, cancel=None):
             seen_cancel.append(cancel)
-            cancel.cancel()
-            cancel.check()
+            if cancel is not None:
+                cancel.cancel()
+                cancel.check()
 
-        monkeypatch.setattr("openfcd.cli.cmd_run._compute_single_frame", _fake_compute)
+        monkeypatch.setattr("openfcd.pipeline.frame.compute_frame", _fake_compute_frame)
 
         worker = _SingleFrameWorker(
             project=proj,
@@ -241,7 +243,7 @@ class TestSingleFrameWorker:
         assert len(results) == 1, "Worker should have completed successfully"
 
     def test_single_frame_worker_applies_roi_annotation(self) -> None:
-        """ROI annotation should crop the single-frame preview the same way as batch compute."""
+        """ROI annotation crops compute; result is embedded back in ref_shape for both signals."""
         app = QCoreApplication.instance() or QCoreApplication([])
 
         proj, project_dir, frame_path = _make_mock_project()
@@ -264,8 +266,10 @@ class TestSingleFrameWorker:
         assert len(errors) == 0, f"Unexpected worker failure: {errors}"
         assert len(results) == 1
         eta_overlay, eta_mm = results[0]
+        # Both signals now carry the full ref_shape-embedded array (new API invariant).
         assert eta_overlay.shape == (128, 128)
-        assert eta_mm.shape == (30, 40)
+        assert eta_mm.shape == (128, 128)
+        # ROI region should have some finite values; outside should be NaN.
         assert np.isfinite(eta_overlay[20:50, 12:52]).any()
         assert np.isnan(eta_overlay[:10, :10]).all()
 
@@ -314,9 +318,14 @@ class TestSingleFrameWorker:
         ref_path = Path(proj.data.frames_dir) / "ref.png"
 
         from skimage.io import imread, imsave
-        arr = imread(str(frame_path)).astype(np.uint8)
-        arr[20:110, 60:63] = 0
-        imsave(str(frame_path), arr)
+        # Paint the same wire on both reference and deformed frames — physical
+        # filaments are static occluders present in both. The detector now
+        # runs on the reference image (frame.py), so a wire only on the
+        # deformed frame would no longer be auto-masked.
+        for path in (ref_path, frame_path):
+            arr = imread(str(path)).astype(np.uint8)
+            arr[20:110, 60:63] = 0
+            imsave(str(path), arr)
 
         ann = _make_annotation()
         worker = _SingleFrameWorker(
