@@ -81,6 +81,14 @@ openfcd new myproject --image-folder /path/to/frames --pattern 'Img*.jpg'
 openfcd run myproject.ofcd
 
 # Results land under myproject.ofcd/runs/{timestamp}/results.h5
+
+# Render QC panels for a frame or for all frames in a run
+openfcd qc-summary myproject.ofcd --run run-YYYYMMDD-HHMMSS --frame 0 -o qc.png
+openfcd qc-summary myproject.ofcd --run run-YYYYMMDD-HHMMSS --all --output-dir qc/
+
+# Estimate flat-water noise floor and calibration sensitivity
+openfcd noise-floor myproject.ofcd --from-run run-YYYYMMDD-HHMMSS -o noise_floor.json
+openfcd sensitivity myproject.ofcd --run run-YYYYMMDD-HHMMSS --frame 0 -o sensitivity.json
 ```
 
 ## Algorithm notes
@@ -110,6 +118,14 @@ pattern seen through the water surface. The algorithm steps:
 meaning is `checker_cell_mm`: the side length of one single checkerboard cell,
 not the full black-white cycle. The carrier calibration assumes
 `|k_phys| = π√2 / checker_cell_mm`.
+
+Each computed frame stores a QC verdict (`PASS`, `WARN`, or `FAIL`) plus the
+stats and QC maps used to reach it. The default warning/fail thresholds are
+kept under `project.qc`: saturated ratio 0.001, invalid ratio 0.20,
+carrier amplitude median minimum 1e-6, normalized Poisson/curl residual
+warning 0.10 and fail 0.20, and phase warning at 0.7π / fail at 0.9π. These
+are conservative starting points and should be calibrated against flat-water
+data for each optical setup.
 
 Physical correctness depends on the reference frame. Best results come from
 a flat-water reference captured in the same acquisition session as the
