@@ -1295,10 +1295,27 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         save_act = menu.addAction("Save", self._session.save)
         save_act.setEnabled(self._session.has_project)
+        reimport_act = menu.addAction("Re-import Frames...", self._on_reimport_frames)
+        reimport_act.setEnabled(self._session.has_project)
         export_act = menu.addAction("Export Current View as PNG…", self._export_current_view_png)
         export_act.setEnabled(self._center_stack.currentIndex() > 0)
         menu.addSeparator()
         menu.addAction("Exit", self.close)
+
+    def _on_reimport_frames(self) -> None:
+        """Re-open ImagePickerDialog to re-import frames (escape hatch)."""
+        if self._run_ctrl.is_running:
+            QMessageBox.warning(
+                self, "Run in Progress",
+                "Cannot re-import frames while a run is active.",
+            )
+            return
+        if not self._session.has_project or not self._session.project_path:
+            return
+        proj = self._session.project
+        if proj:
+            proj.reference.source = ""
+        self._on_session_opened(str(self._session.project_path))
 
     def _populate_recent_projects_menu(self, recent_menu) -> None:
         recents = self._prefs.recent_projects
@@ -1441,7 +1458,8 @@ class MainWindow(QMainWindow):
             frames = scan_frames(proj.data.frames_dir, proj.data.pattern)
 
             # Show image picker to let user filter frames before import.
-            if frames:
+            # Skip if reference.source is already set — project was previously imported.
+            if frames and not proj.reference.source:
                 from openfcd.gui.dialogs.image_picker import ImagePickerDialog
                 picker = ImagePickerDialog(self, frames=frames)
                 if picker.exec() == ImagePickerDialog.DialogCode.Accepted:
@@ -1505,12 +1523,39 @@ class MainWindow(QMainWindow):
             "Optical defaults repaired" if repaired else "",
         ])
 
-        # Load annotation if exists
+        # Load annotation if exists and populate AnnotationPanel
         ann_path = proj_path / "annotations" / "default.json"
         if ann_path.exists():
             from openfcd.io.annotation import load as load_annotation
             _ann = load_annotation(ann_path)
-            # TODO: populate AnnotationPanel ROI/Mask from _ann
+            roi = _ann.roi
+            panel = self._properties.image_properties_panel
+            if not roi.is_empty:
+                panel.set_roi(int(roi.x), int(roi.y), int(roi.width), int(roi.height))
+                self._preview.show_roi(int(roi.y), int(roi.x), int(roi.height), int(roi.width))
+            else:
+                panel.set_roi(0, 0, 0, 0)
+            total_masks = len(_ann.polygons) + sum(
+                len(v) for v in _ann.frame_polygons.values()
+            )
+            if total_masks > 0:
+                panel.set_mask_status(
+                    f"{total_masks} mask{'s' if total_masks != 1 else ''} defined"
+                )
+            else:
+                panel.set_mask_status("No masks")
+
+        # Step 3: Auto-restore eta from last completed run
+        last_run_id = self._session.last_run_id
+        if last_run_id and self._session.project_path:
+            results_path = self._session.project_path / "runs" / last_run_id / "results.h5"
+            if results_path.exists():
+                self._load_run_results(last_run_id)
+            else:
+                # Self-heal: stale last_run_id — clear and persist
+                if self._session.store:
+                    self._session.store.last_run_id = None
+                self._session.save()
 
     def _auto_build_reference(
         self,
@@ -1641,30 +1686,18 @@ class MainWindow(QMainWindow):
                 result[spec.id] = missing
         return result
 
-    def _on_run_finished(self, _run_id: str) -> None:
-        self._toolbar.set_running(False)
-        self._status_bar.hide_progress()
+    def _load_run_results(self, run_id: str) -> None:
+        """Load eta results from a completed run's results.h5 into GUI state.
 
-        # Refresh all scenes to use the new run
-        self._session.refresh_scenes(_run_id)
-        # Invalidate RMS view caches (force recompute with new data)
-        if hasattr(self, "_scene_container"):
-            self._scene_container._rms_view._cached_spec_id = None
-            self._scene_container._rms_view._cached_rms = None
-        # Re-populate SimTree scene nodes with updated specs + badges
-        missing_counts = self._compute_missing_counts(_run_id)
-        self._sim_tree.populate_scenes(self._session.scenes, missing_counts)
-        n_scenes = len(self._session.scenes)
-        if n_scenes > 0:
-            self._status_bar.set_items(["Ready", "Computation complete", f"{n_scenes} scenes refreshed"])
-        else:
-            self._status_bar.set_items(["Ready", "Computation complete"])
-
+        Sets _run_eta_frames, _run_eta_mean, and _frame_eta_cache.
+        Updates the preview widget if results loaded successfully.
+        Safe to call from both _on_run_finished and _on_session_opened.
+        """
         if not self._session.project_path:
             return
 
         from openfcd.io.result import HDF5ResultStore
-        results_path = self._session.project_path / "runs" / _run_id / "results.h5"
+        results_path = self._session.project_path / "runs" / run_id / "results.h5"
         if not results_path.exists():
             return
 
@@ -1708,10 +1741,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            matched = [
-                eta_by_name.get(f.name)
-                for f in self._frames
-            ]
+            matched = [eta_by_name.get(f.name) for f in self._frames]
             valid = [a for a in matched if a is not None]
             if valid:
                 shape = valid[0].shape
@@ -1736,12 +1766,37 @@ class MainWindow(QMainWindow):
         # Display in the preview widget.
         if self._run_eta_frames is not None:
             self._center_stack.setCurrentWidget(self._preview)
-            self._preview.set_preview_toggle_visible(self._run_eta_frames is not None)
+            self._preview.set_preview_toggle_visible(True)
             self._preview.set_preview_mode(True)
             self._toolbar.set_preview_available(True)
             self._toolbar.set_preview_on(True)
-            self._status_bar.set_items(["Run done", "Preview: ON"])
             self._reapply_run_eta()
+
+    def _on_run_finished(self, _run_id: str) -> None:
+        self._toolbar.set_running(False)
+        self._status_bar.hide_progress()
+
+        # Refresh all scenes to use the new run
+        self._session.refresh_scenes(_run_id)
+        # Invalidate RMS view caches (force recompute with new data)
+        if hasattr(self, "_scene_container"):
+            self._scene_container._rms_view._cached_spec_id = None
+            self._scene_container._rms_view._cached_rms = None
+        # Re-populate SimTree scene nodes with updated specs + badges
+        missing_counts = self._compute_missing_counts(_run_id)
+        self._sim_tree.populate_scenes(self._session.scenes, missing_counts)
+        n_scenes = len(self._session.scenes)
+        if n_scenes > 0:
+            self._status_bar.set_items(["Ready", "Computation complete", f"{n_scenes} scenes refreshed"])
+        else:
+            self._status_bar.set_items(["Ready", "Computation complete"])
+
+        if not self._session.project_path:
+            return
+
+        self._load_run_results(_run_id)
+        if self._run_eta_frames is not None:
+            self._status_bar.set_items(["Run done", "Preview: ON"])
 
         # Show "N scenes refreshed" for 3 seconds then restore to "Ready"
         from PyQt6.QtCore import QTimer
@@ -1841,6 +1896,25 @@ class MainWindow(QMainWindow):
         from openfcd.gui.dialogs.new_project_wizard import NewProjectWizard
         wizard = NewProjectWizard(self, prefs=self._prefs)
         if wizard.exec() == NewProjectWizard.DialogCode.Accepted:
+            target_dir = Path(wizard.project_location) / f"{wizard.project_name}.ofcd"
+            if target_dir.exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Project Exists",
+                    f"项目已存在：\n{target_dir}\n\n是否覆盖现有项目？此操作将删除该目录下的所有内容。\n\n"
+                    f"Project already exists at:\n{target_dir}\n\nReplace it? "
+                    f"All contents of that directory will be deleted.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                try:
+                    import shutil
+                    shutil.rmtree(target_dir)
+                except Exception as err:
+                    QMessageBox.warning(self, "Replace Failed", str(err))
+                    return
             try:
                 project_dir = self._session.new_project(
                     name=wizard.project_name,

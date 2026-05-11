@@ -86,6 +86,16 @@ class SessionController(QObject):
     def annotation(self) -> AnnotationSchema | None:
         return self._store.annotation if self._store else None
 
+    @property
+    def last_run_id(self) -> str | None:
+        return self._store._last_run_id if self._store else None
+
+    @last_run_id.setter
+    def last_run_id(self, value: str | None) -> None:
+        if self._store is not None:
+            self._store._last_run_id = value
+            self.mark_dirty()
+
     # ── lifecycle ───────────────────────────────────────────────────
     def new_project(
         self,

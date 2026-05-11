@@ -31,6 +31,13 @@ rough edges. Contributions welcome.
   `annotations/default.json`.
 - **HDF5 results** with SWMR so scripts can tail the output while a run is in
   progress.
+- **Session resume on re-open** — re-opening a previously-computed `.ofcd`
+  lands directly on the last saved state: frames are filtered, reference is
+  set, the most recent run's η overlay is restored, and the annotation
+  ROI/mask is populated. Stale `last_run_id` self-heals when the result
+  file is missing. Use *File → Re-import Frames…* to re-run the import flow
+  (blocked while a run is active).
+- **Window/splitter geometry persisted** across sessions via `QSettings`.
 
 ## Installation
 
