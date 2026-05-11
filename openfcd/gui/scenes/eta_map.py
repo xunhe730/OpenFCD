@@ -4,8 +4,8 @@ from __future__ import annotations
 import numpy as np
 from PyQt6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from openfcd.gui.widgets.mpl_canvas import CompactCanvas
 from matplotlib import colormaps
 
 from openfcd.gui import tokens
@@ -27,7 +27,7 @@ class EtaMap(QWidget):
 
         self._fig = Figure()
         self._ax = self._fig.add_subplot(111)
-        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas = CompactCanvas(self._fig)
         self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self._canvas, 1)
 

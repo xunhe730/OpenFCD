@@ -269,11 +269,11 @@ class ProfileSceneView(QWidget):
 
     def _make_chart_widget(self) -> QWidget:
         try:
-            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
             from matplotlib.figure import Figure
+            from openfcd.gui.widgets.mpl_canvas import CompactCanvas
             fig = Figure(figsize=(8.6, 5.8))
             self._ax = fig.add_subplot(111)
-            canvas = FigureCanvasQTAgg(fig)
+            canvas = CompactCanvas(fig)
             canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             canvas.updateGeometry()
             self._fig = fig
