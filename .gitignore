@@ -49,3 +49,10 @@ tests/scratch/
 .gitnexus
 *.bak
 ~$*
+
+# Internal dev / reference material — not for distribution or remote
+design/
+docs/
+AGENTS.md
+CLAUDE.md
+*.pptx

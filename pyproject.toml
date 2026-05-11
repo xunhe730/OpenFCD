@@ -6,6 +6,8 @@ build-backend = "hatchling.build"
 name = "openfcd"
 version = "0.0.1"
 description = "Fast Checkerboard Demodulation desktop app for free-surface reconstruction"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
@@ -41,3 +43,16 @@ addopts = "--tb=short"
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.hatch.build.targets.wheel]
+packages = ["openfcd"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/openfcd",
+    "/tests",
+    "/scripts",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
