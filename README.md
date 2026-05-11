@@ -37,16 +37,19 @@ rough edges. Contributions welcome.
 Requires Python 3.11+.
 
 ```bash
-# Clone and install in development mode with GUI
-git clone https://github.com/xunhe730/OpenFCD.git
-cd OpenFCD
-pip install -e '.[gui,dev]'
+# CLI only
+pip install openfcd
+
+# CLI + desktop GUI (PyQt6)
+pip install 'openfcd[gui]'
 ```
 
-For CLI-only usage (no PyQt6 dependency):
+### Development install
 
 ```bash
-pip install -e '.[dev]'
+git clone https://github.com/xunhe730/OpenFCD.git
+cd OpenFCD
+pip install -e '.[gui,dev]'   # editable, with GUI + test/lint extras
 ```
 
 ## Quick start
