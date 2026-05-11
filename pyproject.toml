@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openfcd"
-version = "0.0.1"
+version = "0.0.2"
 description = "Fast Checkerboard Demodulation desktop app for free-surface reconstruction"
 readme = "README.md"
 license = { file = "LICENSE" }

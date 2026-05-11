@@ -10,8 +10,22 @@ experiment that films a patterned backdrop through a transparent fluid.
 
 ## Status
 
-**v0.0.1** — early release. Core pipeline and GUI are functional; expect
+**v0.0.2** — early release. Core pipeline and GUI are functional; expect
 rough edges. Contributions welcome.
+
+### What's new in 0.0.2
+
+- **Frame management** — Shift multi-select + batch disable / enable /
+  compute on frames; FramePickerDialog excludes disabled frames and the
+  reference frame from selection; SimTree disabled-frame state resets on
+  project switch.
+- **QC CLI** — `openfcd qc-summary` / `noise-floor` / `sensitivity`
+  subcommands for per-frame QC verdicts, flat-water noise-floor stats, and
+  calibration-sensitivity analysis.
+- **GUI polish** — HiDPI-aware preview colorbar at native resolution;
+  profile-composite heatmap & waveform x-axes aligned; unified η color range
+  across EtaMap / EtaHeatmap / ProfileScene / ProfileComposite; Qt palette
+  theming; annotation flushed to disk before each run.
 
 ## Features
 
