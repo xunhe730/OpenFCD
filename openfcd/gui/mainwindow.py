@@ -6,7 +6,8 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout,
-    QStackedWidget, QFileDialog, QMessageBox,
+    QStackedWidget, QFileDialog, QMessageBox, QProgressDialog, QApplication,
+    QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -25,7 +26,6 @@ from openfcd.gui.preferences import get_prefs
 
 def _apply_optical_preset(project, preset: str) -> bool:
     """Update preset and keep preset-backed layer defaults consistent."""
-    from openfcd.geometry.optical import get_default_layers
 
     valid_presets = {"pattern_below_window", "immersed_pattern", "custom"}
     if preset not in valid_presets:
@@ -121,15 +121,13 @@ class _SingleFrameWorker(QThread):
 
     def run(self) -> None:
         try:
-            from openfcd.cli.cmd_run import (
-                _build_geom_params,
-                _compute_single_frame,
-                _embed_eta_in_frame,
-                _resolve_reference,
-            )
-            from openfcd.core.mask import Box, Polygon
+            from openfcd.cli.cmd_run import _build_geom_params, _resolve_reference
             from openfcd.pipeline.base import CancelledError
-            from openfcd.pipeline.compute import load_gray
+            from openfcd.pipeline.frame import (
+                FrameInputsSnapshot,
+                build_frame_inputs,
+                compute_frame,
+            )
 
             geom = _build_geom_params(self._project)
             self.frame_progress.emit(2, "Loading reference…")
@@ -141,51 +139,22 @@ class _SingleFrameWorker(QThread):
                 self.reference_resolved.emit(ref_img)
             self.frame_progress.emit(8, "Loading frame…")
             self._cancel_token.check()
-            def_img = load_gray(self._frame_path)
 
-            if ref_img.shape != def_img.shape:
+            snapshot = FrameInputsSnapshot.from_session(
+                self._annotation, self._project, geom, ref_img
+            )
+            inputs = build_frame_inputs(snapshot, self._frame_path, fast_preview=True)
+            if inputs.def_img.shape != ref_img.shape:
                 self.frame_failed.emit(
-                    f"Shape mismatch: ref={ref_img.shape}, frame={def_img.shape}"
+                    f"Shape mismatch: ref={ref_img.shape}, frame={inputs.def_img.shape}"
                 )
                 return
-
-            roi_box = None
-            frame_poly = None
-            if self._annotation is not None:
-                roi = self._annotation.roi
-                if not roi.is_empty:
-                    roi_box = Box(
-                        row0=int(roi.y),
-                        col0=int(roi.x),
-                        height=int(roi.height),
-                        width=int(roi.width),
-                    )
-
-                polys = self._annotation.frame_polygons.get(self._frame_path.name, [])
-                if polys and polys[0].vertices:
-                    frame_poly = Polygon(
-                        [(float(v[0]), float(v[1])) for v in polys[0].vertices]
-                    )
-
-            computation = _compute_single_frame(
-                ref_img,
-                def_img,
-                geom,
-                self._project,
-                roi_box=roi_box,
-                robot_poly=frame_poly,
-                fast_preview=True,
+            result = compute_frame(
+                inputs,
                 progress_cb=lambda pct, lbl: self.frame_progress.emit(pct, lbl),
                 cancel=self._cancel_token,
             )
-            eta_mm = getattr(computation, "eta_mm", computation)
-            # η may be smaller than ref_img when scale normalization cropped
-            # (ref zoomed down to match def's carrier period).  Re-centre it
-            # inside the ROI (or the full frame if no ROI) to preserve alignment
-            # with the original pixel grid.
-            eta_overlay = _embed_eta_in_frame(eta_mm, ref_img.shape, roi_box)
-
-            self.frame_done.emit(eta_overlay, eta_mm)
+            self.frame_done.emit(result.eta_mm, result.eta_mm)
 
         except CancelledError:
             self.frame_failed.emit("Compute cancelled")
@@ -197,11 +166,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("OpenFCD")
         self.setWindowIcon(get_app_icon())
-        self.resize(1400, 900)
-        
         tokens.set_dark_mode(tokens.is_dark)
-        
         self._prefs = get_prefs()
+        self._apply_initial_geometry()
         self._session = SessionController(self)
         self._run_ctrl = RunController(self)
         # Run-result state (populated on Run completion; used for per-frame η preview)
@@ -218,6 +185,7 @@ class MainWindow(QMainWindow):
     def _setup_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
+        central.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -235,13 +203,13 @@ class MainWindow(QMainWindow):
         root.addWidget(self._toolbar)
 
         # ── Center splitter ──
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
 
         # Left: SimTree (280px)
         self._sim_tree = SimTree(self)
         self._sim_tree.populate()
-        splitter.addWidget(self._sim_tree)
+        self._main_splitter.addWidget(self._sim_tree)
 
         # Center: Stacked preview area
         center_col = QWidget()
@@ -278,14 +246,18 @@ class MainWindow(QMainWindow):
         self._center_stack.addWidget(self._scene_container)  # index 3
 
         center_layout.addWidget(self._center_stack, 1)
-        splitter.addWidget(center_col)
+        self._main_splitter.addWidget(center_col)
 
         # Right: PropertiesPanel
         self._properties = PropertiesPanel(self)
-        splitter.addWidget(self._properties)
+        self._main_splitter.addWidget(self._properties)
 
-        splitter.setSizes([280, 770, 350])
-        root.addWidget(splitter, 1)
+        self._main_splitter.setSizes([280, 770, 350])
+        ss = self._prefs.splitter_state
+        if ss:
+            from PyQt6.QtCore import QByteArray
+            self._main_splitter.restoreState(QByteArray(ss))
+        root.addWidget(self._main_splitter, 1)
 
         # Track loaded frames for slider/preview
         self._frames: list[Path] = []
@@ -318,6 +290,9 @@ class MainWindow(QMainWindow):
         self._scene_container.scene_changed.connect(self._on_scene_changed)
         self._sim_tree.frame_disabled_requested.connect(self._on_disable_frame)
         self._sim_tree.frame_enabled_requested.connect(self._on_enable_frame)
+        self._sim_tree.frames_disabled_requested.connect(self._on_disable_frames)
+        self._sim_tree.frames_enabled_requested.connect(self._on_enable_frames)
+        self._sim_tree.frames_compute_requested.connect(self._on_compute_frames)
         self._title_bar.menu_requested.connect(self._on_menu_requested)
         self._session.session_opened.connect(self._on_session_opened)
         self._session.session_modified.connect(self._on_session_dirty)
@@ -374,7 +349,7 @@ class MainWindow(QMainWindow):
         if item is None:
             self._on_new()  # no selection → fall back to New Project
             return
-        from openfcd.gui.panels.sim_tree import ROLE_NODE_TYPE, NodeType
+        from openfcd.gui.panels.sim_tree import ROLE_NODE_TYPE
         node_type = item.data(0, ROLE_NODE_TYPE)
         if node_type in (NodeType.SCENE_ITEM, NodeType.SCENES):
             self._on_new_scene_requested("eta_map")
@@ -404,11 +379,24 @@ class MainWindow(QMainWindow):
                 "Please run a computation first.")
             return
 
+        proj = self._session.project if self._session.has_project else None
+        excluded = set(proj.data.disabled_frame_indices) if proj else set()
+        # The reference frame produces zero η by construction (it IS the
+        # reference), and may not even be present in the run's results.h5.
+        # Always exclude it from scene selection so the slider does not show
+        # a phantom noise frame.
+        if proj and proj.reference.source:
+            for i, f in enumerate(self._frames):
+                if f.name == proj.reference.source:
+                    excluded.add(i)
+                    break
+        preselected = [i for i in range(len(self._frames)) if i not in excluded]
         dialog = FramePickerDialog(
             self,
             frames=self._frames,
             run_exists=run_exists,
-            preselected=list(range(len(self._frames))),
+            preselected=preselected,
+            disabled=sorted(excluded),
         )
         if dialog.exec() != FramePickerDialog.DialogCode.Accepted:
             return
@@ -417,7 +405,8 @@ class MainWindow(QMainWindow):
         if not indices:
             return
 
-        import uuid, datetime
+        import uuid
+        import datetime
         from openfcd.io.scene import SceneSpec, SceneType
         type_map = {"eta_map": SceneType.ETA_MAP, "profile": SceneType.PROFILE, "rms": SceneType.RMS}
         name_map = {"eta_map": "η Map", "profile": "Profile", "rms": "RMS"}
@@ -696,26 +685,40 @@ class MainWindow(QMainWindow):
             self._reapply_run_eta()
 
     def _on_disable_frame(self, idx: int) -> None:
-        self._sim_tree.set_frame_disabled(idx, True)
-        if self._session.has_project and self._session.project:
-            proj = self._session.project
-            disabled = list(proj.data.disabled_frame_indices)
-            if idx not in disabled:
-                disabled.append(idx)
-            proj.data.disabled_frame_indices = disabled
-            self._session.mark_dirty()
+        self._on_disable_frames([idx])
 
     def _on_enable_frame(self, idx: int) -> None:
-        self._sim_tree.set_frame_disabled(idx, False)
+        self._on_enable_frames([idx])
+
+    def _on_disable_frames(self, idxs: list[int]) -> None:
+        if not idxs:
+            return
+        for i in idxs:
+            self._sim_tree.set_frame_disabled(i, True)
         if self._session.has_project and self._session.project:
             proj = self._session.project
+            current = set(proj.data.disabled_frame_indices)
+            current.update(int(i) for i in idxs)
+            proj.data.disabled_frame_indices = sorted(current)
+            self._session.mark_dirty()
+
+    def _on_enable_frames(self, idxs: list[int]) -> None:
+        if not idxs:
+            return
+        for i in idxs:
+            self._sim_tree.set_frame_disabled(i, False)
+        if self._session.has_project and self._session.project:
+            proj = self._session.project
+            drop = {int(i) for i in idxs}
             proj.data.disabled_frame_indices = [
-                i for i in proj.data.disabled_frame_indices if i != idx
+                i for i in proj.data.disabled_frame_indices if i not in drop
             ]
             self._session.mark_dirty()
 
     def _on_set_reference(self, idx: int) -> None:
-        """Set frame as reference."""
+        """Set frame as reference. The reference frame is auto-disabled so it
+        does not participate in run/compute (it has zero deformation by
+        construction)."""
         if not self._session.has_project or idx < 0:
             return
         proj = self._session.project
@@ -725,6 +728,34 @@ class MainWindow(QMainWindow):
             self._sim_tree.update_ref_mark(idx)
             self._session.invalidate_reference_cache()
             self._session.mark_dirty()
+            # Auto-disable the chosen reference frame.
+            if idx not in proj.data.disabled_frame_indices:
+                self._on_disable_frames([idx])
+
+    def _on_compute_frames(self, idxs: list[int]) -> None:
+        """Queue a batch of single-frame computes, skipping disabled frames."""
+        if not idxs:
+            return
+        proj = self._session.project
+        disabled = set(proj.data.disabled_frame_indices) if proj else set()
+        queue = [int(i) for i in idxs if int(i) not in disabled]
+        skipped = len(idxs) - len(queue)
+        if skipped:
+            self._status_bar.set_items(
+                [f"Skipped {skipped} disabled frame(s)"]
+            )
+        if not queue:
+            return
+        self._compute_queue = list(queue)
+        self._drain_compute_queue()
+
+    def _drain_compute_queue(self) -> None:
+        if not getattr(self, "_compute_queue", None):
+            return
+        if getattr(self, "_single_frame_worker", None) is not None:
+            return
+        next_idx = self._compute_queue.pop(0)
+        self._on_compute_frame(next_idx)
 
     def _on_compute_frame(self, idx: int) -> None:
         """Compute a single frame in a background thread and show the result."""
@@ -738,6 +769,12 @@ class MainWindow(QMainWindow):
             )
             return
         if idx < 0 or idx >= len(self._frames):
+            return
+        # Disabled frames must not participate in compute.
+        if proj and idx in set(proj.data.disabled_frame_indices):
+            self._status_bar.set_items(
+                [f"Frame {idx + 1} is disabled — skipped"]
+            )
             return
 
         # Reflect "running" state immediately so the user gets instant feedback,
@@ -768,8 +805,13 @@ class MainWindow(QMainWindow):
         worker.frame_failed.connect(self._on_single_frame_failed)
         worker.frame_progress.connect(self._on_single_frame_progress)
         worker.reference_resolved.connect(self._session.cache_reference)
-        worker.finished.connect(lambda: setattr(self, "_single_frame_worker", None))
+        worker.finished.connect(self._on_single_frame_finished)
         worker.start()
+
+    def _on_single_frame_finished(self) -> None:
+        self._single_frame_worker = None
+        # Continue any pending batch compute queue.
+        self._drain_compute_queue()
 
     def _check_carrier_scale(self, proj, frame_path) -> str | None:
         """Return a warning string if ref/def carrier period mismatch >10%, else None."""
@@ -973,12 +1015,50 @@ class MainWindow(QMainWindow):
     # ── Theme ───────────────────────────────────────────────────────
     def _apply_theme(self) -> None:
         t = tokens
+        t.apply_qt_palette()
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
                 background: {t.BG_PRIMARY};
                 color: {t.TEXT_PRIMARY};
                 font-family: {t.FONT_UI};
                 font-size: 13px;
+            }}
+            QLabel {{
+                background: transparent;
+            }}
+            QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
+            QComboBox, QListView, QTreeView, QTableView {{
+                background: {t.BG_TERTIARY};
+                color: {t.TEXT_PRIMARY};
+                border: 1px solid {t.BORDER_SUBTLE};
+                selection-background-color: {t.SELECTION_BG};
+                selection-color: {t.TEXT_PRIMARY};
+            }}
+            QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled,
+            QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
+                color: {t.TEXT_MUTED};
+                background: {t.BG_SECONDARY};
+            }}
+            QComboBox QAbstractItemView {{
+                background: {t.BG_TERTIARY};
+                color: {t.TEXT_PRIMARY};
+                selection-background-color: {t.SELECTION_BG};
+                selection-color: {t.TEXT_PRIMARY};
+            }}
+            QMenu {{
+                background-color: {t.BG_TERTIARY};
+                color: {t.TEXT_PRIMARY};
+                border: 1px solid {t.BORDER_SUBTLE};
+                padding: 4px;
+            }}
+            QMenu::item {{
+                background: transparent;
+                color: {t.TEXT_PRIMARY};
+                padding: 5px 22px;
+            }}
+            QMenu::item:selected {{
+                background-color: {t.SELECTION_BG};
+                color: {t.TEXT_PRIMARY};
             }}
             QSplitter::handle {{
                 background: {t.BORDER_SUBTLE};
@@ -990,6 +1070,56 @@ class MainWindow(QMainWindow):
             self._welcome.setStyleSheet(
                 f"color: {t.TEXT_MUTED}; font-size: 14px; padding: 40px;"
             )
+
+    # ── Geometry helpers ────────────────────────────────────────────
+    def _apply_initial_geometry(self) -> None:
+        """Restore saved geometry or size/center to 90 % of the available screen."""
+        from PyQt6.QtCore import QByteArray
+        from PyQt6.QtGui import QGuiApplication
+        geo = self._prefs.window_geometry
+        if geo:
+            ok = self.restoreGeometry(QByteArray(geo))
+            if ok:
+                self._clamp_to_available_screen()
+                ws = self._prefs.window_state
+                if ws:
+                    self.restoreState(QByteArray(ws))
+                return
+        # First launch or corrupt state — fit-to-screen and center.
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        target_w = min(1400, int(avail.width() * 0.9))
+        target_h = min(900, int(avail.height() * 0.9))
+        self.resize(target_w, target_h)
+        self.move(
+            avail.x() + (avail.width() - target_w) // 2,
+            avail.y() + (avail.height() - target_h) // 2,
+        )
+
+    def _clamp_to_available_screen(self) -> None:
+        """Ensure the window frame is fully within the current screen's available area."""
+        from PyQt6.QtGui import QGuiApplication
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        g = self.frameGeometry()
+        if avail.contains(g):
+            return
+        new_w = min(g.width(), avail.width())
+        new_h = min(g.height(), avail.height())
+        self.resize(new_w, new_h)
+        nx = max(avail.x(), min(g.x(), avail.right() - new_w))
+        ny = max(avail.y(), min(g.y(), avail.bottom() - new_h))
+        self.move(nx, ny)
+
+    def _save_window_state(self) -> None:
+        """Persist geometry, window state, and splitter state to prefs."""
+        try:
+            self._prefs.window_geometry = bytes(self.saveGeometry())
+            self._prefs.window_state = bytes(self.saveState())
+            if hasattr(self, "_main_splitter"):
+                self._prefs.splitter_state = bytes(self._main_splitter.saveState())
+        except Exception:
+            pass  # never block app close on a settings-write failure
 
     # ── Application Events ──────────────────────────────────────────
     def closeEvent(self, event) -> None:
@@ -1003,12 +1133,15 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.StandardButton.Save:
                 self._session.save()
+                self._save_window_state()
                 event.accept()
             elif reply == QMessageBox.StandardButton.Cancel:
                 event.ignore()
             else:
+                self._save_window_state()
                 event.accept()
         else:
+            self._save_window_state()
             event.accept()
 
     def _on_menu_requested(self, menu_name: str) -> None:
@@ -1019,13 +1152,19 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
-                background-color: {tokens.BG_PRIMARY};
+                background-color: {tokens.BG_TERTIARY};
                 color: {tokens.TEXT_PRIMARY};
                 border: 1px solid {tokens.BORDER_SUBTLE};
+                padding: 4px;
+            }}
+            QMenu::item {{
+                background: transparent;
+                color: {tokens.TEXT_PRIMARY};
+                padding: 5px 22px;
             }}
             QMenu::item:selected {{
-                background-color: {tokens.ACCENT_CLAY};
-                color: white;
+                background-color: {tokens.SELECTION_BG};
+                color: {tokens.TEXT_PRIMARY};
             }}
         """)
 
@@ -1074,7 +1213,6 @@ class MainWindow(QMainWindow):
         current = self._center_stack.currentWidget()
         if current is None:
             return
-        from PyQt6.QtGui import QPixmap
         pixmap = current.grab()
         if pixmap.save(path, "PNG"):
             self._status_bar.set_items(["Exported", Path(path).name])
@@ -1157,10 +1295,27 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         save_act = menu.addAction("Save", self._session.save)
         save_act.setEnabled(self._session.has_project)
+        reimport_act = menu.addAction("Re-import Frames...", self._on_reimport_frames)
+        reimport_act.setEnabled(self._session.has_project)
         export_act = menu.addAction("Export Current View as PNG…", self._export_current_view_png)
         export_act.setEnabled(self._center_stack.currentIndex() > 0)
         menu.addSeparator()
         menu.addAction("Exit", self.close)
+
+    def _on_reimport_frames(self) -> None:
+        """Re-open ImagePickerDialog to re-import frames (escape hatch)."""
+        if self._run_ctrl.is_running:
+            QMessageBox.warning(
+                self, "Run in Progress",
+                "Cannot re-import frames while a run is active.",
+            )
+            return
+        if not self._session.has_project or not self._session.project_path:
+            return
+        proj = self._session.project
+        if proj:
+            proj.reference.source = ""
+        self._on_session_opened(str(self._session.project_path))
 
     def _populate_recent_projects_menu(self, recent_menu) -> None:
         recents = self._prefs.recent_projects
@@ -1281,10 +1436,12 @@ class MainWindow(QMainWindow):
 
     # ── Session events ──────────────────────────────────────────────
     def _on_session_opened(self, path: str) -> None:
-        # New project → clear η caches from any previous session.
+        # New project → clear per-session state from any previous project.
         self._frame_eta_cache = {}
         self._run_eta_frames = None
         self._run_eta_mean = None
+        # Pending batch-compute queue is project-scoped; drop it.
+        self._compute_queue = []
         proj_path = Path(path)
         name = proj_path.name
         self._title_bar.set_project_title(f"{name} — OpenFCD")
@@ -1301,11 +1458,22 @@ class MainWindow(QMainWindow):
             frames = scan_frames(proj.data.frames_dir, proj.data.pattern)
 
             # Show image picker to let user filter frames before import.
-            if frames:
+            # Skip if reference.source is already set — project was previously imported.
+            if frames and not proj.reference.source:
                 from openfcd.gui.dialogs.image_picker import ImagePickerDialog
                 picker = ImagePickerDialog(self, frames=frames)
                 if picker.exec() == ImagePickerDialog.DialogCode.Accepted:
                     frames = picker.selected_frames
+                    if picker.auto_ref_enabled and frames:
+                        self._auto_build_reference(
+                            proj=proj,
+                            project_dir=proj_path,
+                            frames=frames,
+                            reducer=picker.auto_ref_reducer,
+                        )
+                        synth_ref = proj_path / "reference_built.jpg"
+                        if synth_ref.exists():
+                            frames = [synth_ref] + frames
 
             # Find ref index
             if proj.reference.source:
@@ -1355,12 +1523,105 @@ class MainWindow(QMainWindow):
             "Optical defaults repaired" if repaired else "",
         ])
 
-        # Load annotation if exists
+        # Load annotation if exists and populate AnnotationPanel
         ann_path = proj_path / "annotations" / "default.json"
         if ann_path.exists():
             from openfcd.io.annotation import load as load_annotation
-            ann = load_annotation(ann_path)
-            # TODO: populate AnnotationPanel ROI/Mask from ann
+            _ann = load_annotation(ann_path)
+            roi = _ann.roi
+            panel = self._properties.image_properties_panel
+            if not roi.is_empty:
+                panel.set_roi(int(roi.x), int(roi.y), int(roi.width), int(roi.height))
+                self._preview.show_roi(int(roi.y), int(roi.x), int(roi.height), int(roi.width))
+            else:
+                panel.set_roi(0, 0, 0, 0)
+            total_masks = len(_ann.polygons) + sum(
+                len(v) for v in _ann.frame_polygons.values()
+            )
+            if total_masks > 0:
+                panel.set_mask_status(
+                    f"{total_masks} mask{'s' if total_masks != 1 else ''} defined"
+                )
+            else:
+                panel.set_mask_status("No masks")
+
+        # Step 3: Auto-restore eta from last completed run
+        last_run_id = self._session.last_run_id
+        if last_run_id and self._session.project_path:
+            results_path = self._session.project_path / "runs" / last_run_id / "results.h5"
+            if results_path.exists():
+                self._load_run_results(last_run_id)
+            else:
+                # Self-heal: stale last_run_id — clear and persist
+                if self._session.store:
+                    self._session.store.last_run_id = None
+                self._session.save()
+
+    def _auto_build_reference(
+        self,
+        proj: object,
+        project_dir: Path,
+        frames: list[Path],
+        reducer: str,
+    ) -> None:
+        """Build and persist a synthetic reference from the selected frames."""
+        from openfcd.core.reference_builder import build_reference_from_paths
+
+        if len(frames) < 5:
+            QMessageBox.warning(
+                self,
+                "Auto-reference",
+                f"Need >=5 frames for a stable mean; got {len(frames)}. "
+                "Continuing anyway.",
+            )
+        progress = QProgressDialog(
+            f"Building reference ({reducer} of {len(frames)} frames)...",
+            None,
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            ref_img = build_reference_from_paths(frames, reducer=reducer)  # type: ignore[arg-type]
+            out_npy = Path(project_dir) / "reference_built.npy"
+            out_jpg = Path(project_dir) / "reference_built.jpg"
+            np.save(out_npy, ref_img)
+            # Also write an 8-bit JPG so the SimTree can show a thumbnail and
+            # the filename-based ref-index lookup in _on_session_opened picks
+            # this entry up. _resolve_reference prefers the sibling .npy
+            # (full float precision) when both exist.
+            # load_gray() may return float64 in [0, 1] (for RGB inputs via
+            # rgb2gray) or [0, 255] (for grayscale JPG/PNG cast direct to
+            # float). Normalize so the saved JPG always uses the full 8-bit
+            # range without saturating to white.
+            from skimage.io import imsave as _imsave
+            import warnings as _warnings
+            arr = ref_img.astype(np.float64, copy=False)
+            arr_u8 = (
+                np.clip(arr * 255.0, 0.0, 255.0)
+                if float(arr.max(initial=0.0)) <= 1.0 + 1e-6
+                else np.clip(arr, 0.0, 255.0)
+            ).astype(np.uint8)
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                _imsave(str(out_jpg), arr_u8)
+            proj.reference.mode = "build"  # type: ignore[union-attr]
+            proj.reference.source = "reference_built.jpg"  # type: ignore[union-attr]
+            proj.reference.build_params = {  # type: ignore[union-attr]
+                "reducer": reducer,
+                "n": len(frames),
+                "stride": 1,
+                "explicit": True,
+            }
+            self._session.save()
+            self._status_bar.set_items([
+                f"Auto-built reference: {reducer} of {len(frames)} frames",
+            ])
+        finally:
+            progress.close()
 
     def _on_session_dirty(self) -> None:
         self._title_bar.is_dirty = self._session.is_dirty
@@ -1370,7 +1631,6 @@ class MainWindow(QMainWindow):
 
         # Also save annotation
         if self._session.project_path:
-            from openfcd.io.annotation import save as save_annotation
             ann_dir = self._session.project_path / "annotations"
             ann_dir.mkdir(exist_ok=True)
             # TODO: get annotation from AnnotationPanel once built
@@ -1426,30 +1686,18 @@ class MainWindow(QMainWindow):
                 result[spec.id] = missing
         return result
 
-    def _on_run_finished(self, _run_id: str) -> None:
-        self._toolbar.set_running(False)
-        self._status_bar.hide_progress()
+    def _load_run_results(self, run_id: str) -> None:
+        """Load eta results from a completed run's results.h5 into GUI state.
 
-        # Refresh all scenes to use the new run
-        self._session.refresh_scenes(_run_id)
-        # Invalidate RMS view caches (force recompute with new data)
-        if hasattr(self, "_scene_container"):
-            self._scene_container._rms_view._cached_spec_id = None
-            self._scene_container._rms_view._cached_rms = None
-        # Re-populate SimTree scene nodes with updated specs + badges
-        missing_counts = self._compute_missing_counts(_run_id)
-        self._sim_tree.populate_scenes(self._session.scenes, missing_counts)
-        n_scenes = len(self._session.scenes)
-        if n_scenes > 0:
-            self._status_bar.set_items(["Ready", "Computation complete", f"{n_scenes} scenes refreshed"])
-        else:
-            self._status_bar.set_items(["Ready", "Computation complete"])
-
+        Sets _run_eta_frames, _run_eta_mean, and _frame_eta_cache.
+        Updates the preview widget if results loaded successfully.
+        Safe to call from both _on_run_finished and _on_session_opened.
+        """
         if not self._session.project_path:
             return
 
         from openfcd.io.result import HDF5ResultStore
-        results_path = self._session.project_path / "runs" / _run_id / "results.h5"
+        results_path = self._session.project_path / "runs" / run_id / "results.h5"
         if not results_path.exists():
             return
 
@@ -1493,10 +1741,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            matched = [
-                eta_by_name.get(f.name)
-                for f in self._frames
-            ]
+            matched = [eta_by_name.get(f.name) for f in self._frames]
             valid = [a for a in matched if a is not None]
             if valid:
                 shape = valid[0].shape
@@ -1521,12 +1766,37 @@ class MainWindow(QMainWindow):
         # Display in the preview widget.
         if self._run_eta_frames is not None:
             self._center_stack.setCurrentWidget(self._preview)
-            self._preview.set_preview_toggle_visible(self._run_eta_frames is not None)
+            self._preview.set_preview_toggle_visible(True)
             self._preview.set_preview_mode(True)
             self._toolbar.set_preview_available(True)
             self._toolbar.set_preview_on(True)
-            self._status_bar.set_items(["Run done", "Preview: ON"])
             self._reapply_run_eta()
+
+    def _on_run_finished(self, _run_id: str) -> None:
+        self._toolbar.set_running(False)
+        self._status_bar.hide_progress()
+
+        # Refresh all scenes to use the new run
+        self._session.refresh_scenes(_run_id)
+        # Invalidate RMS view caches (force recompute with new data)
+        if hasattr(self, "_scene_container"):
+            self._scene_container._rms_view._cached_spec_id = None
+            self._scene_container._rms_view._cached_rms = None
+        # Re-populate SimTree scene nodes with updated specs + badges
+        missing_counts = self._compute_missing_counts(_run_id)
+        self._sim_tree.populate_scenes(self._session.scenes, missing_counts)
+        n_scenes = len(self._session.scenes)
+        if n_scenes > 0:
+            self._status_bar.set_items(["Ready", "Computation complete", f"{n_scenes} scenes refreshed"])
+        else:
+            self._status_bar.set_items(["Ready", "Computation complete"])
+
+        if not self._session.project_path:
+            return
+
+        self._load_run_results(_run_id)
+        if self._run_eta_frames is not None:
+            self._status_bar.set_items(["Run done", "Preview: ON"])
 
         # Show "N scenes refreshed" for 3 seconds then restore to "Ready"
         from PyQt6.QtCore import QTimer
@@ -1576,6 +1846,8 @@ class MainWindow(QMainWindow):
             return
 
         overlap = self._toolbar.overlap_on() if hasattr(self._toolbar, "overlap_on") else True
+        if hasattr(self._toolbar, "colorbar_on") and hasattr(self._preview, "set_colorbar"):
+            self._preview.set_colorbar(self._toolbar.colorbar_on())
         self._preview.show_eta_overlay(np.asarray(eta), show_overlap=overlap)
 
     def _on_run_failed(self, error: str) -> None:
@@ -1624,6 +1896,25 @@ class MainWindow(QMainWindow):
         from openfcd.gui.dialogs.new_project_wizard import NewProjectWizard
         wizard = NewProjectWizard(self, prefs=self._prefs)
         if wizard.exec() == NewProjectWizard.DialogCode.Accepted:
+            target_dir = Path(wizard.project_location) / f"{wizard.project_name}.ofcd"
+            if target_dir.exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Project Exists",
+                    f"项目已存在：\n{target_dir}\n\n是否覆盖现有项目？此操作将删除该目录下的所有内容。\n\n"
+                    f"Project already exists at:\n{target_dir}\n\nReplace it? "
+                    f"All contents of that directory will be deleted.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                try:
+                    import shutil
+                    shutil.rmtree(target_dir)
+                except Exception as err:
+                    QMessageBox.warning(self, "Replace Failed", str(err))
+                    return
             try:
                 project_dir = self._session.new_project(
                     name=wizard.project_name,
@@ -1695,6 +1986,7 @@ class MainWindow(QMainWindow):
             workers=workers,
             disabled_indices=self._sim_tree.disabled_indices,
             frame_paths=tuple(self._frames),
+            session_controller=self._session,
         )
 
     # ── Annotation handlers ────────────────────────────────────────
@@ -1704,8 +1996,9 @@ class MainWindow(QMainWindow):
             self._center_stack.setCurrentWidget(self._preview)
             self._preview.start_roi_mode()
             self._status_bar.set_items(["ROI mode", "Click and drag to draw region of interest"])
-        except Exception as e:
-            import traceback, logging
+        except Exception:
+            import traceback
+            import logging
             logging.error(f"ROI mode error: {traceback.format_exc()}")
             print(f"ROI mode error: {traceback.format_exc()}")
 
@@ -1715,8 +2008,9 @@ class MainWindow(QMainWindow):
             self._center_stack.setCurrentWidget(self._preview)
             self._preview.start_mask_mode()
             self._status_bar.set_items(["Mask mode", "Click FL → FR → BR → BL (4 points clockwise)"])
-        except Exception as e:
-            import traceback, logging
+        except Exception:
+            import traceback
+            import logging
             logging.error(f"Mask mode error: {traceback.format_exc()}")
             print(f"Mask mode error: {traceback.format_exc()}")
 
@@ -1826,7 +2120,6 @@ class MainWindow(QMainWindow):
 
     def _on_point_placed(self, idx: int, row: int, col: int) -> None:
         """A single annotation point was placed — update status bar."""
-        mode_labels = {0: "1/2", 1: "2/2"}  # ROI
         if idx < 4:
             mask_labels = {0: "FL 1/4", 1: "FR 2/4", 2: "BR 3/4", 3: "BL 4/4"}
             label = mask_labels.get(idx, f"{idx+1}")

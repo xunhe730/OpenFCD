@@ -7,6 +7,8 @@ Pydantic schema definitions WITHOUT instantiating Qt widgets (headless-safe).
 import ast
 from pathlib import Path
 
+from PyQt6.QtWidgets import QApplication
+
 
 
 
@@ -70,3 +72,30 @@ class TestComputePanelEnumAlignment:
         assert "linear" not in SCHEMA_DETREND
         # Ensure only valid detrends exist
         assert SCHEMA_DETREND == {"plane", "none"}
+
+
+# ── ImagePropertiesPanel widget tests ─────────────────────────────────────────
+
+def _app() -> QApplication:
+    return QApplication.instance() or QApplication([])
+
+
+def test_annotation_panel_set_roi() -> None:
+    """set_roi populates all four ROI field texts with the supplied coordinates."""
+    _app()
+    from openfcd.gui.panels.properties import ImagePropertiesPanel
+    panel = ImagePropertiesPanel()
+    panel.set_roi(10, 20, 100, 200)
+    assert panel._roi_x.text() == "10"
+    assert panel._roi_y.text() == "20"
+    assert panel._roi_w.text() == "100"
+    assert panel._roi_h.text() == "200"
+
+
+def test_annotation_panel_set_mask_status() -> None:
+    """set_mask_status updates the mask status label text."""
+    _app()
+    from openfcd.gui.panels.properties import ImagePropertiesPanel
+    panel = ImagePropertiesPanel()
+    panel.set_mask_status("3 masks defined")
+    assert panel._mask_status.text() == "3 masks defined"

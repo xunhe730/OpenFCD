@@ -149,6 +149,14 @@ def _load_reference_source(project: ProjectModel, project_dir: Path, src: str) -
     from openfcd.pipeline.compute import load_gray
 
     ref_path = Path(src)
+    # 0) If source is an image file and a sibling .npy of the same stem
+    # exists in project_dir (auto-built reference cache), prefer the .npy
+    # — it preserves the full float64 mean/median, the .jpg only exists
+    # for SimTree thumbnail display.
+    if ref_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}:
+        npy_sibling = project_dir / (ref_path.stem + ".npy")
+        if npy_sibling.exists():
+            return np.load(npy_sibling)
     # 1) Already absolute and exists?
     if ref_path.is_absolute() and ref_path.exists():
         return load_gray(ref_path)
@@ -208,57 +216,6 @@ def _resolve_reference(project: ProjectModel, project_dir: Path) -> np.ndarray:
 
     else:
         raise ValueError(f"Unknown reference.mode: {mode!r}")
-
-
-# ---------------------------------------------------------------------------
-# Auto-detect occluder on reference image
-# ---------------------------------------------------------------------------
-
-def _detect_occluder_on_ref(ref_img: np.ndarray, geom, project) -> object:
-    """Run auto-mask on the reference image and return a Polygon or None.
-
-    The reference image (flat water surface) gives the most stable occluder
-    detection because waves haven't distorted the carrier yet.  The polygon
-    is computed once and reused for all frames that lack a per-frame mask.
-    """
-    try:
-        from openfcd.core.fcd import calculate_carriers
-        from openfcd.core.flatfield import flatfield_normalize
-        from openfcd.core.mask import auto_mask, find_oriented_polygon, find_largest_interior_blob, Polygon
-
-        # Fast downsample when ref is large (mirrors fast_preview logic)
-        img = ref_img
-        scale = 1.0
-        h0, w0 = img.shape
-        factor = min(2, max(h0, w0) // 2500)
-        if factor >= 2:
-            from scipy.ndimage import zoom
-            scale = 1.0 / factor
-            img = zoom(img, scale, order=1)
-
-        # Same sigma formula as _compute_single_frame
-        h_img, w_img = img.shape
-        if getattr(project.process, "flatfield_sigma_auto", True):
-            sigma = float(np.clip(max(h_img, w_img) * 0.06, 100.0, 2000.0))
-        else:
-            sigma = float(project.process.flatfield_sigma)
-
-        ref_ff = flatfield_normalize(img, sigma=sigma)
-        carriers = calculate_carriers(ref_ff - ref_ff.mean())
-        scout = auto_mask(ref_ff, carriers, threshold_ratio=0.2, dilate_px=4)
-        poly = find_oriented_polygon(scout, edge_margin=20)
-        if poly is None:
-            box = find_largest_interior_blob(scout, edge_margin=20)
-            if box is not None:
-                poly = Polygon.from_box(box)
-        if poly is None:
-            return None
-        # Scale vertices back to original image coordinates
-        if scale != 1.0:
-            poly = Polygon([(v[0] / scale, v[1] / scale) for v in poly.vertices])
-        return poly
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -357,46 +314,38 @@ class PreprocessStage:
 
 
 class ComputeStage:
-    """Process each frame through the FCD pipeline.
-
-    Each frame is paired with the shared reference image. The process()
-    function from openfcd.pipeline.compute does the heavy lifting:
-    flatfield → carriers → mask → inpaint → FCD → calibrate → eta_mm.
-    Results are written per-frame into the HDF5ResultStore.
-    """
+    """Process each frame through the FCD pipeline via `compute_frame`."""
 
     name: str = "compute"
 
     def run(
         self, ctx: dict, cancel: CancelToken | None = None
     ) -> Iterator[StageEvent]:
-        from openfcd.pipeline.compute import GeomParams, load_gray
+        from openfcd.pipeline.aggregate import StreamingMeanAccumulator
+        from openfcd.pipeline.frame import (
+            FrameInputsSnapshot,
+            build_frame_inputs,
+            compute_frame,
+        )
 
         run_id: str = ctx.get("run_id", "")
         frame_paths: list[Path] = ctx.get("frame_paths", [])
         frame_count: int = ctx.get("frame_count", 0)
-        ref_img: np.ndarray = ctx["reference_image"]
-        geom: GeomParams = ctx["geom_params"]
         result_store: HDF5ResultStore | None = ctx.get("result_store")
         project: ProjectModel = ctx["project"]
 
-        # Filter out disabled frames before processing, while preserving GUI
-        # frame indices as HDF5 frame ids. Scene specs and the GUI tree use
-        # those original indices.
         disabled = set(ctx.get("disabled_frame_indices", []))
         frame_items = list(enumerate(frame_paths))
         if disabled:
             frame_items = [(i, fp) for i, fp in frame_items if i not in disabled]
-            frame_paths = [fp for _, fp in frame_items]
-            frame_count = len(frame_paths)
+            ctx["frame_paths"] = [fp for _, fp in frame_items]
+            frame_count = len(frame_items)
             ctx["frame_count"] = frame_count
-            ctx["frame_paths"] = frame_paths
         yield StageEvent(
             kind="start", stage=self.name, batch=None, frame_idx=None,
             substage=None, progress=0.0, total=frame_count, completed=0,
             metrics={"action": "starting_compute"}, run_id=run_id,
         )
-
         if cancel and cancel.is_cancelled:
             yield StageEvent(
                 kind="cancel", stage=self.name, batch=None, frame_idx=None,
@@ -405,101 +354,20 @@ class ComputeStage:
             )
             return
 
-        # Resolve annotation ROI and polygon for masking
-        annotation = ctx.get("annotation")  # AnnotationSchema | None
-        roi_box = None
-        polygon_map: dict[str, list] = {}
-        if annotation is not None:
-            roi = annotation.roi
-            if not roi.is_empty:
-                from openfcd.core.mask import Box
-                roi_box = Box(
-                    row0=int(roi.y),
-                    col0=int(roi.x),
-                    height=int(roi.height),
-                    width=int(roi.width),
-                )
-            polygon_map = annotation.frame_polygons
-
-        def _resolve_frame_poly(name: str):
-            """Return the visible mask explicitly drawn for this frame."""
-            polys = polygon_map.get(name, [])
-            if polys and polys[0].vertices:
-                from openfcd.core.mask import Polygon
-                return Polygon([(float(v[0]), float(v[1])) for v in polys[0].vertices])
-            return None
-
-        # Single-frame body shared by serial and parallel paths.
+        snapshot = FrameInputsSnapshot.from_run_context(ctx)
+        accumulator = StreamingMeanAccumulator()
+        ctx["eta_accumulator"] = accumulator
         ctx["frame_calibrations"] = []
-
-        def _process_one(idx: int, frame_path: Path) -> tuple[int, FrameComputation | None, str | None]:
-            """Returns (idx, computation, error_msg). computation is None on error."""
-            try:
-                deformed_img = load_gray(frame_path)
-                if deformed_img.shape != ref_img.shape:
-                    return idx, None, "shape_mismatch"
-                computation = _compute_single_frame(
-                    ref_img, deformed_img, geom, project,
-                    roi_box=roi_box,
-                    robot_poly=_resolve_frame_poly(frame_path.name),
-                    fast_preview=True,
-                    cancel=cancel,
-                )
-                return idx, computation, None
-            except CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                return idx, None, str(exc)
+        stream_results = _resolve_stream_results(result_store, snapshot.ref_img, frame_count)
 
         eta_list: list[np.ndarray | None] = [None] * frame_count
         processed = 0
         errors = 0
         t0 = time.time()
 
-        def _emit_frame_progress(idx: int, frame_name: str) -> StageEvent:
-            prog = (processed + errors) / max(frame_count, 1)
-            done = processed + errors
-            elapsed = time.time() - t0
-            eta_sec = (elapsed / done) * (frame_count - done) if done > 0 else 0.0
-            return StageEvent(
-                kind="progress", stage=self.name, batch="default",
-                frame_idx=idx, substage="processing_frame", progress=prog,
-                total=frame_count, completed=processed,
-                metrics={
-                    "frame": frame_name,
-                    "errors": errors,
-                    "eta_seconds": round(eta_sec, 1),
-                },
-                run_id=run_id,
-            )
-
-        # Stream results to disk: drop in-memory array after writing to HDF5.
-        # Trigger when total estimated η size exceeds 400 MB (size-aware) or
-        # frame count exceeds 50, whichever comes first.
-        import os as _os
-        _stream_env = _os.environ.get("OPENFCD_STREAM_RESULTS", "").strip().lower()
-        if _stream_env in ("1", "true", "yes", "on"):
-            stream_results = result_store is not None
-        elif _stream_env in ("0", "false", "no", "off"):
-            stream_results = False
-        else:
-            estimated_bytes = ref_img.nbytes * frame_count
-            stream_results = result_store is not None and (
-                frame_count > 50 or estimated_bytes > 400_000_000
-            )
-
-        # Incremental running mean — avoids PostprocessStage re-reading all frames.
-        _eta_sum: np.ndarray | None = None
-        _eta_count: np.ndarray | None = None
-
-        # Simple serial loop — direct call, no per-frame thread overhead.
-        # Sub-step events are collected during compute and yielded immediately
-        # after; the bar still shows per-step movement at each frame boundary.
         for ordinal, (frame_idx, frame_path) in enumerate(frame_items):
             if cancel and cancel.is_cancelled:
                 break
-
-            # Pre-frame: show which frame we're starting.
             yield StageEvent(
                 kind="progress", stage=self.name, batch="default",
                 frame_idx=frame_idx, substage="loading",
@@ -509,39 +377,24 @@ class ComputeStage:
                          "frame_no": f"{ordinal + 1}/{frame_count}"},
                 run_id=run_id,
             )
-
-            # Collect sub-step events; yield them in a burst after compute so
-            # the bar animates through the frame's slice without thread overhead.
-            _sub_events: list[tuple[float, str]] = []
-
+            sub_events: list[tuple[float, str]] = []
             def _cb(pct: int, lbl: str, _i=ordinal) -> None:
-                _sub_events.append((_i + pct / 100.0, lbl))
+                sub_events.append((_i + pct / 100.0, lbl))
 
-            computation: FrameComputation | None = None
-            eta_mm: np.ndarray | None = None
+            result = None
             err: str | None = None
             try:
-                def_img = load_gray(frame_path)
-                if def_img.shape != ref_img.shape:
+                inputs = build_frame_inputs(snapshot, frame_path, fast_preview=True)
+                if inputs.def_img.shape != snapshot.ref_shape:
                     err = "shape_mismatch"
                 else:
-                    computation = _compute_single_frame(
-                        ref_img, def_img, geom, project,
-                        roi_box=roi_box,
-                        robot_poly=_resolve_frame_poly(frame_path.name),
-                        progress_cb=_cb,
-                        fast_preview=True,
-                        cancel=cancel,
-                    )
-                    eta_mm = getattr(computation, "eta_mm", computation)
+                    result = compute_frame(inputs, progress_cb=_cb, cancel=cancel)
             except CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
 
-            # Yield the collected sub-step events (frame is already done, but
-            # the bar still animates through them before the "done" event).
-            for local_prog, label in _sub_events:
+            for local_prog, label in sub_events:
                 yield StageEvent(
                     kind="progress", stage=self.name, batch="default",
                     frame_idx=frame_idx, substage=label,
@@ -552,72 +405,23 @@ class ComputeStage:
                     run_id=run_id,
                 )
 
-            # Place eta_mm into a full-frame NaN overlay so all saved frames
-            # share a consistent shape (ref_img.shape) and the GUI overlay
-            # aligns correctly with the source image regardless of ROI/cropping.
-            qc_datasets = getattr(computation, "qc_datasets", None) if computation is not None else None
-            if eta_mm is not None:
-                eta_mm = _embed_eta_in_frame(eta_mm, ref_img.shape, roi_box)
-                if qc_datasets:
-                    qc_datasets = {
-                        name: _embed_qc_in_frame(value, ref_img.shape, roi_box)
-                        for name, value in qc_datasets.items()
-                    }
-
-            # Record result.
-            if eta_mm is not None:
-                if result_store is not None:
-                    attrs = {
-                        "status": "ok",
-                        "frame_path": str(frame_path.name),
-                    }
-                    calibration = getattr(computation, "calibration", None)
-                    if calibration is not None:
-                        attrs.update(calibration)
-                        if "pattern_period_mm" in calibration and "checker_cell_mm" not in attrs:
-                            attrs["checker_cell_mm"] = float(calibration["pattern_period_mm"])
-                            attrs["checker_cell_semantics"] = (
-                                "single checker cell side length, not full black-white cycle"
-                            )
-                    attrs.update(getattr(computation, "qc_attrs", {}) or {})
-                    result_store.write_frame(
-                        "default", frame_idx, eta_mm, attrs,
-                        qc_datasets=qc_datasets,
-                    )
-                    if calibration is not None:
-                        ctx["frame_calibrations"].append(dict(calibration))
+            if result is not None:
+                _write_frame_result(result_store, project, frame_idx, frame_path, result, ctx)
                 if not stream_results:
-                    eta_list[ordinal] = eta_mm
+                    eta_list[ordinal] = result.eta_mm
+                accumulator.update(result.eta_mm)
                 processed += 1
-                # Update incremental running mean.
-                if _eta_sum is None:
-                    _eta_sum = np.zeros_like(eta_mm, dtype=np.float64)
-                    _eta_count = np.zeros(eta_mm.shape, dtype=np.int64)
-                if eta_mm.shape == _eta_sum.shape:
-                    valid = np.isfinite(eta_mm)
-                    _eta_sum[valid] += eta_mm[valid]
-                    _eta_count[valid] += 1
             else:
                 errors += 1
                 if result_store is not None:
                     result_store.write_frame(
-                        "default", frame_idx,
-                        np.zeros((1, 1), dtype=np.float64),
+                        "default", frame_idx, np.zeros((1, 1), dtype=np.float64),
                         {"status": "error", "message": err or "",
                          "frame_path": str(frame_path.name)},
                     )
+            yield _frame_progress_event(self.name, run_id, frame_idx, frame_path.name,
+                                        processed, errors, frame_count, t0)
 
-            yield _emit_frame_progress(frame_idx, frame_path.name)
-
-        # Compute and store precomputed mean in ctx for PostprocessStage.
-        if _eta_sum is not None and _eta_count is not None:
-            safe_count = np.maximum(_eta_count, 1)
-            precomp_mean = _eta_sum / safe_count
-            precomp_mean[_eta_count == 0] = np.nan
-            ctx["precomputed_eta_mean"] = precomp_mean
-            ctx["precomputed_eta_count"] = int(np.nansum(_eta_count > 0))
-
-        # Store eta stack in context for postprocess (drop None slots = errored frames)
         ctx["eta_list"] = [e for e in eta_list if e is not None]
         ctx["batches_processed"] = ["default"]
         ctx["compute_errors"] = errors
@@ -632,6 +436,72 @@ class ComputeStage:
 
     def dry_run(self, ctx: dict) -> list[str]:
         return ["process_frames", "write_per_frame_hdf5"]
+
+
+def _resolve_stream_results(
+    result_store: HDF5ResultStore | None, ref_img: np.ndarray, frame_count: int
+) -> bool:
+    import os as _os
+    env = _os.environ.get("OPENFCD_STREAM_RESULTS", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return result_store is not None
+    if env in ("0", "false", "no", "off"):
+        return False
+    estimated = ref_img.nbytes * frame_count
+    return result_store is not None and (frame_count > 50 or estimated > 400_000_000)
+
+
+def _write_frame_result(
+    result_store: HDF5ResultStore | None,
+    project: ProjectModel,
+    frame_idx: int,
+    frame_path: Path,
+    result,
+    ctx: dict,
+) -> None:
+    if result_store is None:
+        return
+    attrs: dict = {"status": "ok", "frame_path": str(frame_path.name)}
+    calibration = result.calibration
+    if calibration:
+        attrs.update(calibration)
+        if "pattern_period_mm" in calibration and "checker_cell_mm" not in attrs:
+            attrs["checker_cell_mm"] = float(calibration["pattern_period_mm"])
+            attrs["checker_cell_semantics"] = (
+                "single checker cell side length, not full black-white cycle"
+            )
+    attrs.update(result.qc_attrs or {})
+    try:
+        from openfcd.pipeline.qc import qc_verdict, thresholds_from_config
+        verdict = qc_verdict(attrs, thresholds_from_config(getattr(project, "qc", None)))
+        attrs["qc_verdict"] = verdict["verdict"]
+        attrs["qc_reasons"] = "; ".join(verdict["reasons"])
+    except Exception as exc:  # noqa: BLE001
+        attrs["qc_verdict"] = "WARN"
+        attrs["qc_reasons"] = f"qc verdict unavailable: {exc}"
+    result_store.write_frame(
+        "default", frame_idx, result.eta_mm, attrs, qc_datasets=result.qc_datasets,
+    )
+    if calibration:
+        ctx["frame_calibrations"].append(dict(calibration))
+
+
+def _frame_progress_event(
+    stage_name: str, run_id: str, frame_idx: int, frame_name: str,
+    processed: int, errors: int, frame_count: int, t0: float,
+) -> StageEvent:
+    prog = (processed + errors) / max(frame_count, 1)
+    done = processed + errors
+    elapsed = time.time() - t0
+    eta_sec = (elapsed / done) * (frame_count - done) if done > 0 else 0.0
+    return StageEvent(
+        kind="progress", stage=stage_name, batch="default",
+        frame_idx=frame_idx, substage="processing_frame", progress=prog,
+        total=frame_count, completed=processed,
+        metrics={"frame": frame_name, "errors": errors,
+                 "eta_seconds": round(eta_sec, 1)},
+        run_id=run_id,
+    )
 
 
 class PostprocessStage:
@@ -662,12 +532,15 @@ class PostprocessStage:
             )
             return
 
+        accumulator = ctx.get("eta_accumulator")
+        precomputed_mean = accumulator.finalize() if accumulator is not None else None
+        precomputed_count = accumulator.n_valid_pixels if accumulator is not None else 0
         if result_store is not None:
             summary = _summarize_results(
                 eta_list,
                 result_store,
-                precomputed_mean=ctx.get("precomputed_eta_mean"),
-                precomputed_count=ctx.get("precomputed_eta_count", 0),
+                precomputed_mean=precomputed_mean,
+                precomputed_count=precomputed_count,
             )
             if summary is not None:
                 eta_mean, eta_median, eta_rms, n_valid = summary
@@ -716,509 +589,6 @@ class PostprocessStage:
 
 
 # ---------------------------------------------------------------------------
-# Helper: embed ROI-sized η into full-frame NaN canvas
-# ---------------------------------------------------------------------------
-
-
-def _embed_eta_in_frame(
-    eta_mm: np.ndarray,
-    ref_shape: tuple[int, int],
-    roi_box,
-) -> np.ndarray:
-    """Embed ROI-sized eta_mm into a full-frame NaN canvas.
-
-    Uses centering logic so Run results are spatially identical to
-    single-frame compute for the same inputs.
-    """
-    h_ref, w_ref = ref_shape
-    eta_full = np.full((h_ref, w_ref), np.nan, dtype=np.float64)
-    if roi_box is not None:
-        r0 = max(0, roi_box.row0)
-        c0 = max(0, roi_box.col0)
-        r1 = min(h_ref, roi_box.row0 + roi_box.height)
-        c1 = min(w_ref, roi_box.col0 + roi_box.width)
-    else:
-        r0, c0, r1, c1 = 0, 0, h_ref, w_ref
-    box_h, box_w = r1 - r0, c1 - c0
-    eh, ew = eta_mm.shape
-    dr = max(0, (box_h - eh) // 2)
-    dc = max(0, (box_w - ew) // 2)
-    ef_h = min(eh, box_h - dr)
-    ef_w = min(ew, box_w - dc)
-    if ef_h > 0 and ef_w > 0:
-        eta_full[r0 + dr : r0 + dr + ef_h, c0 + dc : c0 + dc + ef_w] = eta_mm[:ef_h, :ef_w]
-    return eta_full
-
-
-def _embed_qc_in_frame(
-    arr: np.ndarray,
-    ref_shape: tuple[int, int],
-    roi_box,
-) -> np.ndarray:
-    """Embed ROI-sized QC data using the same placement as eta output."""
-    data = np.asarray(arr)
-    if data.shape == ref_shape:
-        return data
-    h_ref, w_ref = ref_shape
-    fill = False if data.dtype == bool else np.nan
-    out = np.full((h_ref, w_ref), fill, dtype=data.dtype if data.dtype == bool else np.float64)
-    if roi_box is not None:
-        r0 = max(0, roi_box.row0)
-        c0 = max(0, roi_box.col0)
-        r1 = min(h_ref, roi_box.row0 + roi_box.height)
-        c1 = min(w_ref, roi_box.col0 + roi_box.width)
-    else:
-        r0, c0, r1, c1 = 0, 0, h_ref, w_ref
-    box_h, box_w = r1 - r0, c1 - c0
-    dh, dw = data.shape
-    dr = max(0, (box_h - dh) // 2)
-    dc = max(0, (box_w - dw) // 2)
-    ef_h = min(dh, box_h - dr)
-    ef_w = min(dw, box_w - dc)
-    if ef_h > 0 and ef_w > 0:
-        out[r0 + dr : r0 + dr + ef_h, c0 + dc : c0 + dc + ef_w] = data[:ef_h, :ef_w]
-    return out
-
-
-
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-class _RefInvariants:
-    """Frame-invariant ref-side work: ROI-cropped ref + its flatfield.
-
-    Computed once per run and shared across all frames. Skipped when fast_preview
-    is on (each preview call has its own downsample factor → different sigma)."""
-
-    __slots__ = ("ref_img", "ref_ff", "sigma")
-
-    def __init__(self, ref_img: np.ndarray, ref_ff: np.ndarray, sigma: float):
-        self.ref_img = ref_img
-        self.ref_ff = ref_ff
-        self.sigma = sigma
-
-
-def _compute_ref_invariants(
-    ref_img: np.ndarray, project: ProjectModel, roi_box=None
-) -> _RefInvariants:
-    """Hoist ROI crop + flatfield of the reference image (constant across frames)."""
-    from openfcd.core.flatfield import flatfield_normalize
-
-    if getattr(project.process, "flatfield_sigma_auto", True):
-        h_img, w_img = ref_img.shape
-        sigma = float(np.clip(max(h_img, w_img) * 0.06, 100.0, 2000.0))
-    else:
-        sigma = float(project.process.flatfield_sigma)
-    if roi_box is not None:
-        r0 = max(0, roi_box.row0)
-        c0 = max(0, roi_box.col0)
-        r1 = min(ref_img.shape[0], roi_box.row0 + roi_box.height)
-        c1 = min(ref_img.shape[1], roi_box.col0 + roi_box.width)
-        ref_img = ref_img[r0:r1, c0:c1]
-    ref_ff = flatfield_normalize(ref_img, sigma=sigma)
-    return _RefInvariants(ref_img=ref_img, ref_ff=ref_ff, sigma=sigma)
-
-
-def _compute_single_frame(
-    ref_img: np.ndarray,
-    def_img: np.ndarray,
-    geom,
-    project: ProjectModel,
-    roi_box=None,
-    robot_poly=None,
-    robot_pad_px: int = 4,
-    fast_preview: bool = False,
-    progress_cb=None,
-    *,
-    ref_invariants: "_RefInvariants | None" = None,
-    cancel: CancelToken | None = None,
-) -> FrameComputation:
-    """Run the FCD pipeline on a single (reference, deformed) pair.
-
-    Uses core functions directly rather than the file-based process() API,
-    since we already have the images loaded in memory.
-
-    Args:
-        roi_box:      optional Box for ROI crop (from annotation)
-        robot_poly:   optional Polygon for occlusion mask (from annotation mask)
-        robot_pad_px: pixels to dilate the occlusion mask
-        fast_preview: if True, auto-downsample images >3000px on longest side;
-                      cleanup still runs before upsampling.
-        progress_cb:  optional callable(pct: int, label: str) for progress updates
-        ref_invariants: precomputed ROI-cropped ref + flatfield (run-loop hoist).
-                        Mutually exclusive with fast_preview.
-    """
-    def _report(pct: int, label: str) -> None:
-        if cancel is not None:
-            cancel.check()
-        if progress_cb is not None:
-            progress_cb(pct, label)
-    from openfcd.core.fcd import (
-        calculate_carriers,
-        carrier_amplitude,
-        carriers_pixel_per_mm,
-        fcd_displacement,
-        fftinvgrad,
-    )
-    from openfcd.core.flatfield import flatfield_normalize
-    from openfcd.core.inpaint import inpaint_fft, synthesize_from_carriers
-    from openfcd.core.mask import (
-        polygon_mask,
-        auto_mask,
-        detect_filament_occluders,
-        find_oriented_polygon,
-        find_largest_interior_blob,
-    )
-    from openfcd.pipeline.compute import (
-        cosine_taper,
-        carrier_phase_residual,
-        detrend_plane,
-        edge_margin_mask,
-        eta_confidence_mask,
-        fill_small_eta_holes,
-        poisson_residual_diagnostics,
-        repair_eta_confidence_artifacts,
-        suppress_nonphysical_eta_filaments,
-    )
-
-    if ref_invariants is not None and fast_preview:
-        # fast_preview path performs its own downsample → cached sigma/ref_ff
-        # would be wrong. Drop the hoist for safety.
-        ref_invariants = None
-
-    if ref_invariants is not None:
-        sigma = ref_invariants.sigma
-    elif getattr(project.process, "flatfield_sigma_auto", True):
-        h_img, w_img = ref_img.shape
-        sigma = float(np.clip(max(h_img, w_img) * 0.06, 100.0, 2000.0))
-    else:
-        sigma = project.process.flatfield_sigma
-    taper_alpha = project.process.taper.alpha
-    edge_mm = project.process.edge_nan_mm
-    small_hole_radius_mm = float(getattr(project.process, "small_hole_fill_radius_mm", 1.0))
-    same_input = np.array_equal(ref_img, def_img)
-
-    # Fast-preview: auto-downsample images wider/taller than 3000px.
-    # Processing at half resolution is ~4× faster; result is upsampled back.
-    _original_shape: tuple | None = None
-    _downsample_scale = 1.0  # tracks pixel scale for sigma correction
-    if fast_preview:
-        h0, w0 = ref_img.shape
-        # Target ~2500px on longest side (factor=2 for 5000-5999px, etc.)
-        # Capped at factor=2 to keep carrier period ≥25px and HP sigma > wave period
-        factor = min(2, max(h0, w0) // 2500)
-        if factor >= 2:
-            from scipy.ndimage import zoom
-            scale = 1.0 / factor
-            _downsample_scale = scale
-            ref_img = zoom(ref_img, scale, order=1)
-            def_img = zoom(def_img, scale, order=1)
-            sigma = sigma * scale
-            if robot_poly is not None:
-                from openfcd.core.mask import Polygon as _Polygon
-                robot_poly = _Polygon([(v[0] * scale, v[1] * scale) for v in robot_poly.vertices])
-            if roi_box is not None:
-                from openfcd.core.mask import Box as _Box
-                roi_box = _Box(
-                    row0=int(roi_box.row0 * scale),
-                    col0=int(roi_box.col0 * scale),
-                    height=int(roi_box.height * scale),
-                    width=int(roi_box.width * scale),
-                )
-            _original_shape = (h0, w0)
-
-    _report(5, "Setup")
-
-    # Apply ROI crop if specified. When ref_invariants is supplied, ref_img is
-    # already ROI-cropped; def_img and robot_poly still need the same crop.
-    if roi_box is not None:
-        r0 = max(0, roi_box.row0)
-        c0 = max(0, roi_box.col0)
-        if ref_invariants is None:
-            r1 = min(ref_img.shape[0], roi_box.row0 + roi_box.height)
-            c1 = min(ref_img.shape[1], roi_box.col0 + roi_box.width)
-            ref_img = ref_img[r0:r1, c0:c1]
-        r1d = min(def_img.shape[0], roi_box.row0 + roi_box.height)
-        c1d = min(def_img.shape[1], roi_box.col0 + roi_box.width)
-        def_img = def_img[r0:r1d, c0:c1d]
-        if robot_poly is not None:
-            robot_poly = robot_poly.shifted(-r0, -c0)
-
-    # Flatfield normalization (ref side hoisted out of the run loop when possible)
-    _report(10, "Flatfield")
-    if ref_invariants is not None:
-        ref_img = ref_invariants.ref_img
-        ref_ff = ref_invariants.ref_ff
-    else:
-        ref_ff = flatfield_normalize(ref_img, sigma=sigma)
-    def_ff = flatfield_normalize(def_img, sigma=sigma, bg_src=ref_img)
-    finite_def = np.isfinite(def_img)
-    if finite_def.any():
-        max_level = 255.0 if float(np.nanmax(def_img)) > 1.5 else 1.0
-        saturated = finite_def & ((def_img <= 0.0) | (def_img >= 0.995 * max_level))
-        saturated_ratio = float(saturated.sum() / finite_def.size)
-    else:
-        saturated_ratio = 1.0
-
-    # Find carriers in reference
-    _report(30, "Carriers")
-    carriers0 = calculate_carriers(ref_ff - ref_ff.mean())
-
-    # Scale normalization: rescale ref to match def's carrier period when they differ.
-    # For scale < 1 the function returns a *smaller* ref and the crop coordinates
-    # of def that correspond to it — we must crop def to avoid carrier leakage in
-    # the FCD border region (unpaired def carrier → checkerboard through integration).
-    _fast_preview_active = _original_shape is not None
-    if getattr(project.process, "auto_scale_ref", True):
-        from openfcd.core.registration import scale_normalize_reference
-        ref_ff, carriers0, _scale, _valid_crop = scale_normalize_reference(
-            ref_ff, def_ff, carriers0
-        )
-        if _valid_crop is not None:
-            r0v, c0v, hv, wv = _valid_crop
-            def_ff = def_ff[r0v:r0v + hv, c0v:c0v + wv]
-            if robot_poly is not None:
-                robot_poly = robot_poly.shifted(-r0v, -c0v)
-
-    filament_mask = detect_filament_occluders(def_ff, carriers0)
-    carrier_loss_mask = auto_mask(def_ff, carriers0, threshold_ratio=0.2, dilate_px=4)
-    carrier_amp_map = carrier_amplitude(def_ff, carriers0)
-
-    # Build occlusion mask
-    _report(45, "Inpaint")
-    if robot_poly is not None:
-        # Manual annotation mask
-        occlusion_mask = polygon_mask(ref_ff.shape, robot_poly, dilate_px=robot_pad_px)
-        occlusion_mask |= filament_mask
-        # Inpaint carrier region
-        syn = synthesize_from_carriers(ref_ff - ref_ff.mean(), carriers0)
-        ref_clean = inpaint_fft(ref_ff, occlusion_mask, syn + ref_ff.mean())
-        carriers = calculate_carriers(ref_clean - ref_clean.mean())
-        syn2 = synthesize_from_carriers(ref_clean - ref_clean.mean(), carriers)
-        def_clean = inpaint_fft(def_ff, occlusion_mask, syn2 + ref_clean.mean())
-    else:
-        # Auto-detect occlusion (may fail if scene is clean)
-        auto_poly = find_oriented_polygon(carrier_loss_mask, edge_margin=20)
-        if auto_poly is None:
-            auto_box = find_largest_interior_blob(carrier_loss_mask, edge_margin=20)
-            if auto_box is not None:
-                from openfcd.core.mask import Polygon
-                auto_poly = Polygon.from_box(auto_box)
-        if auto_poly is not None:
-            occlusion_mask = polygon_mask(ref_ff.shape, auto_poly, dilate_px=robot_pad_px)
-            occlusion_mask |= filament_mask
-            syn = synthesize_from_carriers(ref_ff - ref_ff.mean(), carriers0)
-            ref_clean = inpaint_fft(ref_ff, occlusion_mask, syn + ref_ff.mean())
-            carriers = calculate_carriers(ref_clean - ref_clean.mean())
-            syn2 = synthesize_from_carriers(ref_clean - ref_clean.mean(), carriers)
-            def_clean = inpaint_fft(def_ff, occlusion_mask, syn2 + ref_clean.mean())
-        else:
-            # No occlusion detected — process as clean field
-            occlusion_mask = filament_mask.copy()
-            ref_clean = ref_ff
-            def_clean = def_ff
-            carriers = carriers0
-    glint_anchor_mask = occlusion_mask | filament_mask | carrier_loss_mask
-
-    def _finalize_eta(eta: np.ndarray, px_per_mm: float) -> tuple[np.ndarray, float]:
-        # Upsample back to ROI-resolution (undo the fast-preview downsample).
-        # _original_shape is the full image shape but eta is at cropped+downsampled
-        # resolution; use the exact downscale factor instead of stretching to
-        # the full camera shape.
-        if _original_shape is not None:
-            _report(97, "Upsample")
-            from scipy.ndimage import zoom as _zoom
-            valid = np.isfinite(eta)
-            filled = np.where(valid, eta, 0.0)
-            up = round(1.0 / _downsample_scale)
-            eta_up = _zoom(filled, up, order=1)
-            valid_up = _zoom(valid.astype(np.float32), up, order=0) > 0.5
-            eta = np.where(valid_up, eta_up, np.nan)
-            px_per_mm = px_per_mm / _downsample_scale
-
-        if small_hole_radius_mm > 0:
-            _report(98, "Fill holes")
-            eta = fill_small_eta_holes(
-                eta,
-                px_per_mm=px_per_mm,
-                radius_mm=small_hole_radius_mm,
-            )
-        return eta, float(px_per_mm)
-
-    def _finalize_qc_map(arr: np.ndarray) -> np.ndarray:
-        if _original_shape is None:
-            return arr
-        from scipy.ndimage import zoom as _zoom
-        up = round(1.0 / _downsample_scale)
-        order = 0 if arr.dtype == bool else 1
-        out = _zoom(arr.astype(np.float32) if arr.dtype == bool else arr, up, order=order)
-        if arr.dtype == bool:
-            return out > 0.5
-        return out
-
-    # Edge conditioning: taper OR Moisan periodic decomposition (mutually exclusive).
-    # Combining them reintroduces a periodic→zero boundary jump that causes an
-    # artifact ring, so exactly one method is applied.
-    #
-    #  taper_alpha > 0  →  cosine taper (traditional; zeros out edges)
-    #  taper_alpha = 0  →  Moisan (2011) periodic+smooth decomposition:
-    #                       creates a truly periodic image so FFT integration
-    #                       has no boundary artefacts, preserving edge content.
-    _report(65, "Taper/PeriodicBC")
-    if taper_alpha > 0:
-        win = cosine_taper(ref_clean.shape, alpha=taper_alpha)
-        ref_mean = ref_clean.mean()
-        def_mean = def_clean.mean()
-        ref_clean = (ref_clean - ref_mean) * win + ref_mean
-        def_clean = (def_clean - def_mean) * win + def_mean
-    else:
-        from openfcd.core.fcd import periodic_smooth_decompose
-        ref_clean, _ = periodic_smooth_decompose(ref_clean)
-        def_clean, _ = periodic_smooth_decompose(def_clean)
-
-    # Self-test path: reference against itself should produce a zero field.
-    # Returning zeros explicitly is more honest than surfacing algorithmic
-    # carrier/integration residuals as if they were physical waves.
-    if same_input:
-        px_per_mm = carriers_pixel_per_mm(carriers, geom.pattern_period_mm)
-        eta_mm = np.zeros(ref_clean.shape, dtype=np.float64)
-        eta_mm[occlusion_mask] = np.nan
-        if edge_mm > 0:
-            em_px = int(edge_mm * px_per_mm)
-            eta_mm[edge_margin_mask(eta_mm.shape, em_px)] = np.nan
-        eta_mm, px_per_mm = _finalize_eta(eta_mm, px_per_mm)
-        valid_mask = np.isfinite(eta_mm)
-        qc_datasets = {
-            "carrier_amplitude": _finalize_qc_map(carrier_amp_map),
-            "valid_mask": valid_mask,
-            "artifact_mask": np.zeros_like(valid_mask, dtype=bool),
-            "phase_residual": np.zeros_like(eta_mm, dtype=np.float64),
-            "poisson_residual": np.zeros_like(eta_mm, dtype=np.float64),
-            "poisson_residual_x": np.zeros_like(eta_mm, dtype=np.float64),
-            "poisson_residual_y": np.zeros_like(eta_mm, dtype=np.float64),
-            "curl_inconsistency": np.zeros_like(eta_mm, dtype=np.float64),
-        }
-        qc_attrs = {
-            "saturated_ratio": saturated_ratio,
-            "invalid_ratio": float((~valid_mask).sum() / valid_mask.size),
-            "carrier_amp_median": float(np.nanmedian(qc_datasets["carrier_amplitude"])),
-            "poisson_residual_rms": 0.0,
-            "curl_inconsistency_rms": 0.0,
-        }
-        _report(100, "Done")
-        return FrameComputation(
-            eta_mm=eta_mm,
-            pixel_per_mm=px_per_mm,
-            calibration=_frame_calibration(px_per_mm, geom),
-            qc_datasets=qc_datasets,
-            qc_attrs=qc_attrs,
-        )
-
-    # FCD: demodulate and integrate
-    _report(70, "FCD demodulate")
-    disp_u, disp_v = fcd_displacement(def_clean - ref_clean.mean(), carriers, unwrap=False)
-    raw_eta = fftinvgrad(-disp_u, -disp_v)
-
-    # Apply occlusion mask (NaN over masked region)
-    raw_eta[occlusion_mask] = np.nan
-
-    # Detrend
-    _report(80, "Detrend")
-    if project.process.detrend == "plane":
-        valid = np.isfinite(raw_eta) & ~edge_margin_mask(raw_eta.shape, 20)
-        if valid.sum() > 100:
-            raw_eta = detrend_plane(raw_eta, valid=valid)
-
-    # Calibrate: pixel → mm
-    _report(85, "Calibrate")
-    px_per_mm = carriers_pixel_per_mm(carriers, geom.pattern_period_mm)
-    eta_mm = raw_eta / (geom.alpha * geom.h_p_eff_mm * px_per_mm ** 2)
-
-    # Mask edges
-    if edge_mm > 0:
-        em_px = int(edge_mm * px_per_mm)
-        eta_mm[edge_margin_mask(eta_mm.shape, em_px)] = np.nan
-
-    # Optional spatial high-pass: remove large-scale drift (non-physical waves
-    # from ref/def mismatch) while preserving short-wavelength surface waves.
-    hp_sigma = float(getattr(project.process, "highpass_sigma_px", 0.0)) * _downsample_scale
-    if hp_sigma > 0.0:
-        _report(93, "Highpass")
-        from scipy.ndimage import gaussian_filter
-        finite = np.isfinite(eta_mm)
-        filled = np.where(finite, eta_mm, 0.0)
-        # Normalize by the filtered validity mask so NaN gaps don't bleed into the trend
-        weight = gaussian_filter(finite.astype(np.float32), sigma=hp_sigma)
-        trend = gaussian_filter(filled, sigma=hp_sigma) / np.maximum(weight, 1e-6)
-        eta_mm = np.where(finite, eta_mm - trend, np.nan)
-        # Near the valid-region boundary the Gaussian has truncated support and
-        # the trend estimate is unreliable, producing a coloured fringe.  NaN
-        # out a margin wider than the kernel reach (~1.5·σ) to hide it.
-        hp_margin = int(round(1.5 * hp_sigma))
-        if hp_margin > 0:
-            eta_mm[edge_margin_mask(eta_mm.shape, hp_margin)] = np.nan
-
-    _report(94, "Confidence mask")
-    phase_residual = carrier_phase_residual(def_clean - ref_clean.mean(), carriers)
-    artifact_mask = eta_confidence_mask(
-        eta_mm,
-        carrier_amplitude_map=carrier_amp_map,
-        phase_residual=phase_residual,
-        anchor_mask=glint_anchor_mask,
-        occlusion_mask=occlusion_mask,
-    )
-    if artifact_mask.any():
-        eta_mm = repair_eta_confidence_artifacts(eta_mm, artifact_mask)
-        glint_anchor_mask = glint_anchor_mask | artifact_mask
-
-    _report(95, "Glint suppress")
-    eta_mm = suppress_nonphysical_eta_filaments(
-        eta_mm,
-        low_signal_mask=glint_anchor_mask,
-    )
-
-    measured_sx = -disp_u / (geom.alpha * geom.h_p_eff_mm * px_per_mm)
-    measured_sy = -disp_v / (geom.alpha * geom.h_p_eff_mm * px_per_mm)
-    eta_mm, px_per_mm = _finalize_eta(eta_mm, px_per_mm)
-    measured_sx = _finalize_qc_map(measured_sx)
-    measured_sy = _finalize_qc_map(measured_sy)
-    diagnostics = poisson_residual_diagnostics(
-        eta_mm,
-        measured_sx,
-        measured_sy,
-        px_per_mm=px_per_mm,
-    )
-
-    valid_mask = np.isfinite(eta_mm)
-    qc_datasets = {
-        "carrier_amplitude": _finalize_qc_map(carrier_amp_map),
-        "valid_mask": valid_mask,
-        "artifact_mask": _finalize_qc_map(artifact_mask),
-        "phase_residual": _finalize_qc_map(phase_residual),
-        "poisson_residual": _finalize_qc_map(np.asarray(diagnostics["poisson_residual"])),
-        "poisson_residual_x": _finalize_qc_map(np.asarray(diagnostics["poisson_residual_x"])),
-        "poisson_residual_y": _finalize_qc_map(np.asarray(diagnostics["poisson_residual_y"])),
-        "curl_inconsistency": _finalize_qc_map(np.asarray(diagnostics["curl_inconsistency"])),
-    }
-    curl = qc_datasets["curl_inconsistency"]
-    curl_valid = np.isfinite(curl)
-    qc_attrs = {
-        "saturated_ratio": saturated_ratio,
-        "invalid_ratio": float((~valid_mask).sum() / valid_mask.size),
-        "carrier_amp_median": float(np.nanmedian(qc_datasets["carrier_amplitude"])),
-        "poisson_residual_rms": float(diagnostics["poisson_residual_rms"]),
-        "curl_inconsistency_rms": (
-            float(np.sqrt(np.nanmean(curl[curl_valid] ** 2))) if curl_valid.any() else float("nan")
-        ),
-    }
-    _report(100, "Done")
-    return FrameComputation(
-        eta_mm=eta_mm,
-        pixel_per_mm=px_per_mm,
-        calibration=_frame_calibration(px_per_mm, geom),
-        qc_datasets=qc_datasets,
-        qc_attrs=qc_attrs,
-    )
 
 
 def _filter_frames(frames: list[Path], filt: str) -> list[Path]:
@@ -1415,6 +785,7 @@ def run_cmd(
         "batches_processed": [],
         "frame_count": 0,
         "frame_paths": [],
+        "annotation": store.annotation,
         "workers": workers,
     }
 

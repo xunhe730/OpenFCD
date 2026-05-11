@@ -149,6 +149,66 @@ def calibrate_grid(
 
 
 # ---------------------------------------------------------------------------
+# QC diagnostics
+# ---------------------------------------------------------------------------
+
+@app.command("qc-summary")
+def qc_summary(
+    project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
+    run: str | None = typer.Option(None, help="Run ID (default: latest)"),
+    frame: int | None = typer.Option(None, help="Frame ID (default: first frame)"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Single-frame QC PNG output"),
+    output_dir: Path | None = typer.Option(None, "--output-dir", help="Directory for --all QC PNGs"),
+    all_frames: bool = typer.Option(False, "--all", help="Render QC summary PNGs for all frames"),
+) -> None:
+    """Render QC summary figures from an existing run."""
+    from openfcd.cli.cmd_qc import qc_summary_cmd
+
+    try:
+        qc_summary_cmd(project_path, run, frame, output, output_dir, all_frames)
+    except Exception as exc:
+        typer.echo(f"QC summary error: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+
+@app.command("noise-floor")
+def noise_floor(
+    project_path: Path = typer.Argument(..., help="Path to flat-water .ofcd project directory"),
+    frames: str | None = typer.Option(None, help="Frame range/filter for the flat-water run"),
+    run_id: str | None = typer.Option(None, help="Run ID for a new flat-water run"),
+    workers: int = typer.Option(-1, help="Parallel workers (-1=auto)"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Noise-floor JSON summary path"),
+    hdf5_output: Path | None = typer.Option(None, "--hdf5-output", help="Noise-floor HDF5 summary path"),
+    from_run: str | None = typer.Option(None, "--from-run", help="Analyze an existing run instead of recomputing"),
+) -> None:
+    """Run or analyze a flat-water sequence and write noise-floor summary stats."""
+    from openfcd.cli.cmd_qc import noise_floor_cmd
+
+    try:
+        noise_floor_cmd(project_path, frames, run_id, workers, output, hdf5_output, from_run)
+    except Exception as exc:
+        typer.echo(f"Noise-floor error: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+
+@app.command("sensitivity")
+def sensitivity(
+    project_path: Path = typer.Argument(..., help="Path to .ofcd project directory"),
+    run: str | None = typer.Option(None, help="Run ID (default: latest)"),
+    frame: int | None = typer.Option(None, help="Frame ID (default: first frame)"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Sensitivity JSON output"),
+) -> None:
+    """Estimate eta amplitude sensitivity to calibration parameter perturbations."""
+    from openfcd.cli.cmd_qc import sensitivity_cmd
+
+    try:
+        sensitivity_cmd(project_path, run, frame, output)
+    except Exception as exc:
+        typer.echo(f"Sensitivity error: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+
+# ---------------------------------------------------------------------------
 # Project subcommand group
 # ---------------------------------------------------------------------------
 

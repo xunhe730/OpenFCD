@@ -28,6 +28,7 @@ class FileSessionStore:
         self._annotation = annotation or AnnotationSchema()
         self._read_only = read_only
         self._dirty = False
+        self._last_run_id: str | None = None
 
     @classmethod
     def new(cls, dir_path: str | Path, name: str) -> "FileSessionStore":
@@ -51,7 +52,7 @@ class FileSessionStore:
         store = cls(dir_path, project)
         store._scenes: list = []
         store._scenes_dirty: set[str] = set()
-        return store
+        return store  # _last_run_id stays None for new projects
 
     @classmethod
     def open(cls, dir_path: str | Path, read_only: bool = False) -> "FileSessionStore":
@@ -80,6 +81,7 @@ class FileSessionStore:
                 session_data = json.loads(session_path.read_text())
             except Exception:
                 pass
+        store._last_run_id = session_data.get("ui_state", {}).get("last_run_id")
         scenes_order = session_data.get("scenes_order", [])
         # Reorder loaded_scenes according to scenes_order
         id_to_spec = {s.id: s for s in loaded_scenes}
@@ -114,6 +116,7 @@ class FileSessionStore:
         except Exception:
             session_data = {}
         session_data["scenes_order"] = [s.id for s in getattr(self, "_scenes", [])]
+        session_data.setdefault("ui_state", {})["last_run_id"] = self._last_run_id
         tmp_s = session_path.with_suffix(".json.tmp")
         tmp_s.write_text(json.dumps(session_data, indent=2))
         os.replace(tmp_s, session_path)
@@ -141,6 +144,7 @@ class FileSessionStore:
             **manifest,
         }
         (run_dir / "manifest.yaml").write_text(json.dumps(payload, indent=2))
+        self._last_run_id = run_id
 
     def list_runs(self) -> list[dict]:
         runs_dir = self._dir / "runs"
@@ -177,6 +181,14 @@ class FileSessionStore:
     @property
     def dirty(self) -> bool:
         return self._dirty
+
+    @property
+    def last_run_id(self) -> str | None:
+        return self._last_run_id
+
+    @last_run_id.setter
+    def last_run_id(self, value: str | None) -> None:
+        self._last_run_id = value
 
     # ── Scene mutation API ───────────────────────────────────────────
     @property

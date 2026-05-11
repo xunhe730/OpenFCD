@@ -172,11 +172,19 @@ class RunController(QObject):
         workers: int = -1,
         disabled_indices: frozenset[int] = frozenset(),
         frame_paths: tuple[Path, ...] | list[Path] | None = None,
+        session_controller=None,
     ) -> None:
-        """Start a pipeline run in background thread."""
+        """Start a pipeline run in background thread.
+
+        ``session_controller`` must be passed so annotation is flushed to disk
+        on the main thread before the worker opens its own store instance.
+        """
         if self.is_running:
             self.run_failed.emit("Run already in progress")
             return
+
+        if session_controller is not None:
+            session_controller.flush_annotation_to_disk()
 
         path = Path(project_path)
         selected_paths = tuple(Path(p) for p in frame_paths) if frame_paths is not None else None

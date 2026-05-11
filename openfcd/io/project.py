@@ -77,6 +77,18 @@ class ProcessConfig(BaseModel):
     small_hole_fill_radius_mm: float = 1.0
 
 
+class QCConfig(BaseModel):
+    saturated_ratio_warning: float = 0.001
+    invalid_ratio_warning: float = 0.20
+    carrier_amp_median_min_warning: float = 1e-6
+    poisson_norm_warning: float = 0.10
+    poisson_norm_fail: float = 0.20
+    curl_norm_warning: float = 0.10
+    curl_norm_fail: float = 0.20
+    max_abs_phase_warning: float = 0.7 * 3.141592653589793
+    max_abs_phase_fail: float = 0.9 * 3.141592653589793
+
+
 class ProfileConfig(BaseModel):
     px_per_mm: float = 7.27
     skip_mm: float = 5.0
@@ -118,8 +130,8 @@ class OutputConfig(BaseModel):
 
 
 class VizConfig(BaseModel):
-    eta_vmin_mm: float = -0.35
-    eta_vmax_mm: float = 0.35
+    eta_vmin_mm: float | None = None
+    eta_vmax_mm: float | None = None
     cmap: str = "RdBu_r"
     figure_dpi: int = 200
 
@@ -134,6 +146,7 @@ class ProjectModel(BaseModel):
     batches: list[BatchConfig] = Field(default_factory=list)
     mask: MaskConfig = Field(default_factory=MaskConfig)
     process: ProcessConfig = Field(default_factory=ProcessConfig)
+    qc: QCConfig = Field(default_factory=QCConfig)
     profile: ProfileConfig = Field(default_factory=ProfileConfig)
     roi: ROIConfig = Field(default_factory=ROIConfig)
     run: RunConfig = Field(default_factory=RunConfig)

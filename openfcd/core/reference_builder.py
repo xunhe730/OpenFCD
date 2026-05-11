@@ -76,3 +76,52 @@ def build_reference(
         return np.min(stack, axis=0)
     else:
         raise ValueError(f"Unknown reducer: {reducer!r}")
+
+
+def build_reference_from_paths(
+    frames: list[Path],
+    reducer: Literal["median", "mean", "min"] = "mean",
+) -> np.ndarray:
+    """Build a reference image from an explicit list of frame paths.
+
+    Same as :func:`build_reference` but accepts a pre-filtered list of paths
+    instead of re-globbing a directory.  The picker already filtered the
+    user's selection; re-globbing the directory here would silently include
+    disabled or hidden frames.
+
+    Parameters
+    ----------
+    frames : list[Path]
+        Explicit list of image paths to reduce.
+    reducer : str
+        Aggregation method: ``"mean"`` (default), ``"median"``, or ``"min"``.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 grayscale reference image.
+
+    Raises
+    ------
+    ValueError
+        If *frames* is empty.
+    """
+    if not frames:
+        raise ValueError("build_reference_from_paths: empty frame list")
+    from openfcd.pipeline.compute import load_gray
+
+    first = load_gray(frames[0])
+    stack = np.empty((len(frames), *first.shape), dtype=np.float64)
+    stack[0] = first
+    for i, p in enumerate(frames[1:], 1):
+        stack[i] = load_gray(p)
+
+    reducers: dict[str, object] = {
+        "median": np.median,
+        "mean": np.mean,
+        "min": np.min,
+    }
+    fn = reducers.get(reducer)
+    if fn is None:
+        raise ValueError(f"Unknown reducer: {reducer!r}")
+    return fn(stack, axis=0)  # type: ignore[operator]

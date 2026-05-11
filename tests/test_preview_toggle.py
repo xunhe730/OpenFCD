@@ -1,7 +1,12 @@
-import os; os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import pytest
 pytest.importorskip("PyQt6")
+import numpy as np
 from PyQt6.QtWidgets import QApplication
+from openfcd.gui.mainwindow import MainWindow
 from openfcd.gui.widgets.toolbar import Toolbar
 
 @pytest.fixture(scope="session")
@@ -65,3 +70,41 @@ def test_preview_signals_emitted(qapp):
     # But toggling via _btn_preview_toggle directly does emit
     t._btn_preview_toggle.toggle()
     assert len(received) == 1
+
+
+def test_main_window_syncs_toolbar_colorbar_to_preview(qapp):
+    class _Toolbar:
+        def preview_on(self) -> bool:
+            return True
+
+        def overlap_on(self) -> bool:
+            return True
+
+        def colorbar_on(self) -> bool:
+            return True
+
+    class _Preview:
+        def __init__(self) -> None:
+            self.colorbar = None
+            self.shown = None
+
+        def set_colorbar(self, val: bool) -> None:
+            self.colorbar = val
+
+        def show_eta_overlay(self, eta, **kwargs) -> None:
+            self.shown = (np.asarray(eta), kwargs)
+
+        def clear_eta_overlay(self) -> None:
+            self.shown = None
+
+    window = MainWindow.__new__(MainWindow)
+    window._toolbar = _Toolbar()
+    window._preview = _Preview()
+    window._current_frame_idx = 0
+    window._frame_eta_cache = {0: np.ones((2, 2))}
+    window._run_eta_frames = None
+
+    window._reapply_run_eta()
+
+    assert window._preview.colorbar is True
+    np.testing.assert_array_equal(window._preview.shown[0], np.ones((2, 2)))

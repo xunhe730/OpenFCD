@@ -134,15 +134,16 @@ def test_compute_stage_preserves_gui_frame_ids_for_disabled_frames(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Disabled GUI frames are skipped without renumbering HDF5 frame IDs."""
-    import openfcd.cli.cmd_run as cmd_run
+    from openfcd.pipeline.frame import FrameResult
 
     proj, project_dir, frames = _make_project(tmp_path, n_frames=3)
     h5_path = project_dir / "results.h5"
 
-    def _fake_compute(ref_img, _def_img, *_args, **_kwargs):
-        return np.zeros(ref_img.shape, dtype=np.float64)
+    def _fake_compute_frame(inputs, *, progress_cb=None, cancel=None):
+        eta = np.zeros(inputs.ref_shape, dtype=np.float64)
+        return FrameResult(eta_mm=eta, qc_datasets=None, diagnostics={})
 
-    monkeypatch.setattr(cmd_run, "_compute_single_frame", _fake_compute)
+    monkeypatch.setattr("openfcd.pipeline.frame.compute_frame", _fake_compute_frame)
     result_store = HDF5ResultStore.open(h5_path, "w")
     ctx = {
         "project": proj,
@@ -175,17 +176,15 @@ def test_compute_stage_preserves_gui_frame_ids_for_disabled_frames(
 def test_compute_stage_propagates_in_frame_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cancel during _compute_single_frame should stop the run, not become a frame error."""
-    import openfcd.cli.cmd_run as cmd_run
-
+    """Cancel during compute_frame should stop the run, not become a frame error."""
     proj, project_dir, frames = _make_project(tmp_path, n_frames=1)
 
-    def _fake_compute(*_args, **kwargs):
-        cancel = kwargs["cancel"]
-        cancel.cancel()
-        cancel.check()
+    def _fake_compute_frame(inputs, *, progress_cb=None, cancel=None):
+        if cancel is not None:
+            cancel.cancel()
+            cancel.check()
 
-    monkeypatch.setattr(cmd_run, "_compute_single_frame", _fake_compute)
+    monkeypatch.setattr("openfcd.pipeline.frame.compute_frame", _fake_compute_frame)
 
     ctx = {
         "project": proj,

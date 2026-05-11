@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QWidget,
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from openfcd.gui import tokens
 
 
@@ -20,11 +21,14 @@ class FramePickerDialog(QDialog):
         frames: list[Path] | list[str] | None = None,
         run_exists: bool = False,
         preselected: list[int] | None = None,
+        disabled: list[int] | set[int] | None = None,
     ) -> None:
         super().__init__(parent)
         self._frames = [str(f) if isinstance(f, Path) else f for f in (frames or [])]
         self._run_exists = run_exists
-        self._preselected = set(preselected or [])
+        self._disabled = set(int(i) for i in (disabled or []))
+        # Disabled frames must never end up selected — strip them upfront.
+        self._preselected = {i for i in (preselected or []) if i not in self._disabled}
         self.setWindowTitle("Select Frames")
         self.setMinimumSize(480, 400)
         self._setup_ui()
@@ -51,9 +55,18 @@ class FramePickerDialog(QDialog):
         # List
         self._list = QListWidget()
         for i, name in enumerate(self._frames):
-            item = QListWidgetItem(f"{i:4d}  {Path(name).name}")
+            is_disabled = i in self._disabled
+            label = f"{i:4d}  {Path(name).name}"
+            if is_disabled:
+                label += "  [disabled]"
+            item = QListWidgetItem(label)
             item.setCheckState(Qt.CheckState.Checked if i in self._preselected else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, i)
+            if is_disabled:
+                # Strip user-checkable so the row cannot be toggled on.
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
+                              & ~Qt.ItemFlag.ItemIsSelectable)
+                item.setForeground(QColor(tokens.TEXT_MUTED))
             self._list.addItem(item)
         self._list.itemChanged.connect(lambda _: self._update_count())
         layout.addWidget(self._list)
@@ -81,9 +94,16 @@ class FramePickerDialog(QDialog):
         n = len(self.selected_indices())
         self._count_lbl.setText(f"{n} / {self._list.count()} selected")
 
+    def _set_state(self, i: int, state: Qt.CheckState) -> None:
+        """Set check state, but never toggle disabled rows on."""
+        if i in self._disabled:
+            self._list.item(i).setCheckState(Qt.CheckState.Unchecked)
+            return
+        self._list.item(i).setCheckState(state)
+
     def _select_all(self) -> None:
         for i in range(self._list.count()):
-            self._list.item(i).setCheckState(Qt.CheckState.Checked)
+            self._set_state(i, Qt.CheckState.Checked)
 
     def _invert(self) -> None:
         for i in range(self._list.count()):
@@ -93,7 +113,7 @@ class FramePickerDialog(QDialog):
                 if item.checkState() == Qt.CheckState.Checked
                 else Qt.CheckState.Checked
             )
-            item.setCheckState(state)
+            self._set_state(i, state)
 
     def _stride(self) -> None:
         from PyQt6.QtWidgets import QInputDialog
@@ -102,7 +122,7 @@ class FramePickerDialog(QDialog):
             return
         for i in range(self._list.count()):
             state = Qt.CheckState.Checked if i % n == 0 else Qt.CheckState.Unchecked
-            self._list.item(i).setCheckState(state)
+            self._set_state(i, state)
 
     def _range_select(self) -> None:
         from PyQt6.QtWidgets import QInputDialog
@@ -116,11 +136,12 @@ class FramePickerDialog(QDialog):
             return
         for i in range(self._list.count()):
             state = Qt.CheckState.Checked if lo <= i <= hi else Qt.CheckState.Unchecked
-            self._list.item(i).setCheckState(state)
+            self._set_state(i, state)
 
     def selected_indices(self) -> list[int]:
         return [
             self._list.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self._list.count())
             if self._list.item(i).checkState() == Qt.CheckState.Checked
+            and i not in self._disabled
         ]

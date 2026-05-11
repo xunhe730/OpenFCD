@@ -11,8 +11,10 @@ pytest.importorskip("PyQt6")
 
 from PyQt6.QtWidgets import QApplication, QMenu
 
+from openfcd.gui import tokens
 from openfcd.gui.mainwindow import MainWindow
 from openfcd.gui.preferences import UserPrefs
+from openfcd.gui.widgets.title_bar import TitleBarWidget
 
 
 @pytest.fixture(scope="session")
@@ -111,3 +113,38 @@ def test_help_about_triggers_without_error(main_window, monkeypatch) -> None:
     main_window._on_about()
     assert called["title"] == "About OpenFCD"
     assert "OpenFCD" in called["body"]
+
+
+def test_title_bar_does_not_draw_fake_window_controls(qapp) -> None:
+    bar = TitleBarWidget()
+    assert bar._right_controls == []
+
+
+def test_title_bar_menu_labels_are_transparent(qapp) -> None:
+    bar = TitleBarWidget()
+    assert bar._menus
+    for label in bar._menus:
+        style = label.styleSheet()
+        assert "background:transparent" in style
+        assert "border:none" in style
+
+
+def test_main_window_global_style_covers_dark_menu_contrast(main_window) -> None:
+    main_window._apply_theme()
+    style = main_window.styleSheet()
+    assert "QMenu::item" in style
+    assert "background: transparent" in style
+    assert "selection-color" in style
+
+
+def test_dark_mode_applies_readable_qt_palette(main_window, qapp) -> None:
+    try:
+        tokens.set_dark_mode(True)
+        main_window._apply_theme()
+        palette = qapp.palette()
+        assert palette.windowText().color().name().upper() == tokens.TEXT_PRIMARY
+        assert palette.text().color().name().upper() == tokens.TEXT_PRIMARY
+        assert palette.base().color().name().upper() == tokens.BG_TERTIARY
+    finally:
+        tokens.set_dark_mode(False)
+        main_window._apply_theme()

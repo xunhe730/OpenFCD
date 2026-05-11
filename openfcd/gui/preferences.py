@@ -27,6 +27,9 @@ _DEFAULTS: dict[str, Any] = {
     "recent_projects": [],
     "fast_compute": False,
     "last_export_dir": "",
+    "window_geometry": b"",
+    "window_state": b"",
+    "splitter_state": b"",
 }
 
 
@@ -78,6 +81,19 @@ class UserPrefs:
 
     def _set(self, key: str, value: Any) -> None:
         self._backend[key] = value
+
+    @staticmethod
+    def _coerce_bytes(value: Any, default: bytes = b"") -> bytes:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value)
+        # QByteArray (optional dep — check by class name to avoid import at module level)
+        if type(value).__name__ == "QByteArray":
+            return bytes(value)
+        if isinstance(value, str):
+            # QSettings on macOS plist may round-trip QByteArray as a str;
+            # latin-1 is byte-preserving (maps 0x00-0xFF identically).
+            return value.encode("latin-1", errors="ignore")
+        return default
 
     @staticmethod
     def _coerce_float(value: Any, default: float) -> float:
@@ -213,6 +229,31 @@ class UserPrefs:
 
     def clear_recent_projects(self) -> None:
         self._set("recent_projects", [])
+
+    # ── window geometry / state ────────────────────────────────────────
+    @property
+    def window_geometry(self) -> bytes:
+        return self._coerce_bytes(self._get("window_geometry", b""))
+
+    @window_geometry.setter
+    def window_geometry(self, value: bytes | bytearray) -> None:
+        self._set("window_geometry", bytes(value or b""))
+
+    @property
+    def window_state(self) -> bytes:
+        return self._coerce_bytes(self._get("window_state", b""))
+
+    @window_state.setter
+    def window_state(self, value: bytes | bytearray) -> None:
+        self._set("window_state", bytes(value or b""))
+
+    @property
+    def splitter_state(self) -> bytes:
+        return self._coerce_bytes(self._get("splitter_state", b""))
+
+    @splitter_state.setter
+    def splitter_state(self, value: bytes | bytearray) -> None:
+        self._set("splitter_state", bytes(value or b""))
 
     # ── bulk reset ─────────────────────────────────────────────────────
     def reset(self) -> None:
