@@ -59,6 +59,10 @@ class _RunWorker(QThread):
             project = store.project
             run_id = "run-latest"
 
+            # Snapshot annotation before the run starts so in-flight GUI edits
+            # (e.g. user changes wave_stats config mid-run) do not cause races.
+            self._annotation_snapshot = store.annotation.model_copy(deep=True)
+
             # Delete the previous run so results don't accumulate.
             import shutil as _shutil
             run_dir = store._dir / "runs" / run_id
@@ -78,7 +82,7 @@ class _RunWorker(QThread):
                 "batches_processed": [],
                 "frame_count": 0,
                 "frame_paths": [],
-                "annotation": store.annotation,  # pass annotation for ROI/mask
+                "annotation": self._annotation_snapshot,  # frozen snapshot, not live store.annotation
                 "workers": self._workers,
                 "disabled_frame_indices": self._disabled_indices,
             }

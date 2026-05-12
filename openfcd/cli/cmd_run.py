@@ -570,6 +570,25 @@ class PostprocessStage:
                     meta=meta,
                 )
 
+        # Wave statistics (no-op if annotation.wave_stats is None)
+        if result_store is not None:
+            try:
+                self._inject_wave_stats(result_store, ctx, run_id)
+                yield StageEvent(
+                    kind="progress", stage=self.name, batch=None, frame_idx=None,
+                    substage="wave_stats_done", progress=0.98,
+                    total=total_frames, completed=total_frames,
+                    metrics={"wave_stats": "ok"}, run_id=run_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                yield StageEvent(
+                    kind="progress", stage=self.name, batch=None, frame_idx=None,
+                    substage="wave_stats_warning", progress=0.98,
+                    total=total_frames, completed=total_frames,
+                    metrics={"wave_stats_warning": str(exc), "level": "WARNING"},
+                    run_id=run_id,
+                )
+
         # Write metadata
         if result_store is not None:
             result_store._file.attrs["annotation_fingerprint"] = _quick_fingerprint(project)
@@ -584,8 +603,77 @@ class PostprocessStage:
             run_id=run_id,
         )
 
+    def _inject_wave_stats(
+        self,
+        store: HDF5ResultStore,
+        ctx: dict,
+        run_id: str = "",
+    ) -> None:
+        """Compute wave statistics and write them into the open result store.
+
+        No-op if annotation.wave_stats or annotation.profile_line is None.
+        Reads η frames directly from the open h5 handle (same process).
+        """
+        from openfcd.pipeline.wave_stats_pipeline import compute_and_write_wave_stats
+
+        annotation = ctx.get("annotation")
+        if annotation is None:
+            return
+        if annotation.wave_stats is None or annotation.profile_line is None:
+            return
+
+        batches: list[str] = ctx.get("batches_processed", ["default"])
+        project: ProjectModel = ctx["project"]
+
+        # ── px_per_mm from batch attrs already written by write_batch ──────
+        px_per_mm_by_batch: dict[str, float] = {}
+        for b in batches:
+            try:
+                meta = store.read_batch_meta(b)
+                px_per_mm_by_batch[b] = float(meta.get("pixel_per_mm_median", 1.0))
+            except Exception:  # noqa: BLE001
+                px_per_mm_by_batch[b] = 1.0
+
+        # ── Body polygons from annotation.frame_polygons ────────────────────
+        # frame_polygons is keyed by frame ID (e.g. "Img0042"), NOT by batch
+        # name. Iterate frames recorded in the h5 and look them up directly.
+        # Fallback to annotation.polygons[0] (static, batch-wide) if a frame
+        # has no per-frame entry; finally None if neither exists.
+        body_polygons_by_batch_frame: dict[str, dict[str, np.ndarray | None]] = {}
+        for b in batches:
+            per_frame: dict[str, np.ndarray | None] = {}
+            try:
+                frame_ids = store.list_frames(b)
+            except Exception:  # noqa: BLE001
+                frame_ids = []
+            for fid in frame_ids:
+                fid_str = str(fid)
+                poly_rc: np.ndarray | None = None
+                poly_list = annotation.frame_polygons.get(fid_str, [])
+                for p in poly_list:
+                    if p.label == "body" and p.vertex_count >= 3:
+                        poly_rc = p.as_rc_array()
+                        break
+                if poly_rc is None and annotation.polygons:
+                    poly_rc = annotation.polygons[0].as_rc_array()
+                per_frame[fid_str] = poly_rc
+            body_polygons_by_batch_frame[b] = per_frame
+
+        # ── η loader: read directly from the open h5 handle ────────────────
+        def eta_loader(batch: str, frame_id_str: str) -> np.ndarray:
+            return store._file[f"batches/{batch}/frames/{frame_id_str}"][:]
+
+        compute_and_write_wave_stats(
+            annotation=annotation,
+            store=store,
+            batches=batches,
+            px_per_mm_by_batch=px_per_mm_by_batch,
+            body_polygons_by_batch_frame=body_polygons_by_batch_frame,
+            eta_loader=eta_loader,
+        )
+
     def dry_run(self, ctx: dict) -> list[str]:
-        return ["compute_summaries", "write_metadata", "close_store"]
+        return ["compute_summaries", "wave_stats", "write_metadata", "close_store"]
 
 
 # ---------------------------------------------------------------------------

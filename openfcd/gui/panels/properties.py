@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QSlider, QDoubleSpinBox, QSpinBox,
     QScrollArea,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QIcon
 
 from openfcd.gui import tokens
@@ -571,12 +571,107 @@ class ComputePanel(QWidget):
         outer.addWidget(scroll)
 
 
-class RunSummaryPanel(QWidget):
-    """Summary for a completed/failed run."""
+class WaveStatsPanel(QWidget):
+    """Wave Stats configuration sub-panel (v2).
+
+    Provides a single peak_prominence_k spinbox and a Recompute button.
+    Per-segment editing lives in the ProfileSceneView table.
+    """
+
+    prominence_k_changed = pyqtSignal(float)
+    recompute_clicked = pyqtSignal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        g = PropGroup("Wave Stats", accent=True)
+        self._prom_spin = QDoubleSpinBox()
+        self._prom_spin.setRange(0.05, 2.0)
+        self._prom_spin.setSingleStep(0.01)
+        self._prom_spin.setDecimals(2)
+        self._prom_spin.setValue(0.30)
+        self._prom_spin.setFixedHeight(24)
+        self._prom_spin.setStyleSheet(self._spin_ss())
+        g.add_row("Prominence k", self._prom_spin)
+        layout.addWidget(g)
+
+        g_act = PropGroup("Postprocess")
+        self._btn_recompute = _action_button(
+            "Recompute Wave Stats", primary=True, icon=get_icon(ICON_RUN)
+        )
+        self._btn_recompute.setEnabled(False)
+        self._btn_recompute.clicked.connect(self.recompute_clicked)
+        g_act.content_layout.addWidget(self._btn_recompute)
+        layout.addWidget(g_act)
+
+        layout.addStretch()
+
+        self._prom_timer = QTimer()
+        self._prom_timer.setInterval(400)
+        self._prom_timer.setSingleShot(True)
+        self._prom_timer.timeout.connect(
+            lambda: self.prominence_k_changed.emit(float(self._prom_spin.value()))
+        )
+
+        self._has_wave_stats = False
+        self._has_run = False
+        self._is_running = False
+
+        self._prom_spin.valueChanged.connect(lambda _: self._prom_timer.start())
+
+    @staticmethod
+    def _spin_ss() -> str:
+        return (
+            f"QDoubleSpinBox {{ background: {tokens.BG_TERTIARY}; "
+            f"border: 1px solid {tokens.BORDER_SUBTLE}; border-radius: 4px; "
+            f"padding: 2px 4px; color: {tokens.TEXT_PRIMARY}; font-size: 11.5px; }}"
+        )
+
+    def _update_recompute_state(self) -> None:
+        enabled = self._has_wave_stats and self._has_run and not self._is_running
+        self._btn_recompute.setEnabled(enabled)
+
+    # ── Public API ────────────────────────────────────────────────
+
+    def set_annotation(self, annotation) -> None:
+        """Populate prominence spinbox from annotation.wave_stats (v2)."""
+        self._prom_timer.stop()
+        ws = annotation.wave_stats if annotation is not None else None
+        # A wave_stats config without segments is treated as "no wave stats"
+        # for the purpose of enabling the recompute button.
+        self._has_wave_stats = ws is not None and len(ws.segments) > 0
+        if ws is not None:
+            self._prom_spin.blockSignals(True)
+            self._prom_spin.setValue(float(ws.peak_prominence_k))
+            self._prom_spin.blockSignals(False)
+        self._update_recompute_state()
+
+    def set_has_run(self, has_run: bool) -> None:
+        self._has_run = has_run
+        self._update_recompute_state()
+
+    def set_running(self, is_running: bool) -> None:
+        self._is_running = is_running
+        self._update_recompute_state()
+
+
+class RunSummaryPanel(QWidget):
+    """Summary for a completed/failed run, with embedded Wave Stats panel."""
+
+    wave_stats_prominence_changed = pyqtSignal(float)
+    wave_stats_recompute_clicked = pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -594,13 +689,29 @@ class RunSummaryPanel(QWidget):
         self._fingerprint.setReadOnly(True)
         g.add_row("Config hash", self._fingerprint)
         layout.addWidget(g)
+
+        # ── embedded Wave Stats sub-panel ──
+        self._wave_stats = WaveStatsPanel()
+        self._wave_stats.prominence_k_changed.connect(self.wave_stats_prominence_changed)
+        self._wave_stats.recompute_clicked.connect(self.wave_stats_recompute_clicked)
+        layout.addWidget(self._wave_stats)
+
         layout.addStretch()
+        scroll.setWidget(content)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
     def set_run_info(self, status: str, frames: str, duration: str, fp: str = "") -> None:
         self._status.setText(status)
         self._frames.setText(frames)
         self._duration.setText(duration)
         self._fingerprint.setText(fp)
+
+    @property
+    def wave_stats_panel(self) -> WaveStatsPanel:
+        return self._wave_stats
 
 
 class VizSettingsPanel(QWidget):
@@ -1019,6 +1130,10 @@ class PropertiesPanel(QStackedWidget):
     edge_nan_changed = pyqtSignal(float)
     small_hole_fill_changed = pyqtSignal(float)
 
+    # Wave Stats signals (relayed from RunSummaryPanel → WaveStatsPanel)
+    wave_stats_prominence_changed = pyqtSignal(float)
+    wave_stats_recompute_clicked = pyqtSignal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setMinimumWidth(250)
@@ -1054,6 +1169,10 @@ class PropertiesPanel(QStackedWidget):
         self._image_properties.small_hole_fill_changed.connect(self.small_hole_fill_changed)
 
         self._compute.run_all_clicked.connect(self.run_all_clicked)
+
+        # Wire wave stats signals from RunSummaryPanel
+        self._run_summary.wave_stats_prominence_changed.connect(self.wave_stats_prominence_changed)
+        self._run_summary.wave_stats_recompute_clicked.connect(self.wave_stats_recompute_clicked)
 
         tokens.on_theme_changed(self._apply_theme)
         self._apply_theme()
@@ -1097,3 +1216,15 @@ class PropertiesPanel(QStackedWidget):
     @property
     def viz_settings_panel(self) -> VizSettingsPanel:
         return self._viz_settings
+
+    # ── Wave Stats delegation ──────────────────────────────────────
+
+    def set_annotation(self, annotation) -> None:
+        """Propagate annotation to the wave stats panel."""
+        self._run_summary.wave_stats_panel.set_annotation(annotation)
+
+    def set_run_state(self, has_run: bool, is_running: bool = False) -> None:
+        """Update the recompute-button enable guards."""
+        self._run_summary.wave_stats_panel.set_has_run(has_run)
+        self._run_summary.wave_stats_panel.set_running(is_running)
+

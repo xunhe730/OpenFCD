@@ -1,4 +1,4 @@
-"""Profile Scene view: per-frame drag-line annotation + composite preview."""
+"""Profile Scene view: per-frame line annotation + composite preview + wave-segment table (v2)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,14 +10,59 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSlider,
     QSizePolicy,
+    QSlider,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from openfcd.gui import tokens
+
+
+# Local color cycle for wave-segment auto-assignment. Kept here (not imported
+# from controllers/) to avoid scenes→controllers upward dependency.
+_COLOR_CYCLE: tuple[str, ...] = (
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+)
+
+
+# ── Module-level pure coordinate helpers ────────────────────────────────────
+
+
+def widget_to_rowcol(
+    pos: QPoint,
+    image_shape: tuple[int, int],
+    image_rect: QRectF,
+) -> tuple[float, float] | None:
+    """Convert widget pixel pos to (row, col) image coordinates."""
+    h, w = image_shape
+    if not image_rect.contains(float(pos.x()), float(pos.y())):
+        return None
+    col = (pos.x() - image_rect.left()) / image_rect.width() * (w - 1)
+    row = (pos.y() - image_rect.top()) / image_rect.height() * (h - 1)
+    return (
+        float(np.clip(row, 0, h - 1)),
+        float(np.clip(col, 0, w - 1)),
+    )
+
+
+def rowcol_to_widget(
+    point: tuple[float, float],
+    image_shape: tuple[int, int],
+    image_rect: QRectF,
+) -> QPoint:
+    """Convert (row, col) image coordinates to widget pixel pos."""
+    h, w = image_shape
+    row, col = point
+    x = image_rect.left() + (col / max(1, w - 1)) * image_rect.width()
+    y = image_rect.top() + (row / max(1, h - 1)) * image_rect.height()
+    return QPoint(int(round(x)), int(round(y)))
+
+
+# ── _LineAnnotator (unchanged: profile-line draw widget) ────────────────────
 
 
 class _LineAnnotator(QWidget):
@@ -53,8 +98,6 @@ class _LineAnnotator(QWidget):
                 crop_to_valid,
             )
 
-            # Share color-range policy with EtaMap so Profile annotation overlay
-            # never saturates differently from the Run-monitor view.
             color_eta = crop_to_valid(np.asarray(image, dtype=float))
             viz_stub = type(
                 "_AnnotatorVizStub",
@@ -94,31 +137,16 @@ class _LineAnnotator(QWidget):
         self._update_image_rect()
 
     def _widget_to_rowcol(self, pos: QPoint) -> tuple[float, float] | None:
-        if (
-            self._image is None
-            or self._image_rect.isEmpty()
-            or not self._image_rect.contains(float(pos.x()), float(pos.y()))
-        ):
+        if self._image is None or self._image_rect.isEmpty():
             return None
-        h, w = self._image.shape[:2]
-        col = (pos.x() - self._image_rect.left()) / self._image_rect.width() * (w - 1)
-        row = (pos.y() - self._image_rect.top()) / self._image_rect.height() * (h - 1)
-        return (
-            float(np.clip(row, 0, h - 1)),
-            float(np.clip(col, 0, w - 1)),
-        )
+        return widget_to_rowcol(pos, self._image.shape[:2], self._image_rect)
 
     def _rowcol_to_widget(self, point: tuple[float, float]) -> QPoint:
         if self._image is None or self._image_rect.isEmpty():
             return QPoint(int(point[1]), int(point[0]))
-        h, w = self._image.shape[:2]
-        row, col = point
-        x = self._image_rect.left() + (col / max(1, w - 1)) * self._image_rect.width()
-        y = self._image_rect.top() + (row / max(1, h - 1)) * self._image_rect.height()
-        return QPoint(int(round(x)), int(round(y)))
+        return rowcol_to_widget(point, self._image.shape[:2], self._image_rect)
 
     def set_committed_line(self, line: tuple | None) -> None:
-        """Show a previously committed line (row,col) coords."""
         if line is None:
             self._line_committed = None
         else:
@@ -133,7 +161,6 @@ class _LineAnnotator(QWidget):
         self.update()
 
     def current_line_rowcol(self) -> tuple[tuple[float, float], tuple[float, float]] | None:
-        """Return committed line as ((r0,c0),(r1,c1)) or None."""
         if self._line_committed is None:
             return None
         return self._line_committed
@@ -172,7 +199,6 @@ class _LineAnnotator(QWidget):
             painter.setPen(QColor(tokens.TEXT_MUTED))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No eta frame")
 
-        # Draw in-progress or committed line
         line = None
         if self._drawing and self._line_start and self._line_end:
             line = (self._line_start, self._line_end)
@@ -186,22 +212,30 @@ class _LineAnnotator(QWidget):
             pen = QPen(QColor(tokens.ACCENT_CLAY), 2, Qt.PenStyle.SolidLine)
             painter.setPen(pen)
             painter.drawLine(line[0], line[1])
-            # Endpoint dots
             painter.setBrush(QColor(tokens.ACCENT_CLAY))
             for p in line:
                 painter.drawEllipse(p, 5, 5)
 
 
+# ── ProfileSceneView ────────────────────────────────────────────────────────
+
+
 class ProfileSceneView(QWidget):
-    """Profile scene: annotation mode + curve view."""
+    """Profile scene: composite figure + wave-segment table + segment-collect interaction."""
 
     scene_changed = pyqtSignal(object)
+    profile_line_changed = pyqtSignal(object)       # ProfileLineData | None
+    wave_stats_config_changed = pyqtSignal(object)  # WaveStatsConfig
+    wave_segment_added = pyqtSignal(object)         # WaveSegment
+    wave_segment_edited = pyqtSignal(int, object)   # (idx, WaveSegment)
+    wave_segment_deleted = pyqtSignal(int)
+    live_stats_changed = pyqtSignal(object)         # FrameWaveStats | None
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._spec = None
         self._project_path: Path | None = None
-        self._eta_frames: dict[int, np.ndarray] = {}  # frame_idx → η array
+        self._eta_frames: dict[int, np.ndarray] = {}
         self._frame_names: dict[int, str] = {}
         self._frame_calibrations: dict[int, object] = {}
         self._annotation = None
@@ -209,11 +243,26 @@ class ProfileSceneView(QWidget):
         self._run_manifest: dict | None = None
         self._current_frame_pos = 0
         self._preferred_frame_pos: int | None = None
+        self._annotating_per_frame: bool = False
+        self._active_segment_idx: int | None = None
+
+        # Matplotlib state: composite figure references and hover overlay artists
+        self._fig = None
+        self._composite_axes: dict | None = None  # {"map", "profile"} after render
+        self._lower_ax = None                     # the 1D profile axis (segment-collect target)
+        self._hover_vline = None
+        self._hover_text = None
+        self._segment_patches: list = []
+        self._peak_artists: list = []                # scatter artists for peaks/troughs
+        self._pending_first_x: float | None = None
+        self._live_frame_stats = None                # FrameWaveStats | None
+
+        # ── Top-level layout ────────────────────────────────────────
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header
+        # Header: title + Edit Lines / Done + Collect Segment + status label
         header = QWidget()
         hl = QHBoxLayout(header)
         hl.setContentsMargins(12, 6, 12, 6)
@@ -229,27 +278,53 @@ class ProfileSceneView(QWidget):
         self._btn_done.clicked.connect(self._finish_annotation)
         self._btn_done.setVisible(False)
         hl.addWidget(self._btn_done)
+        self._btn_collect = QPushButton("采集波段")
+        self._btn_collect.setFixedHeight(24)
+        self._btn_collect.setCheckable(True)
+        self._btn_collect.toggled.connect(self._on_collect_toggled)
+        hl.addWidget(self._btn_collect)
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet(f"color: {tokens.TEXT_SECONDARY}; font-size: 11px;")
+        self._status_lbl.setVisible(False)
+        hl.addWidget(self._status_lbl)
         layout.addWidget(header)
 
-        # Main stack: 0=chart, 1=annotation
+        # ── Body: QStackedWidget — page 0 = composite+table splitter, page 1 = _LineAnnotator
         self._mode_stack = QStackedWidget()
         layout.addWidget(self._mode_stack, 1)
 
-        # Chart widget (matplotlib)
-        self._chart_widget = self._make_chart_widget()
+        # Page 0: splitter (top = composite figure, bottom = wave-segment table).
+        # The whole splitter is the "chart widget" page for stack-currentWidget tests.
+        self._chart_widget = QSplitter(Qt.Orientation.Vertical)
+        self._chart_widget.setChildrenCollapsible(False)
+        self._splitter = self._chart_widget   # alias for clarity
+        self._fig_panel = self._make_chart_widget()
+        self._chart_widget.addWidget(self._fig_panel)
+
+        # Table panel
+        from openfcd.gui.panels.wave_stats_table import WaveStatsTablePanel
+        self._table_panel = WaveStatsTablePanel()
+        self._table_panel.segmentClicked.connect(self._on_table_row_clicked)
+        self._table_panel.segmentEdited.connect(self._on_table_segment_edited)
+        self._table_panel.segmentDeleted.connect(self._on_table_segment_deleted)
+        self._table_panel.visibilityToggled.connect(self._on_table_visibility_toggled)
+        self.live_stats_changed.connect(self._table_panel.set_live_stats)
+        self._chart_widget.addWidget(self._table_panel)
+        self._chart_widget.setStretchFactor(0, 3)
+        self._chart_widget.setStretchFactor(1, 1)
+
         self._mode_stack.addWidget(self._chart_widget)  # 0
 
-        # Annotation widget
+        # Page 1: line annotator (Edit Lines mode)
         self._annotator = _LineAnnotator()
         self._mode_stack.addWidget(self._annotator)  # 1
 
-        # Slider
+        # Slider row
         slider_row = QWidget()
         sr = QHBoxLayout(slider_row)
         sr.setContentsMargins(12, 4, 12, 4)
         self._slider_lbl = QLabel("frame 0/0")
         self._slider = QSlider(Qt.Orientation.Horizontal)
-        # Debounced slider: prevent reentrant matplotlib draw() calls
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(80)
@@ -260,30 +335,43 @@ class ProfileSceneView(QWidget):
         sr.addWidget(self._slider, 1)
         layout.addWidget(slider_row)
 
-    def _on_slider_moved(self, idx: int) -> None:
-        self._pending_idx = idx
-        self._render_timer.start()
-
-    def _do_render(self) -> None:
-        self._on_slider(self._pending_idx)
+    # ── chart widget ──────────────────────────────────────────────────
 
     def _make_chart_widget(self) -> QWidget:
+        container = QWidget()
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
         try:
             from matplotlib.figure import Figure
             from openfcd.gui.widgets.mpl_canvas import CompactCanvas
-            fig = Figure(figsize=(8.6, 5.8))
+
+            fig = Figure(figsize=(8.6, 4.2))
             self._ax = fig.add_subplot(111)
             canvas = CompactCanvas(fig)
             canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            canvas.setMinimumHeight(400)
             canvas.updateGeometry()
             self._fig = fig
-            return canvas
+
+            # Wire matplotlib event handlers for hover + segment-collect clicks
+            try:
+                canvas.mpl_connect("motion_notify_event", self._on_mpl_motion)
+                canvas.mpl_connect("button_press_event", self._on_mpl_click)
+            except Exception:
+                pass
+
+            vl.addWidget(canvas, 1)
+            return container
         except ImportError:
             self._ax = None
             self._fig = None
             lbl = QLabel("matplotlib not available")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            return lbl
+            vl.addWidget(lbl)
+            return container
+
+    # ── lifecycle ─────────────────────────────────────────────────────
 
     def load(self, spec, project_path: Path) -> None:
         self._spec = spec
@@ -300,6 +388,8 @@ class ProfileSceneView(QWidget):
         self._mode_stack.setCurrentIndex(0)
         self._btn_done.setVisible(False)
         self._btn_edit.setVisible(True)
+        self._table_panel.set_annotation(self._annotation)
+        self._table_panel.set_h5_path(self._h5_path(), batch="default")
         missing_pos = self._first_missing_line_pos()
         if missing_pos is not None:
             self._set_frame_pos(missing_pos)
@@ -373,6 +463,13 @@ class ProfileSceneView(QWidget):
         dirs = sorted(d.name for d in runs_dir.iterdir() if d.is_dir())
         return dirs[-1] if dirs else None
 
+    def _on_slider_moved(self, idx: int) -> None:
+        self._pending_idx = idx
+        self._render_timer.start()
+
+    def _do_render(self) -> None:
+        self._on_slider(self._pending_idx)
+
     def _on_slider(self, pos: int) -> None:
         self._current_frame_pos = pos
         total = len(self._spec.frame_indices) if self._spec is not None else 0
@@ -399,12 +496,6 @@ class ProfileSceneView(QWidget):
             return self._spec.frame_indices[pos]
         return None
 
-    def _needs_line_annotation(self) -> bool:
-        if self._spec is None or not self._spec.frame_indices:
-            return False
-        lines = self._spec.profile_lines or {}
-        return any(idx not in lines for idx in self._spec.frame_indices)
-
     def _first_missing_line_pos(self, start_pos: int = 0) -> int | None:
         spec = self._spec
         if spec is None:
@@ -419,7 +510,6 @@ class ProfileSceneView(QWidget):
         return None
 
     def _get_line_for_pos(self, pos: int) -> tuple | None:
-        """Return saved (p0, p1) row-col for this slider position."""
         spec = self._spec
         if spec is None:
             return None
@@ -472,9 +562,33 @@ class ProfileSceneView(QWidget):
             fig=self._fig,
             frame_label=f"Profile Composite - frame {frame_idx}" if frame_idx is not None else None,
         )
+        # Reset overlay refs (matplotlib clears axes on render)
+        self._lower_ax = self._detect_lower_axis()
+        self._hover_vline = None
+        self._hover_text = None
+        self._segment_patches = []
+        self._peak_artists = []
+        self._recompute_live_stats()
+        self._overlay_segments(self._active_segment_idx)
         self._fig.canvas.draw_idle()
 
+    def _detect_lower_axis(self):
+        """Detect which axis is the 1D η(x) subplot.
+
+        Uses the bottom-most axis on the figure as a heuristic.
+        """
+        if self._fig is None:
+            return None
+        axes = self._fig.get_axes()
+        if not axes:
+            return None
+        # Pick the axis with the smallest y0 (= lowest on screen)
+        return min(axes, key=lambda a: a.get_position().y0)
+
+    # ── Edit Lines flow (unchanged behaviour) ─────────────────────────
+
     def _enter_annotation(self) -> None:
+        self._annotating_per_frame = True
         self._mode_stack.setCurrentIndex(1)
         self._btn_edit.setVisible(False)
         self._btn_done.setVisible(True)
@@ -483,11 +597,17 @@ class ProfileSceneView(QWidget):
     def _show_annotator_frame(self, pos: int) -> None:
         frame_idx = self._frame_idx_at(pos)
         self._annotator.set_image(self._eta_frames.get(frame_idx) if frame_idx is not None else None)
-        line = self._get_line_for_pos(pos)
-        self._annotator.set_committed_line(line)
+        if self._annotating_per_frame:
+            line = self._get_line_for_pos(pos)
+            self._annotator.set_committed_line(line)
+        else:
+            ann_line = None
+            if self._annotation is not None and self._annotation.profile_line is not None:
+                pl = self._annotation.profile_line
+                ann_line = (pl.start, pl.end)
+            self._annotator.set_committed_line(ann_line)
 
     def _finish_annotation(self) -> None:
-        """Save the drawn line back to SceneSpec.profile_lines."""
         pos = self._current_frame_pos
         frame_idx = self._frame_idx_at(pos)
         saved = False
@@ -501,6 +621,17 @@ class ProfileSceneView(QWidget):
                 updated_lines[frame_idx] = ProfileLine(p0=line[0], p1=line[1])
                 self._spec = self._spec.model_copy(update={"profile_lines": updated_lines})
                 self.scene_changed.emit(self._spec)
+                # Also push to annotation.profile_line so wave_stats picks it up
+                from openfcd.io.annotation import ProfileLineData
+                new_pl = ProfileLineData(start=line[0], end=line[1])
+                self.profile_line_changed.emit(new_pl)
+                parent = self.parent()
+                if hasattr(parent, "set_profile_line"):
+                    parent.set_profile_line(new_pl)
+                if self._annotation is not None:
+                    self._annotation = self._annotation.model_copy(
+                        update={"profile_line": new_pl}
+                    )
                 saved = True
         if not saved:
             self._enter_annotation()
@@ -510,6 +641,7 @@ class ProfileSceneView(QWidget):
             self._set_frame_pos(next_missing)
             self._enter_annotation()
             return
+        self._annotating_per_frame = False
         self._mode_stack.setCurrentIndex(0)
         self._btn_done.setVisible(False)
         self._btn_edit.setVisible(True)
@@ -518,6 +650,7 @@ class ProfileSceneView(QWidget):
     def apply_viz(self, params: dict) -> None:
         if self._spec is not None:
             self._spec = self._spec.model_copy(update={"viz_params": dict(params)})
+        self._annotating_per_frame = False
         self._mode_stack.setCurrentIndex(0)
         self._btn_done.setVisible(False)
         self._btn_edit.setVisible(True)
@@ -528,6 +661,405 @@ class ProfileSceneView(QWidget):
 
     def set_preferred_frame_pos(self, pos: int | None) -> None:
         self._preferred_frame_pos = pos
+
+    # ── Segment-collect interaction ───────────────────────────────────
+
+    def _on_collect_toggled(self, checked: bool) -> None:
+        if checked:
+            self._pending_first_x = None
+            self._status_lbl.setText("点击 1D 子图选第一个端点")
+            self._status_lbl.setVisible(True)
+        else:
+            self._pending_first_x = None
+            self._status_lbl.setVisible(False)
+
+    def _on_mpl_motion(self, event) -> None:
+        """Hover cursor: vline + (x, η) text on the 1D subplot only."""
+        if self._fig is None:
+            return
+        if self._lower_ax is None or event.inaxes is not self._lower_ax:
+            if self._hover_vline is not None:
+                try:
+                    self._hover_vline.set_visible(False)
+                except Exception:
+                    pass
+            if self._hover_text is not None:
+                try:
+                    self._hover_text.set_visible(False)
+                except Exception:
+                    pass
+            self._fig.canvas.draw_idle()
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        if self._hover_vline is None:
+            try:
+                self._hover_vline = self._lower_ax.axvline(
+                    event.xdata, color="0.4", linestyle="--", linewidth=0.8, zorder=10
+                )
+            except Exception:
+                self._hover_vline = None
+        else:
+            try:
+                self._hover_vline.set_xdata([event.xdata, event.xdata])
+                self._hover_vline.set_visible(True)
+            except Exception:
+                pass
+        label = f"x={event.xdata:.2f} mm  η={event.ydata:.3f} mm"
+        if self._hover_text is None:
+            try:
+                self._hover_text = self._lower_ax.text(
+                    0.02, 0.95, label,
+                    transform=self._lower_ax.transAxes,
+                    ha="left", va="top",
+                    fontsize=8,
+                    color="0.2",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.6", alpha=0.85),
+                    zorder=11,
+                )
+            except Exception:
+                self._hover_text = None
+        else:
+            try:
+                self._hover_text.set_text(label)
+                self._hover_text.set_visible(True)
+            except Exception:
+                pass
+        self._fig.canvas.draw_idle()
+
+    def _on_mpl_click(self, event) -> None:
+        """Two-click segment-collect flow on the 1D subplot."""
+        if not self._btn_collect.isChecked():
+            return
+        if self._lower_ax is None or event.inaxes is not self._lower_ax:
+            return
+        if event.button != 1 or event.xdata is None:
+            return
+        if self._pending_first_x is None:
+            self._pending_first_x = float(event.xdata)
+            self._status_lbl.setText(
+                f"已选第一点 x={self._pending_first_x:.2f} mm；再点一次确定第二端点"
+            )
+            return
+        x2 = float(event.xdata)
+        x1 = float(self._pending_first_x)
+        self._pending_first_x = None
+        s_lo, s_hi = (x1, x2) if x1 < x2 else (x2, x1)
+        if s_hi - s_lo < 1e-3:
+            self._status_lbl.setText("段太短，已忽略")
+            self._btn_collect.setChecked(False)
+            return
+        # Emit new-segment signal; let the parent controller append to annotation
+        from openfcd.io.annotation import WaveSegment
+        new_seg = WaveSegment(s_lo_mm=s_lo, s_hi_mm=s_hi)
+        self.wave_segment_added.emit(new_seg)
+        # Local-cache update so the table refresh has the new segment immediately
+        self._append_segment_local(new_seg)
+        self._btn_collect.setChecked(False)
+        self._status_lbl.setText(
+            f"已采集 [{s_lo:.2f}, {s_hi:.2f}] mm"
+        )
+
+    def _append_segment_local(self, new_seg) -> None:
+        """Update local annotation cache and refresh table+overlays."""
+        if self._annotation is None:
+            return
+        from openfcd.io.annotation import WaveStatsConfig
+        old_cfg = self._annotation.wave_stats
+        existing = list(old_cfg.segments) if old_cfg else []
+        # Auto-assign next color from cycle if caller passed the default.
+        if new_seg.color == "#1f77b4":
+            new_seg = new_seg.model_copy(
+                update={"color": _COLOR_CYCLE[len(existing) % len(_COLOR_CYCLE)]}
+            )
+        if old_cfg is None:
+            new_cfg = WaveStatsConfig(segments=[new_seg])
+        else:
+            new_cfg = old_cfg.model_copy(
+                update={"segments": existing + [new_seg]}
+            )
+        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self.wave_stats_config_changed.emit(new_cfg)
+        self._table_panel.set_annotation(self._annotation)
+        self._overlay_segments(self._active_segment_idx)
+        self._recompute_live_stats()
+        if self._fig is not None:
+            self._fig.canvas.draw_idle()
+
+    # ── Live wave-stats computation ───────────────────────────────────
+
+    def _resolve_px_per_mm(self) -> float | None:
+        """Resolve px_per_mm for the active frame, falling back to spec viz."""
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        cal = self._frame_calibrations.get(frame_idx) if frame_idx is not None else None
+        if cal is not None:
+            px = getattr(cal, "pixel_per_mm", None)
+            if px is not None and float(px) > 0:
+                return float(px)
+        params = self._spec.viz_params if self._spec is not None else None
+        if isinstance(params, dict):
+            val = params.get("px_per_mm")
+            try:
+                if val is not None and float(val) > 0:
+                    return float(val)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _resolve_body_polygon_rc(self):
+        """Return a (N, 2) body polygon array in (row, col) or None."""
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        frame_name = self._frame_names.get(frame_idx) if frame_idx is not None else None
+        ann = self._annotation
+        if ann is None:
+            return None
+        if frame_name and frame_name in getattr(ann, "frame_polygons", {}):
+            polys = ann.frame_polygons[frame_name]
+            if polys:
+                return polys[0].as_rc_array()
+        if ann.polygons:
+            return ann.polygons[0].as_rc_array()
+        return None
+
+    def _recompute_live_stats(self) -> None:
+        """Compute FrameWaveStats for current frame + visible segments.
+
+        Pushes the result into the table panel and stores it on
+        ``self._live_frame_stats``.  Safe to call when inputs are missing
+        (sets the cache to ``None`` and clears the table stats).
+        """
+        ann = self._annotation
+        # Profile line may live in annotation.profile_line (newly drawn) OR in
+        # spec.profile_lines per-frame dict (loaded from an existing project).
+        # _show_chart sources from _get_line_for_pos; mirror that here so the
+        # two pipelines see the same line.
+        pl_endpoints = self._get_line_for_pos(self._current_frame_pos)
+        if pl_endpoints is None and ann is not None and ann.profile_line is not None:
+            pl_endpoints = (tuple(ann.profile_line.start), tuple(ann.profile_line.end))
+        if ann is None or ann.wave_stats is None or pl_endpoints is None:
+            print(  # noqa: T201 — Patch 5 diagnostic
+                f"[recompute] bail A: ann={ann is not None} "
+                f"wave_stats={ann.wave_stats is not None if ann else None} "
+                f"pl_endpoints={pl_endpoints is not None}"
+            )
+            self._live_frame_stats = None
+            if hasattr(self._table_panel, "set_live_stats"):
+                self._table_panel.set_live_stats(None)
+            self.live_stats_changed.emit(None)
+            return
+        segs = list(ann.wave_stats.segments)
+        if not segs:
+            print("[recompute] bail B: no segments")  # noqa: T201
+            self._live_frame_stats = None
+            if hasattr(self._table_panel, "set_live_stats"):
+                self._table_panel.set_live_stats(None)
+            self.live_stats_changed.emit(None)
+            return
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        eta = self._eta_frames.get(frame_idx) if frame_idx is not None else None
+        if eta is None:
+            print(  # noqa: T201
+                f"[recompute] bail C: frame_idx={frame_idx} "
+                f"current_pos={self._current_frame_pos} "
+                f"eta_frames_keys={list(self._eta_frames)[:5]}..."
+                f"({len(self._eta_frames)} total)"
+            )
+            self._live_frame_stats = None
+            if hasattr(self._table_panel, "set_live_stats"):
+                self._table_panel.set_live_stats(None)
+            self.live_stats_changed.emit(None)
+            return
+        px_per_mm = self._resolve_px_per_mm() or 1.0
+        prominence_k = float(ann.wave_stats.peak_prominence_k)
+        try:
+            from openfcd.core.wave_stats import compute_frame_wave_stats
+            print(  # noqa: T201
+                f"[recompute] OK: frame_idx={frame_idx} eta.shape={np.asarray(eta).shape} "
+                f"px_per_mm={px_per_mm} pl={pl_endpoints} "
+                f"n_segs={len(segs)} prom_k={prominence_k} "
+                f"body_poly={'yes' if self._resolve_body_polygon_rc() is not None else 'no'}"
+            )
+            stats = compute_frame_wave_stats(
+                eta=np.asarray(eta, dtype=np.float64),
+                profile_line=pl_endpoints,
+                body_polygon_rc=self._resolve_body_polygon_rc(),
+                px_per_mm=float(px_per_mm),
+                segments=[(float(s.s_lo_mm), float(s.s_hi_mm)) for s in segs],
+                prominence_k=prominence_k,
+            )
+        except Exception as exc:
+            import traceback
+            print(f"[recompute] bail D: compute failed: {type(exc).__name__}: {exc}")  # noqa: T201
+            traceback.print_exc()
+            self._live_frame_stats = None
+            if hasattr(self._table_panel, "set_live_stats"):
+                self._table_panel.set_live_stats(None)
+            self.live_stats_changed.emit(None)
+            return
+        print(  # noqa: T201
+            f"[recompute] emit: n_seg_stats={len(stats.segments)} "
+            f"first_lambda={stats.segments[0].wavelength_mm if stats.segments else None}"
+        )
+        self._live_frame_stats = stats
+        if hasattr(self._table_panel, "set_live_stats"):
+            self._table_panel.set_live_stats(stats)
+        self.live_stats_changed.emit(stats)
+
+    # ── Segment overlay on 1D subplot ─────────────────────────────────
+
+    def _overlay_segments(self, active_idx: int | None) -> None:
+        """Draw semi-transparent rectangle overlays on the 1D η(x) subplot.
+
+        ``active_idx`` is rendered at higher alpha than the others.  Overlays
+        are pure UI: ``export_profile_composite`` clears them before saving.
+        """
+        # Remove existing overlays
+        for patch in self._segment_patches:
+            try:
+                patch.remove()
+            except Exception:
+                pass
+        self._segment_patches = []
+        for art in self._peak_artists:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._peak_artists = []
+
+        if self._lower_ax is None:
+            return
+        if self._annotation is None or self._annotation.wave_stats is None:
+            return
+        segs = self._annotation.wave_stats.segments
+        if not segs:
+            return
+
+        y0, y1 = self._lower_ax.get_ylim()
+        for idx, seg in enumerate(segs):
+            if not seg.visible:
+                continue
+            alpha = 0.35 if idx == active_idx else 0.15
+            try:
+                patch = self._lower_ax.axvspan(
+                    seg.s_lo_mm, seg.s_hi_mm,
+                    facecolor=seg.color, alpha=alpha,
+                    edgecolor=seg.color if idx == active_idx else "none",
+                    linewidth=1.2 if idx == active_idx else 0.0,
+                    zorder=5,
+                )
+                self._segment_patches.append(patch)
+            except Exception:
+                pass
+
+        # Overlay peaks (circles) and troughs (triangles) from the live stats
+        stats = self._live_frame_stats
+        if stats is not None:
+            for seg_stats in stats.segments:
+                idx = int(seg_stats.segment_idx)
+                if idx >= len(segs) or not segs[idx].visible:
+                    continue
+                color = segs[idx].color
+                try:
+                    if seg_stats.peaks_s_mm.size:
+                        a = self._lower_ax.scatter(
+                            seg_stats.peaks_s_mm, seg_stats.peaks_eta,
+                            s=36, marker="o",
+                            facecolors=color, edgecolors="black",
+                            linewidths=0.6, alpha=0.85, zorder=8,
+                        )
+                        self._peak_artists.append(a)
+                    if seg_stats.troughs_s_mm.size:
+                        b = self._lower_ax.scatter(
+                            seg_stats.troughs_s_mm, seg_stats.troughs_eta,
+                            s=36, marker="v",
+                            facecolors=color, edgecolors="black",
+                            linewidths=0.6, alpha=0.85, zorder=8,
+                        )
+                        self._peak_artists.append(b)
+                except Exception:
+                    pass
+
+        # Restore y-limits in case axvspan changed them
+        try:
+            self._lower_ax.set_ylim(y0, y1)
+        except Exception:
+            pass
+
+    # ── Table-event handlers ──────────────────────────────────────────
+
+    def _on_table_row_clicked(self, idx: int) -> None:
+        self._active_segment_idx = idx
+        self._overlay_segments(idx)
+        if self._fig is not None:
+            self._fig.canvas.draw_idle()
+
+    def _on_table_segment_edited(self, idx: int, new_seg) -> None:
+        if self._annotation is None or self._annotation.wave_stats is None:
+            return
+        old_cfg = self._annotation.wave_stats
+        if idx >= len(old_cfg.segments):
+            return
+        new_segs = list(old_cfg.segments)
+        new_segs[idx] = new_seg
+        new_cfg = old_cfg.model_copy(update={"segments": new_segs})
+        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self.wave_segment_edited.emit(idx, new_seg)
+        self.wave_stats_config_changed.emit(new_cfg)
+        self._table_panel.set_annotation(self._annotation)
+        self._overlay_segments(self._active_segment_idx)
+        self._recompute_live_stats()
+        if self._fig is not None:
+            self._fig.canvas.draw_idle()
+
+    def _on_table_segment_deleted(self, idx: int) -> None:
+        if self._annotation is None or self._annotation.wave_stats is None:
+            return
+        old_cfg = self._annotation.wave_stats
+        if idx >= len(old_cfg.segments):
+            return
+        new_segs = list(old_cfg.segments)
+        new_segs.pop(idx)
+        new_cfg = old_cfg.model_copy(update={"segments": new_segs})
+        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self.wave_segment_deleted.emit(idx)
+        self.wave_stats_config_changed.emit(new_cfg)
+        if self._active_segment_idx is not None and self._active_segment_idx >= len(new_segs):
+            self._active_segment_idx = None
+        self._table_panel.set_annotation(self._annotation)
+        self._overlay_segments(self._active_segment_idx)
+        self._recompute_live_stats()
+        if self._fig is not None:
+            self._fig.canvas.draw_idle()
+
+    def _on_table_visibility_toggled(self, idx: int, visible: bool) -> None:
+        # Data mutation is handled by _on_table_segment_edited, which receives
+        # the updated WaveSegment via wave_stats_table._on_visibility_toggled's
+        # dual emit (visibilityToggled + segmentEdited). Here we only refresh
+        # UI side-effects so we don't double-mutate the annotation.
+        self._overlay_segments(self._active_segment_idx)
+        self._recompute_live_stats()
+        if self._fig is not None:
+            self._fig.canvas.draw_idle()
+
+    # ── Misc public API ───────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        if self._mode_stack.currentIndex() == 0:
+            self._show_chart(self._current_frame_pos)
+        self._table_panel.set_h5_path(self._h5_path(), batch="default")
+        self._table_panel.set_annotation(self._annotation)
+
+    def _h5_path(self) -> Path | None:
+        if self._project_path is None or self._spec is None:
+            return None
+        run_id = (
+            getattr(self._spec, "run_id", None)
+            or self._latest_run_id(self._project_path)
+        )
+        if run_id is None:
+            return None
+        return self._project_path / "runs" / run_id / "results.h5"
 
     def export_context(self) -> dict:
         frame_idx = self._frame_idx_at(self._current_frame_pos)
@@ -544,3 +1076,28 @@ class ProfileSceneView(QWidget):
             "body_source": body_source,
             "layout_mode": "export",
         }
+
+    def export_profile_composite(self, path: Path | str, dpi: int = 150) -> None:
+        """Export the composite figure without segment overlays."""
+        if self._fig is None:
+            return
+        # Clear overlays + hover artifacts
+        prior_active = self._active_segment_idx
+        self._overlay_segments(None)
+        if self._hover_vline is not None:
+            try:
+                self._hover_vline.set_visible(False)
+            except Exception:
+                pass
+        if self._hover_text is not None:
+            try:
+                self._hover_text.set_visible(False)
+            except Exception:
+                pass
+        try:
+            self._fig.canvas.draw()
+            self._fig.savefig(str(path), dpi=int(dpi))
+        finally:
+            self._overlay_segments(prior_active)
+            if self._fig is not None:
+                self._fig.canvas.draw_idle()

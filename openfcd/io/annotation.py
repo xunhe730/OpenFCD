@@ -10,10 +10,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
-
 import numpy as np
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class PolygonData(BaseModel):
@@ -50,8 +48,46 @@ class ROIData(BaseModel):
         return self.width <= 0 or self.height <= 0
 
 
+class WaveSegment(BaseModel):
+    """A wave-analysis segment along profile arc-length ``[s_lo_mm, s_hi_mm]``."""
+    model_config = ConfigDict(frozen=True)
+
+    s_lo_mm: float
+    s_hi_mm: float
+    label: str = ""           # user-defined; UI fills "Segment N" when empty
+    color: str = "#1f77b4"    # matplotlib-style hex; table color picker
+    visible: bool = True      # table row checkbox
+
+    @field_validator("s_hi_mm")
+    @classmethod
+    def _check(cls, v: float, info) -> float:
+        lo = info.data.get("s_lo_mm")
+        if lo is not None and v <= lo:
+            raise ValueError(f"s_hi_mm ({v}) must be > s_lo_mm ({lo})")
+        return v
+
+
+class WaveStatsConfig(BaseModel):
+    """v2: arbitrary N wave segments (no fore/aft binary)."""
+    model_config = ConfigDict(frozen=True)
+
+    segments: list[WaveSegment] = Field(default_factory=list)
+    peak_prominence_k: float = Field(default=0.3, ge=0.05, le=2.0)
+
+
+class ProfileLineData(BaseModel):
+    """A spatial profile line defined by two (row, col) pixel endpoints."""
+    model_config = ConfigDict(frozen=True)
+
+    start: tuple[float, float]
+    end: tuple[float, float]
+    label: str = "profile"
+
+
 class AnnotationSchema(BaseModel):
     """Complete annotation for one experimental condition / batch."""
+    model_config = ConfigDict(extra="ignore")
+
     condition: str = "default"
     frame_range: str = ""
     anchor_frame: str = ""
@@ -64,6 +100,8 @@ class AnnotationSchema(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     note: str = ""
+    wave_stats: WaveStatsConfig | None = None
+    profile_line: ProfileLineData | None = None
 
     # ── Legacy compat: accept old flat polygon format ───────────────
     @field_validator("polygons", mode="before")

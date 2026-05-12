@@ -36,6 +36,26 @@ class HDF5ResultStore:
             store._file = h5py.File(path, mode)
         return store
 
+    @classmethod
+    def open_existing_for_append(cls, h5_path: str | Path) -> "HDF5ResultStore":
+        """Open an existing h5 file for appending new groups/datasets.
+
+        Unlike ``open(mode='w')`` (which truncates), this preserves all
+        existing content and allows writing additional groups.
+
+        The returned store uses ``_mode='append'`` so that ``close()`` only
+        closes the file handle — it does **not** trigger the atomic os.replace
+        that 'w' mode uses.  The caller (e.g. ``cmd_postprocess``) is
+        responsible for the final ``os.replace(tmp, target)``.
+
+        Note: if this call is interrupted before ``os.replace`` completes,
+        a ``results.h5.tmp`` residue may remain; delete it manually to recover.
+        """
+        store = cls(h5_path, "append")
+        store._tmp_path = None
+        store._file = h5py.File(Path(h5_path), "a")
+        return store
+
     def list_batches(self) -> list[str]:
         grp = self._file.get("batches", None)
         if grp is None:
@@ -136,6 +156,105 @@ class HDF5ResultStore:
             qc_grp = qc_root.create_group(str(frame_id))
             for name, arr in qc_datasets.items():
                 qc_grp.create_dataset(name, data=np.asarray(arr))
+
+    def write_wave_stats(
+        self,
+        batch: str,
+        segments: list[dict] | None,
+        attrs: dict,
+    ) -> None:
+        """Write wave statistics (v2) into ``batches/{batch}/wave_stats/``.
+
+        Layout::
+
+            batches/{batch}/wave_stats/
+              attrs: <attrs dict, written in sorted-key order>
+              segments/
+                {idx:04d}/
+                  attrs: s_lo_mm, s_hi_mm, label, color, visible (uint8)
+                  wavelength_mm     (n_frames,) float64
+                  wavenumber_per_mm (n_frames,) float64
+                  peaks/{frame_id}      (n, 2) float64
+                  troughs/{frame_id}    (n, 2) float64
+                  heights/{frame_id}    (n,)   float64
+
+        Parameters
+        ----------
+        batch :
+            Batch name (e.g. ``"default"``).
+        segments :
+            Ordered list of per-segment dicts.  ``None`` skips the
+            ``segments`` group entirely.  Each dict must contain:
+
+            * ``segment_idx``  (int) — used to form the ``{idx:04d}`` key
+            * ``s_lo_mm``, ``s_hi_mm``  (float) — written as attrs
+            * ``label``, ``color``  (str) — written as attrs
+            * ``visible``  (bool) — stored as uint8
+            * ``wavelength_mm``      (n_frames,)
+            * ``wavenumber_per_mm``  (n_frames,)
+            * ``peaks``    ``{frame_id_int: (n, 2) float64}``
+            * ``troughs``  ``{frame_id_int: (n, 2) float64}``
+            * ``heights``  ``{frame_id_int: (n,) float64}``
+        attrs :
+            Group-level attributes (e.g. ``prominence_k``, ``ds_mm``,
+            ``n_frames``, ``n_segments``, ``schema_version``).  Keys are
+            traversed in sorted order for byte-equal output.
+        """
+        ws_grp = self._file.require_group(f"batches/{batch}/wave_stats")
+        for k in sorted(attrs.keys()):
+            ws_grp.attrs[k] = attrs[k]
+
+        if segments is None:
+            return
+
+        segs_grp = ws_grp.require_group("segments")
+        # Sort by segment_idx for byte-equal output
+        sorted_segs = sorted(segments, key=lambda d: int(d["segment_idx"]))
+        for seg in sorted_segs:
+            idx = int(seg["segment_idx"])
+            seg_key = f"{idx:04d}"
+            if seg_key in segs_grp:
+                del segs_grp[seg_key]
+            seg_grp = segs_grp.create_group(seg_key)
+
+            # Per-segment attrs (sorted key order)
+            seg_attrs = {
+                "s_lo_mm": float(seg["s_lo_mm"]),
+                "s_hi_mm": float(seg["s_hi_mm"]),
+                "label": str(seg.get("label", "")),
+                "color": str(seg.get("color", "#1f77b4")),
+                "visible": np.uint8(1 if bool(seg.get("visible", True)) else 0),
+            }
+            for k in sorted(seg_attrs.keys()):
+                seg_grp.attrs[k] = seg_attrs[k]
+
+            # Scalar-per-frame arrays
+            wl = np.asarray(seg["wavelength_mm"], dtype=np.float64)
+            wn = np.asarray(seg["wavenumber_per_mm"], dtype=np.float64)
+            seg_grp.create_dataset("wavelength_mm", data=wl)
+            seg_grp.create_dataset("wavenumber_per_mm", data=wn)
+
+            # Per-frame nested groups
+            peaks_grp = seg_grp.create_group("peaks")
+            troughs_grp = seg_grp.create_group("troughs")
+            heights_grp = seg_grp.create_group("heights")
+            for fid in sorted(seg.get("peaks", {}).keys()):
+                peaks_grp.create_dataset(
+                    str(fid),
+                    data=np.asarray(seg["peaks"][fid], dtype=np.float64),
+                )
+            for fid in sorted(seg.get("troughs", {}).keys()):
+                troughs_grp.create_dataset(
+                    str(fid),
+                    data=np.asarray(seg["troughs"][fid], dtype=np.float64),
+                )
+            for fid in sorted(seg.get("heights", {}).keys()):
+                heights_grp.create_dataset(
+                    str(fid),
+                    data=np.asarray(seg["heights"][fid], dtype=np.float64),
+                )
+
+        self._file.flush()
 
     def close(self) -> None:
         if self._file is not None:

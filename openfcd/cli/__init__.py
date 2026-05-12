@@ -240,3 +240,11 @@ def project_fingerprint(project_path: Path = typer.Argument(...)) -> None:
 
 
 app.add_typer(project_app)
+
+
+# ---------------------------------------------------------------------------
+# Postprocess
+# ---------------------------------------------------------------------------
+
+from openfcd.cli.cmd_postprocess import postprocess_app  # noqa: E402
+app.add_typer(postprocess_app, name="postprocess")

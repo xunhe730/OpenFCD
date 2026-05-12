@@ -14,7 +14,19 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from openfcd.geometry.optical import get_default_layers
 from openfcd.io.project import ProjectModel
 from openfcd.io.store import FileSessionStore
-from openfcd.io.annotation import AnnotationSchema
+from openfcd.io.annotation import (
+    AnnotationSchema,
+    ProfileLineData,
+    WaveSegment,
+    WaveStatsConfig,
+)
+
+# Matplotlib default color cycle ("tab10") for auto-assigning segment colors.
+_COLOR_CYCLE: tuple[str, ...] = (
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+)
+
 
 class SessionController(QObject):
     """Manages project session lifecycle via FileSessionStore."""
@@ -23,6 +35,8 @@ class SessionController(QObject):
     session_closed = pyqtSignal()
     session_saved = pyqtSignal()
     session_modified = pyqtSignal()    # dirty state changed
+    wave_stats_updated = pyqtSignal()          # annotation.wave_stats replaced
+    wave_stats_recomputed = pyqtSignal(str)    # recompute done; emits run_id
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -258,3 +272,178 @@ class SessionController(QObject):
         if dirty:
             self._store._scenes = updated
             self._store._scenes_dirty = {s.id for s in updated}
+
+    # ── Wave Stats ───────────────────────────────────────────────────
+
+    def update_wave_stats_config(self, config: WaveStatsConfig) -> None:
+        """Replace wave_stats on the live annotation and mark dirty.
+
+        Emits ``wave_stats_updated``.  The caller is responsible for
+        constructing a valid (frozen) ``WaveStatsConfig`` instance.
+        """
+        if self._store is None:
+            return
+        ann = self._store.annotation
+        ann.wave_stats = config
+        self.mark_dirty()
+        self.wave_stats_updated.emit()
+
+    def set_profile_line(self, line: ProfileLineData) -> None:
+        """Update profile_line on the live annotation and mark dirty."""
+        if self._store is None:
+            return
+        ann = self._store.annotation
+        ann.profile_line = line
+        self.mark_dirty()
+
+    # ── Segment convenience methods (v2) ─────────────────────────────
+
+    def _replace_segments(self, new_segments: list[WaveSegment]) -> None:
+        if self._store is None:
+            return
+        ann = self._store.annotation
+        old = ann.wave_stats
+        if old is None:
+            new_cfg = WaveStatsConfig(segments=new_segments)
+        else:
+            new_cfg = old.model_copy(update={"segments": new_segments})
+        self.update_wave_stats_config(new_cfg)
+
+    def add_wave_segment(self, seg: WaveSegment) -> None:
+        if self._store is None:
+            return
+        old = self._store.annotation.wave_stats
+        segs = list(old.segments) if old is not None else []
+        # Auto-assign a distinct color from the cycle when caller used the
+        # default. Callers explicitly passing a non-default color keep it.
+        if seg.color == "#1f77b4":
+            cycle_color = _COLOR_CYCLE[len(segs) % len(_COLOR_CYCLE)]
+            seg = seg.model_copy(update={"color": cycle_color})
+        segs.append(seg)
+        self._replace_segments(segs)
+
+    def update_wave_segment(self, idx: int, seg: WaveSegment) -> None:
+        if self._store is None:
+            return
+        old = self._store.annotation.wave_stats
+        if old is None or idx >= len(old.segments):
+            return
+        segs = list(old.segments)
+        segs[idx] = seg
+        self._replace_segments(segs)
+
+    def delete_wave_segment(self, idx: int) -> None:
+        if self._store is None:
+            return
+        old = self._store.annotation.wave_stats
+        if old is None or idx >= len(old.segments):
+            return
+        segs = list(old.segments)
+        segs.pop(idx)
+        self._replace_segments(segs)
+
+    def toggle_segment_visibility(self, idx: int, visible: bool) -> None:
+        if self._store is None:
+            return
+        old = self._store.annotation.wave_stats
+        if old is None or idx >= len(old.segments):
+            return
+        seg = old.segments[idx]
+        self.update_wave_segment(idx, seg.model_copy(update={"visible": bool(visible)}))
+
+    def recompute_wave_stats(self, run_id: str | None = None) -> bool:
+        """Recompute wave_stats for *run_id* (default: latest run).
+
+        Uses the same logic as ``openfcd postprocess`` but via direct import
+        (no subprocess) for lower overhead and proper exception propagation.
+
+        Returns ``True`` on success; ``False`` when pre-conditions are not met
+        or an error occurs.  Emits ``wave_stats_recomputed(run_id)`` on success.
+        """
+        if self._store is None:
+            return False
+        annotation = self._store.annotation
+        if annotation.wave_stats is None:
+            return False
+
+        ofcd_path = self._store._dir
+        runs = self._store.list_runs()
+        if not runs:
+            return False
+
+        if run_id is None:
+            target_run: str = runs[-1]["run_id"]
+        else:
+            available = [r["run_id"] for r in runs]
+            if run_id not in available:
+                return False
+            target_run = run_id
+
+        h5_path = ofcd_path / "runs" / target_run / "results.h5"
+        if not h5_path.exists():
+            return False
+
+        # Flush current in-memory annotation to disk so the recompute picks it up
+        self.flush_annotation_to_disk()
+
+        import os
+        import h5py
+        import numpy as np
+        from openfcd.io.result import HDF5ResultStore
+        from openfcd.cli.cmd_postprocess import _copy_skipping_wave_stats
+        from openfcd.pipeline.wave_stats_pipeline import compute_and_write_wave_stats
+
+        tmp_path = h5_path.with_name(h5_path.name + ".tmp")
+        try:
+            with h5py.File(h5_path, "r") as src, h5py.File(tmp_path, "w") as dst:
+                _copy_skipping_wave_stats(src, dst)
+
+            store = HDF5ResultStore.open_existing_for_append(tmp_path)
+            try:
+                batches = store.list_batches()
+
+                px_per_mm_by_batch: dict[str, float] = {}
+                for b in batches:
+                    meta = store.read_batch_meta(b)
+                    px_per_mm_by_batch[b] = float(meta.get("pixel_per_mm_median", 1.0))
+
+                body_polygons_by_batch_frame: dict[str, dict[str, np.ndarray | None]] = {}
+                for b in batches:
+                    frame_poly_map: dict[str, np.ndarray | None] = {}
+                    for fid in store.list_frames(b):
+                        fid_str = str(fid)
+                        if (
+                            fid_str in annotation.frame_polygons
+                            and annotation.frame_polygons[fid_str]
+                        ):
+                            frame_poly_map[fid_str] = (
+                                annotation.frame_polygons[fid_str][0].as_rc_array()
+                            )
+                        elif annotation.polygons:
+                            frame_poly_map[fid_str] = annotation.polygons[0].as_rc_array()
+                        else:
+                            frame_poly_map[fid_str] = None
+                    body_polygons_by_batch_frame[b] = frame_poly_map
+
+                def _eta_loader(batch: str, fid_str: str) -> np.ndarray:
+                    return store._file[f"batches/{batch}/frames/{fid_str}"][:]  # type: ignore[index]
+
+                compute_and_write_wave_stats(
+                    annotation=annotation,
+                    store=store,
+                    batches=batches,
+                    px_per_mm_by_batch=px_per_mm_by_batch,
+                    body_polygons_by_batch_frame=body_polygons_by_batch_frame,
+                    eta_loader=_eta_loader,
+                )
+            finally:
+                store.close()
+
+            os.replace(tmp_path, h5_path)
+        except Exception:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            return False
+
+        self.wave_stats_recomputed.emit(target_run)
+        return True
