@@ -110,6 +110,34 @@ def test_copy_previous_frame(qapp):
     assert [s.s_lo_mm for s in b_segs] == [s.s_lo_mm for s in a_segs]
 
 
+def test_slider_handler_resyncs_table_rows(qapp):
+    """Regression: user-driven slider changes (``_on_slider_moved`` /
+    ``_on_slider``) only update ``_current_frame_pos`` and request a debounced
+    render. The table panel's row list must end up reflecting the destination
+    frame's segments — earlier this only worked through the programmatic
+    ``_set_frame_pos`` path, so dragging the slider left the table showing the
+    previous frame's row entries while overlays/stats were correctly empty.
+    """
+    view = _make_view(qapp)
+
+    # Seed segments only on frame A; B stays empty.
+    view._append_segment_local(WaveSegment(s_lo_mm=-30.0, s_hi_mm=-5.0))
+    assert len(view._table_panel._segments()) == 1
+
+    # Drag to frame B via the user-facing slider handler, then flush the
+    # debounced render. The handler must trigger a table resync.
+    view._on_slider_moved(1)
+    view._render_timer.stop()
+    view._do_render()
+    assert view._table_panel._segments() == []
+
+    # Drag back to A; rows must reappear.
+    view._on_slider(0)
+    view._render_timer.stop()
+    view._do_render()
+    assert len(view._table_panel._segments()) == 1
+
+
 def test_delete_on_one_frame_does_not_affect_other(qapp):
     view = _make_view(qapp)
 

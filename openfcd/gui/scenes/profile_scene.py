@@ -696,6 +696,11 @@ class ProfileSceneView(QWidget):
             self._hover_text = None
             self._segment_patches = []
             self._peak_artists = []
+            # Resync the table panel's current frame so its row list reflects
+            # this frame's segments — slider handlers only update
+            # ``_current_frame_pos``, the canonical frame-change point is
+            # the debounced render.
+            self._sync_table_current_frame()
             # Single recompute path: this also redraws the segment/peak overlay
             # on the freshly-built axes and schedules a canvas repaint.
             self._recompute_live_stats()
