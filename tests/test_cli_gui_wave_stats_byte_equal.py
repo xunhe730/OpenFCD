@@ -47,11 +47,12 @@ def _make_eta(frame_idx: int) -> np.ndarray:
 def _make_annotation() -> AnnotationSchema:
     # s_mm is centered on the line midpoint (s=0): fore = left half, aft = right half.
     half = L_MM / 2.0
+    segs = [
+        WaveSegment(s_lo_mm=-half, s_hi_mm=0.0, label="fore"),
+        WaveSegment(s_lo_mm=0.0, s_hi_mm=half, label="aft"),
+    ]
     ws = WaveStatsConfig(
-        segments=[
-            WaveSegment(s_lo_mm=-half, s_hi_mm=0.0, label="fore"),
-            WaveSegment(s_lo_mm=0.0, s_hi_mm=half, label="aft"),
-        ],
+        segments_by_frame={str(fi): list(segs) for fi in range(N_FRAMES)},
         peak_prominence_k=0.15,
     )
     pl = ProfileLineData(
@@ -123,33 +124,34 @@ def test_wave_stats_subtree_structure(tmp_path):
     _build_and_run(tmp_path / "struct.h5")
 
     with h5py.File(tmp_path / "struct.h5", "r") as f:
-        for idx in (0, 1):
-            seg = f[f"batches/{BATCH}/wave_stats/segments/{idx:04d}"]
-            for dataset in ("wavelength_mm", "wavenumber_per_mm"):
-                assert dataset in seg
-            for subgrp in ("peaks", "troughs", "heights"):
-                assert subgrp in seg
+        for fid in range(N_FRAMES):
+            for idx in (0, 1):
+                seg = f[f"batches/{BATCH}/wave_stats/frame_{fid}/segments/{idx:04d}"]
+                for dataset in (
+                    "wavelength_mm", "wavenumber_per_mm",
+                    "peaks", "troughs", "heights",
+                ):
+                    assert dataset in seg
 
 
 def test_wave_stats_wavelength_shape(tmp_path):
+    """v3 stores wavelength_mm as scalar per frame (one frame group per frame)."""
     _build_and_run(tmp_path / "shape.h5")
 
     with h5py.File(tmp_path / "shape.h5", "r") as f:
-        for idx in (0, 1):
-            wl = f[f"batches/{BATCH}/wave_stats/segments/{idx:04d}/wavelength_mm"][:]
-            assert wl.shape == (N_FRAMES,)
+        for fid in range(N_FRAMES):
+            for idx in (0, 1):
+                wl = f[f"batches/{BATCH}/wave_stats/frame_{fid}/segments/{idx:04d}/wavelength_mm"][()]
+                assert np.asarray(wl).ndim == 0
 
 
 def test_wave_stats_attrs_present(tmp_path):
     _build_and_run(tmp_path / "attrs.h5")
-    required = {
-        "prominence_k", "ds_mm", "n_frames", "n_segments",
-        "schema_version", "segments_meta",
-    }
+    required = {"prominence_k", "ds_mm", "n_frames", "schema_version"}
     with h5py.File(tmp_path / "attrs.h5", "r") as f:
         ws_attrs = dict(f[f"batches/{BATCH}/wave_stats"].attrs)
         for key in required:
             assert key in ws_attrs, f"missing attr: {key!r}"
         assert ws_attrs["ds_mm"] == pytest.approx(1.0 / PX_PER_MM)
         assert ws_attrs["n_frames"] == N_FRAMES
-        assert int(ws_attrs["schema_version"]) == 2
+        assert int(ws_attrs["schema_version"]) == 3

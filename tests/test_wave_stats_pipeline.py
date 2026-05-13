@@ -1,4 +1,4 @@
-"""Tests for openfcd/pipeline/wave_stats_pipeline.py (v2)."""
+"""Tests for openfcd/pipeline/wave_stats_pipeline.py (v3 — per-frame layout)."""
 
 from __future__ import annotations
 
@@ -36,14 +36,21 @@ def _make_eta(shift: float = 0.0) -> np.ndarray:
     return np.tile(eta_row, (H, 1))
 
 
-@pytest.fixture()
-def annotation() -> AnnotationSchema:
+def _two_seg_per_frame(frame_ids: list[int]) -> dict[str, list[WaveSegment]]:
     mid = L_MM / 2.0
     segs = [
         WaveSegment(s_lo_mm=0.0, s_hi_mm=mid, label="fore", color="#1f77b4"),
         WaveSegment(s_lo_mm=mid, s_hi_mm=L_MM, label="aft", color="#d62728"),
     ]
-    ws_cfg = WaveStatsConfig(segments=segs, peak_prominence_k=0.15)
+    return {str(fid): list(segs) for fid in frame_ids}
+
+
+@pytest.fixture()
+def annotation() -> AnnotationSchema:
+    ws_cfg = WaveStatsConfig(
+        segments_by_frame=_two_seg_per_frame([0, 1]),
+        peak_prominence_k=0.15,
+    )
     pl = ProfileLineData(start=(50.0, 0.0), end=(50.0, float(W - 1)))
     return AnnotationSchema(wave_stats=ws_cfg, profile_line=pl)
 
@@ -87,28 +94,19 @@ def test_basic_wave_stats_written(annotation, store_with_frames):
     assert ws_grp.attrs["prominence_k"] == pytest.approx(0.15)
     assert ws_grp.attrs["ds_mm"] == pytest.approx(1.0 / PX_PER_MM)
     assert ws_grp.attrs["n_frames"] == 2
-    assert ws_grp.attrs["n_segments"] == 2
-    assert int(ws_grp.attrs["schema_version"]) == 2
-    assert "segments_meta" in ws_grp.attrs
+    assert int(ws_grp.attrs["schema_version"]) == 3
 
-    # segments group
-    assert "segments" in ws_grp
-    assert "segments/0000" in ws_grp
-    assert "segments/0001" in ws_grp
-
-    seg0 = ws_grp["segments/0000"]
-    assert seg0.attrs["label"] == "fore"
-    assert seg0.attrs["color"] == "#1f77b4"
-
-    # per-segment datasets
-    for k in (0, 1):
-        seg = ws_grp[f"segments/{k:04d}"]
-        wl = seg["wavelength_mm"][:]
-        assert wl.shape == (2,)
-        assert "wavenumber_per_mm" in seg
-        assert "peaks" in seg
-        assert "troughs" in seg
-        assert "heights" in seg
+    # per-frame groups
+    for fid in (0, 1):
+        frame_grp = ws_grp[f"frame_{fid}"]
+        assert frame_grp.attrs["n_segments"] == 2
+        for idx in (0, 1):
+            seg = frame_grp[f"segments/{idx:04d}"]
+            assert "wavelength_mm" in seg
+            assert "wavenumber_per_mm" in seg
+            assert "peaks" in seg
+            assert "troughs" in seg
+            assert "heights" in seg
 
 
 # ── Test 2: wavelength approximately correct ─────────────────────────────────
@@ -125,10 +123,9 @@ def test_wavelength_approximately_correct(annotation, store_with_frames):
         eta_loader=_eta_loader(store),
     )
 
-    wl = store._file["batches/test/wave_stats/segments/0000/wavelength_mm"][:]
-    for w in wl:
-        if np.isfinite(w):
-            assert abs(w - LAMBDA_MM) / LAMBDA_MM < 0.20
+    wl = float(store._file["batches/test/wave_stats/frame_0/segments/0000/wavelength_mm"][()])
+    if np.isfinite(wl):
+        assert abs(wl - LAMBDA_MM) / LAMBDA_MM < 0.20
 
 
 # ── Test 3: no-op when wave_stats is None ────────────────────────────────────
@@ -154,7 +151,8 @@ def test_no_op_when_profile_line_none(store_with_frames):
     store = store_with_frames
     seg = WaveSegment(s_lo_mm=0.0, s_hi_mm=L_MM / 2.0)
     ann = AnnotationSchema(
-        wave_stats=WaveStatsConfig(segments=[seg]), profile_line=None
+        wave_stats=WaveStatsConfig(segments_by_frame={"0": [seg]}),
+        profile_line=None,
     )
 
     ok = compute_and_write_wave_stats(
@@ -175,7 +173,8 @@ def test_no_op_when_no_visible_segments(store_with_frames):
     seg = WaveSegment(s_lo_mm=0.0, s_hi_mm=L_MM / 2.0, visible=False)
     pl = ProfileLineData(start=(50.0, 0.0), end=(50.0, float(W - 1)))
     ann = AnnotationSchema(
-        wave_stats=WaveStatsConfig(segments=[seg]), profile_line=pl
+        wave_stats=WaveStatsConfig(segments_by_frame={"0": [seg], "1": [seg]}),
+        profile_line=pl,
     )
 
     ok = compute_and_write_wave_stats(
@@ -199,6 +198,7 @@ def test_frames_unaffected(annotation, tmp_path):
         store.write_frame("test", i, _make_eta(i * 0.05), {"status": "ok"})
     store.write_batch("test", data={}, meta={"pixel_per_mm_median": PX_PER_MM})
 
+    # Annotation only covers frames 0/1; frame 2 should be skipped.
     ok = compute_and_write_wave_stats(
         annotation=annotation,
         store=store,
@@ -209,6 +209,11 @@ def test_frames_unaffected(annotation, tmp_path):
     )
     assert ok is True
     assert store.list_frames("test") == [0, 1, 2]
+    # Only frames 0 and 1 should have wave_stats groups
+    ws_grp = store._file["batches/test/wave_stats"]
+    assert "frame_0" in ws_grp
+    assert "frame_1" in ws_grp
+    assert "frame_2" not in ws_grp
     store.close()
 
 
@@ -225,7 +230,7 @@ def test_segments_meta_is_json(annotation, store_with_frames):
         body_polygons_by_batch_frame={"test": {}},
         eta_loader=_eta_loader(store),
     )
-    meta_str = store._file["batches/test/wave_stats"].attrs["segments_meta"]
+    meta_str = store._file["batches/test/wave_stats/frame_0"].attrs["segments_meta"]
     parsed = json.loads(meta_str)
     assert isinstance(parsed, list)
     assert len(parsed) == 2
@@ -245,7 +250,10 @@ def test_invisible_segment_excluded(store_with_frames):
     ]
     pl = ProfileLineData(start=(50.0, 0.0), end=(50.0, float(W - 1)))
     ann = AnnotationSchema(
-        wave_stats=WaveStatsConfig(segments=segs, peak_prominence_k=0.15),
+        wave_stats=WaveStatsConfig(
+            segments_by_frame={"0": segs, "1": segs},
+            peak_prominence_k=0.15,
+        ),
         profile_line=pl,
     )
 
@@ -258,16 +266,44 @@ def test_invisible_segment_excluded(store_with_frames):
         eta_loader=_eta_loader(store),
     )
 
-    ws_grp = store._file["batches/test/wave_stats"]
-    keys = list(ws_grp["segments"].keys())
-    # segment_idx 0 (A) and 2 (C) should exist, idx 1 (B, invisible) should not
+    frame_grp = store._file["batches/test/wave_stats/frame_0"]
+    keys = list(frame_grp["segments"].keys())
+    # idx 0 (A) and 2 (C) should exist, idx 1 (B, invisible) should not
     assert "0000" in keys
     assert "0002" in keys
     assert "0001" not in keys
-    assert ws_grp.attrs["n_segments"] == 2
+    assert frame_grp.attrs["n_segments"] == 2
 
 
-# ── Test 7: sorted-order reproducibility ─────────────────────────────────────
+# ── Test 7: empty-frame skip ─────────────────────────────────────────────────
+
+
+def test_frame_without_segments_is_skipped(store_with_frames):
+    """Frame 0 has segments; frame 1 has no segments → no frame_1 group."""
+    store = store_with_frames
+    mid = L_MM / 2.0
+    seg = WaveSegment(s_lo_mm=0.0, s_hi_mm=mid, label="fore")
+    pl = ProfileLineData(start=(50.0, 0.0), end=(50.0, float(W - 1)))
+    ann = AnnotationSchema(
+        wave_stats=WaveStatsConfig(segments_by_frame={"0": [seg]}),
+        profile_line=pl,
+    )
+    ok = compute_and_write_wave_stats(
+        annotation=ann,
+        store=store,
+        batches=["test"],
+        px_per_mm_by_batch={"test": PX_PER_MM},
+        body_polygons_by_batch_frame={"test": {}},
+        eta_loader=_eta_loader(store),
+    )
+    assert ok is True
+    ws_grp = store._file["batches/test/wave_stats"]
+    assert "frame_0" in ws_grp
+    assert "frame_1" not in ws_grp
+    assert ws_grp.attrs["n_frames"] == 1
+
+
+# ── Test 8: sorted-order reproducibility ─────────────────────────────────────
 
 
 def _sha256_wave_stats_group(store: HDF5ResultStore, batch: str) -> str:

@@ -68,11 +68,22 @@ class WaveSegment(BaseModel):
 
 
 class WaveStatsConfig(BaseModel):
-    """v2: arbitrary N wave segments (no fore/aft binary)."""
-    model_config = ConfigDict(frozen=True)
+    """v3: per-frame wave segments keyed by ``str(frame_idx)``.
 
-    segments: list[WaveSegment] = Field(default_factory=list)
+    Each frame holds its own list of WaveSegment; missing keys mean "no
+    segments on that frame".  ``peak_prominence_k`` is global across frames.
+    Legacy ``segments: [...]`` keys in old JSON are silently dropped via
+    ``extra="ignore"`` — disk files all have ``wave_stats: null`` so there
+    is no migration cost.
+    """
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    segments_by_frame: dict[str, list[WaveSegment]] = Field(default_factory=dict)
     peak_prominence_k: float = Field(default=0.3, ge=0.05, le=2.0)
+
+    def segments_for_frame(self, frame_idx: int | str) -> list[WaveSegment]:
+        """Return the segment list for ``frame_idx`` (empty list if none)."""
+        return list(self.segments_by_frame.get(str(frame_idx), []))
 
 
 class ProfileLineData(BaseModel):

@@ -342,6 +342,9 @@ class ProfileSceneView(QWidget):
         self._table_panel.segmentEdited.connect(self._on_table_segment_edited)
         self._table_panel.segmentDeleted.connect(self._on_table_segment_deleted)
         self._table_panel.visibilityToggled.connect(self._on_table_visibility_toggled)
+        self._table_panel.copyPreviousFrameRequested.connect(
+            self._on_copy_previous_frame_segments
+        )
         self.live_stats_changed.connect(self._table_panel.set_live_stats)
         self._chart_widget.addWidget(self._table_panel)
         self._chart_widget.setStretchFactor(0, 3)
@@ -424,6 +427,7 @@ class ProfileSceneView(QWidget):
         self._btn_edit.setVisible(True)
         self._table_panel.set_annotation(self._annotation)
         self._table_panel.set_h5_path(self._h5_path(), batch="default")
+        self._sync_table_current_frame()
         missing_pos = self._first_missing_line_pos()
         if missing_pos is not None:
             self._set_frame_pos(missing_pos)
@@ -544,6 +548,12 @@ class ProfileSceneView(QWidget):
         self._slider_lbl.setText(f"frame {pos}/{max(0, total - 1)}")
         if self._slider.value() != pos:
             self._slider.setValue(pos)
+        # Reset segment-collect mode so it does not bleed across frames.
+        if hasattr(self, "_btn_collect") and self._btn_collect.isChecked():
+            self._btn_collect.setChecked(False)
+        # Notify the table panel of the active frame so it renders the
+        # segment list for the new frame (per-frame wave-stats, v3).
+        self._sync_table_current_frame()
 
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
@@ -941,28 +951,92 @@ class ProfileSceneView(QWidget):
             f"已采集 [{s_lo:.2f}, {s_hi:.2f}] mm"
         )
 
+    def _current_frame_key(self) -> str | None:
+        """Return ``str(frame_idx)`` for the active slider position, or None."""
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if frame_idx is None:
+            return None
+        return str(frame_idx)
+
+    def _sync_table_current_frame(self) -> None:
+        """Push the active frame_idx to the table panel."""
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if hasattr(self._table_panel, "set_current_frame"):
+            self._table_panel.set_current_frame(frame_idx)
+        # Refresh "copy previous frame" button enabled state.
+        if hasattr(self._table_panel, "set_previous_frame_has_segments"):
+            self._table_panel.set_previous_frame_has_segments(
+                self._previous_frame_has_segments()
+            )
+
+    def _previous_frame_has_segments(self) -> bool:
+        if self._spec is None or self._annotation is None:
+            return False
+        ws = self._annotation.wave_stats
+        if ws is None:
+            return False
+        pos = self._current_frame_pos
+        if pos <= 0:
+            return False
+        prev_idx = self._frame_idx_at(pos - 1)
+        if prev_idx is None:
+            return False
+        return bool(ws.segments_for_frame(prev_idx))
+
     def _append_segment_local(self, new_seg) -> None:
-        """Update local annotation cache and refresh table+overlays."""
+        """Append ``new_seg`` to the CURRENT frame's segment list."""
         if self._annotation is None:
+            return
+        frame_key = self._current_frame_key()
+        if frame_key is None:
             return
         from openfcd.io.annotation import WaveStatsConfig
         old_cfg = self._annotation.wave_stats
-        existing = list(old_cfg.segments) if old_cfg else []
+        existing = list(old_cfg.segments_for_frame(frame_key)) if old_cfg else []
         # Auto-assign next color from cycle if caller passed the default.
         if new_seg.color == "#1f77b4":
             new_seg = new_seg.model_copy(
                 update={"color": _COLOR_CYCLE[len(existing) % len(_COLOR_CYCLE)]}
             )
         if old_cfg is None:
-            new_cfg = WaveStatsConfig(segments=[new_seg])
+            new_cfg = WaveStatsConfig(segments_by_frame={frame_key: [new_seg]})
         else:
-            new_cfg = old_cfg.model_copy(
-                update={"segments": existing + [new_seg]}
-            )
+            new_by_frame = dict(old_cfg.segments_by_frame)
+            new_by_frame[frame_key] = existing + [new_seg]
+            new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
         self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
         self.wave_stats_config_changed.emit(new_cfg)
         self._table_panel.set_annotation(self._annotation)
+        self._sync_table_current_frame()
         # _recompute_live_stats handles overlay refresh + canvas redraw.
+        self._recompute_live_stats()
+
+    def _on_copy_previous_frame_segments(self) -> None:
+        """Copy the previous frame's segments to the current frame."""
+        if self._annotation is None or self._annotation.wave_stats is None:
+            return
+        if self._spec is None:
+            return
+        pos = self._current_frame_pos
+        if pos <= 0:
+            return
+        prev_idx = self._frame_idx_at(pos - 1)
+        cur_idx = self._frame_idx_at(pos)
+        if prev_idx is None or cur_idx is None:
+            return
+        old_cfg = self._annotation.wave_stats
+        prev_segs = old_cfg.segments_for_frame(prev_idx)
+        if not prev_segs:
+            return
+        # Re-instantiate frozen WaveSegment objects to keep frames decoupled.
+        new_segs = [seg.model_copy() for seg in prev_segs]
+        new_by_frame = dict(old_cfg.segments_by_frame)
+        new_by_frame[str(cur_idx)] = new_segs
+        new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
+        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self.wave_stats_config_changed.emit(new_cfg)
+        self._table_panel.set_annotation(self._annotation)
+        self._sync_table_current_frame()
         self._recompute_live_stats()
 
     # ── Live wave-stats computation ───────────────────────────────────
@@ -1016,10 +1090,12 @@ class ProfileSceneView(QWidget):
             pl_endpoints = (tuple(ann.profile_line.start), tuple(ann.profile_line.end))
         if ann is None or ann.wave_stats is None or pl_endpoints is None:
             return None
-        segs = list(ann.wave_stats.segments)
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if frame_idx is None:
+            return None
+        segs = ann.wave_stats.segments_for_frame(frame_idx)
         if not segs:
             return None
-        frame_idx = self._frame_idx_at(self._current_frame_pos)
         eta = self._eta_frames.get(frame_idx) if frame_idx is not None else None
         if eta is None:
             return None
@@ -1079,7 +1155,10 @@ class ProfileSceneView(QWidget):
             return
         if self._annotation is None or self._annotation.wave_stats is None:
             return
-        segs = self._annotation.wave_stats.segments
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if frame_idx is None:
+            return
+        segs = self._annotation.wave_stats.segments_for_frame(frame_idx)
         if not segs:
             return
 
@@ -1145,33 +1224,45 @@ class ProfileSceneView(QWidget):
     def _on_table_segment_edited(self, idx: int, new_seg) -> None:
         if self._annotation is None or self._annotation.wave_stats is None:
             return
-        old_cfg = self._annotation.wave_stats
-        if idx >= len(old_cfg.segments):
+        frame_key = self._current_frame_key()
+        if frame_key is None:
             return
-        new_segs = list(old_cfg.segments)
-        new_segs[idx] = new_seg
-        new_cfg = old_cfg.model_copy(update={"segments": new_segs})
+        old_cfg = self._annotation.wave_stats
+        cur_segs = list(old_cfg.segments_for_frame(frame_key))
+        if idx >= len(cur_segs):
+            return
+        cur_segs[idx] = new_seg
+        new_by_frame = dict(old_cfg.segments_by_frame)
+        new_by_frame[frame_key] = cur_segs
+        new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
         self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
         self.wave_segment_edited.emit(idx, new_seg)
         self.wave_stats_config_changed.emit(new_cfg)
         self._table_panel.set_annotation(self._annotation)
+        self._sync_table_current_frame()
         self._recompute_live_stats()
 
     def _on_table_segment_deleted(self, idx: int) -> None:
         if self._annotation is None or self._annotation.wave_stats is None:
             return
-        old_cfg = self._annotation.wave_stats
-        if idx >= len(old_cfg.segments):
+        frame_key = self._current_frame_key()
+        if frame_key is None:
             return
-        new_segs = list(old_cfg.segments)
-        new_segs.pop(idx)
-        new_cfg = old_cfg.model_copy(update={"segments": new_segs})
+        old_cfg = self._annotation.wave_stats
+        cur_segs = list(old_cfg.segments_for_frame(frame_key))
+        if idx >= len(cur_segs):
+            return
+        cur_segs.pop(idx)
+        new_by_frame = dict(old_cfg.segments_by_frame)
+        new_by_frame[frame_key] = cur_segs
+        new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
         self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
         self.wave_segment_deleted.emit(idx)
         self.wave_stats_config_changed.emit(new_cfg)
-        if self._active_segment_idx is not None and self._active_segment_idx >= len(new_segs):
+        if self._active_segment_idx is not None and self._active_segment_idx >= len(cur_segs):
             self._active_segment_idx = None
         self._table_panel.set_annotation(self._annotation)
+        self._sync_table_current_frame()
         self._recompute_live_stats()
 
     def _on_table_visibility_toggled(self, idx: int, visible: bool) -> None:
@@ -1188,6 +1279,7 @@ class ProfileSceneView(QWidget):
             self._request_render(self._current_frame_pos)
         self._table_panel.set_h5_path(self._h5_path(), batch="default")
         self._table_panel.set_annotation(self._annotation)
+        self._sync_table_current_frame()
 
     def _h5_path(self) -> Path | None:
         if self._project_path is None or self._spec is None:

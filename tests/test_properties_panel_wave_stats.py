@@ -10,11 +10,13 @@ Covers:
   a.  peak_prominence_k spinbox range [0.05, 2.0] — clamping
   a2. set_annotation with WaveStatsConfig(peak_prominence_k=0.5) → spinbox shows 0.5
   a3. Editing spinbox → prominence_k_changed emitted after debounce timer fires
-  b.  Recompute button disabled matrix (no run / wave_stats=None / segments empty / running)
+  b.  Recompute button disabled matrix (no run / wave_stats=None / no segments in any
+      frame / running)
   b2. Recompute click → recompute_clicked signal emitted
-  c.  SessionController unit tests: update_wave_stats_config, set_profile_line,
-      add_wave_segment, update_wave_segment, delete_wave_segment,
-      toggle_segment_visibility
+  c.  SessionController: update_wave_stats_config, set_profile_line
+      (per-frame segment mutations now go through ProfileSceneView directly;
+      the controller's flat-list convenience methods were removed with the
+      ``segments_by_frame`` migration.)
 """
 from __future__ import annotations
 
@@ -47,10 +49,12 @@ def ann_with_segments() -> AnnotationSchema:
     return AnnotationSchema(
         wave_stats=WaveStatsConfig(
             peak_prominence_k=0.5,
-            segments=[
-                WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0, label="fore"),
-                WaveSegment(s_lo_mm=15.0, s_hi_mm=30.0, label="aft"),
-            ],
+            segments_by_frame={
+                "0": [
+                    WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0, label="fore"),
+                    WaveSegment(s_lo_mm=15.0, s_hi_mm=30.0, label="aft"),
+                ]
+            },
         )
     )
 
@@ -87,7 +91,9 @@ class TestSetAnnotation:
 
     def test_empty_segments_treats_as_no_wave_stats(self, panel: WaveStatsPanel) -> None:
         # WaveStatsConfig with no segments → recompute stays disabled even if has_run
-        ann = AnnotationSchema(wave_stats=WaveStatsConfig(peak_prominence_k=0.3, segments=[]))
+        ann = AnnotationSchema(
+            wave_stats=WaveStatsConfig(peak_prominence_k=0.3, segments_by_frame={})
+        )
         panel.set_has_run(True)
         panel.set_annotation(ann)
         assert not panel._btn_recompute.isEnabled()
@@ -139,7 +145,7 @@ class TestRecomputeButtonState:
 
     def test_disabled_when_segments_empty(self, panel: WaveStatsPanel) -> None:
         panel.set_has_run(True)
-        ann = AnnotationSchema(wave_stats=WaveStatsConfig(segments=[]))
+        ann = AnnotationSchema(wave_stats=WaveStatsConfig(segments_by_frame={}))
         panel.set_annotation(ann)
         assert not panel._btn_recompute.isEnabled()
 
@@ -180,14 +186,18 @@ class TestSessionControllerUpdateWaveStats:
             ctrl = SessionController()
             ctrl.new_project(name="ws_test", location=tmp)
             seg = WaveSegment(s_lo_mm=1.0, s_hi_mm=5.0)
-            config = WaveStatsConfig(peak_prominence_k=0.7, segments=[seg])
+            config = WaveStatsConfig(
+                peak_prominence_k=0.7,
+                segments_by_frame={"3": [seg]},
+            )
             ctrl.update_wave_stats_config(config)
             ann = ctrl.annotation
             assert ann is not None
             assert ann.wave_stats is not None
             assert ann.wave_stats.peak_prominence_k == pytest.approx(0.7)
-            assert len(ann.wave_stats.segments) == 1
-            assert ann.wave_stats.segments[0].s_lo_mm == pytest.approx(1.0)
+            frame_segs = ann.wave_stats.segments_for_frame(3)
+            assert len(frame_segs) == 1
+            assert frame_segs[0].s_lo_mm == pytest.approx(1.0)
 
     def test_emits_wave_stats_updated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,87 +228,6 @@ class TestSessionControllerSetProfileLine:
     def test_noop_without_project(self) -> None:
         ctrl = SessionController()
         ctrl.set_profile_line(ProfileLineData(start=(0.0, 0.0), end=(1.0, 1.0)))  # must not raise
-
-
-class TestSessionControllerAddWaveSegment:
-    def test_add_segment_appends(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="add_seg", location=tmp)
-            ctrl.add_wave_segment(WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0))
-            ann = ctrl.annotation
-            assert ann is not None and ann.wave_stats is not None
-            assert len(ann.wave_stats.segments) == 1
-            assert ann.wave_stats.segments[0].s_lo_mm == pytest.approx(0.0)
-
-    def test_add_segment_emits_wave_stats_updated(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="add_seg_sig", location=tmp)
-            received: list[bool] = []
-            ctrl.wave_stats_updated.connect(lambda: received.append(True))
-            ctrl.add_wave_segment(WaveSegment(s_lo_mm=5.0, s_hi_mm=20.0))
-            assert len(received) == 1
-
-
-class TestSessionControllerUpdateWaveSegment:
-    def test_update_replaces_segment(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="upd_seg", location=tmp)
-            ctrl.add_wave_segment(WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0))
-            ctrl.update_wave_segment(0, WaveSegment(s_lo_mm=2.0, s_hi_mm=12.0))
-            ann = ctrl.annotation
-            assert ann is not None and ann.wave_stats is not None
-            assert ann.wave_stats.segments[0].s_lo_mm == pytest.approx(2.0)
-
-    def test_update_out_of_range_is_noop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="upd_oob", location=tmp)
-            ctrl.update_wave_segment(99, WaveSegment(s_lo_mm=0.0, s_hi_mm=5.0))  # must not raise
-
-
-class TestSessionControllerDeleteWaveSegment:
-    def test_delete_removes_segment(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="del_seg", location=tmp)
-            ctrl.add_wave_segment(WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0))
-            ctrl.add_wave_segment(WaveSegment(s_lo_mm=15.0, s_hi_mm=25.0))
-            ctrl.delete_wave_segment(0)
-            ann = ctrl.annotation
-            assert ann is not None and ann.wave_stats is not None
-            assert len(ann.wave_stats.segments) == 1
-            assert ann.wave_stats.segments[0].s_lo_mm == pytest.approx(15.0)
-
-    def test_delete_out_of_range_is_noop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="del_oob", location=tmp)
-            ctrl.delete_wave_segment(0)  # must not raise (no segments)
-
-
-class TestSessionControllerToggleSegmentVisibility:
-    def test_toggle_sets_visible_false(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="tog_seg", location=tmp)
-            ctrl.add_wave_segment(WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0, visible=True))
-            ctrl.toggle_segment_visibility(0, False)
-            ann = ctrl.annotation
-            assert ann is not None and ann.wave_stats is not None
-            assert ann.wave_stats.segments[0].visible is False
-
-    def test_toggle_sets_visible_true(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctrl = SessionController()
-            ctrl.new_project(name="tog_seg2", location=tmp)
-            ctrl.add_wave_segment(WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0, visible=False))
-            ctrl.toggle_segment_visibility(0, True)
-            ann = ctrl.annotation
-            assert ann is not None and ann.wave_stats is not None
-            assert ann.wave_stats.segments[0].visible is True
 
 
 class TestSessionControllerRecomputeGuards:

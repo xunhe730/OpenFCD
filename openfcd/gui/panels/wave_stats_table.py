@@ -83,6 +83,7 @@ class WaveStatsTablePanel(QWidget):
     segmentDeleted = pyqtSignal(int)
     visibilityToggled = pyqtSignal(int, bool)
     heightsRequested = pyqtSignal(int)             # row idx; emitted on double-click of Heights cell
+    copyPreviousFrameRequested = pyqtSignal()      # "copy previous frame" button clicked
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -91,14 +92,31 @@ class WaveStatsTablePanel(QWidget):
         self._batch: str = "default"
         self._live_stats = None  # FrameWaveStats | None — populated by ProfileSceneView
         self._suspend_signals = False
+        # v3: per-frame wave-stats. The table renders the segments for the
+        # currently active frame. None ⇒ no frame selected (renders empty).
+        self._current_frame_idx: int | None = None
+        self._previous_frame_has_segments: bool = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(4)
 
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
         self._title = QLabel("Wave Segments")
         self._title.setStyleSheet("font-size: 11px; font-weight: 600;")
-        layout.addWidget(self._title)
+        header_layout.addWidget(self._title)
+        header_layout.addStretch()
+        self._btn_copy_prev = QPushButton("复制上帧")
+        self._btn_copy_prev.setFixedHeight(22)
+        self._btn_copy_prev.setEnabled(False)
+        self._btn_copy_prev.clicked.connect(
+            lambda: self.copyPreviousFrameRequested.emit()
+        )
+        header_layout.addWidget(self._btn_copy_prev)
+        layout.addWidget(header)
 
         self._table = QTableWidget(0, N_COLS, self)
         self._table.setHorizontalHeaderLabels(COL_HEADERS)
@@ -137,6 +155,16 @@ class WaveStatsTablePanel(QWidget):
     def live_stats(self):
         return self._live_stats
 
+    def set_current_frame(self, frame_idx: int | None) -> None:
+        """Bind the currently active frame index (v3 per-frame wave-stats)."""
+        self._current_frame_idx = frame_idx
+        self._rebuild_rows()
+
+    def set_previous_frame_has_segments(self, has_segments: bool) -> None:
+        """Enable/disable the 'copy previous frame' button."""
+        self._previous_frame_has_segments = bool(has_segments)
+        self._btn_copy_prev.setEnabled(self._previous_frame_has_segments)
+
     def select_row(self, idx: int) -> None:
         """Programmatically select a row (no signal emitted)."""
         if 0 <= idx < self._table.rowCount():
@@ -147,7 +175,11 @@ class WaveStatsTablePanel(QWidget):
     def _segments(self) -> list:
         if self._annotation is None or self._annotation.wave_stats is None:
             return []
-        return list(self._annotation.wave_stats.segments)
+        if self._current_frame_idx is None:
+            return []
+        return self._annotation.wave_stats.segments_for_frame(
+            self._current_frame_idx
+        )
 
     def _rebuild_rows(self) -> None:
         self._suspend_signals = True

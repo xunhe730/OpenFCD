@@ -27,7 +27,7 @@ from scipy.signal import find_peaks
 @dataclass(frozen=True)
 class SegmentWaveStats:
     """Wave statistics for a single user-defined segment on one frame."""
-    segment_idx: int                       # 0-based index in WaveStatsConfig.segments
+    segment_idx: int                       # 0-based index within the frame's segment list
     s_lo_mm: float
     s_hi_mm: float
     peaks_s_mm: np.ndarray

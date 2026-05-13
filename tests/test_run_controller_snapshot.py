@@ -21,7 +21,7 @@ from openfcd.io.annotation import (
 def test_annotation_deep_copy_independence():
     """model_copy(deep=True) must return an object independent of the source."""
     seg = WaveSegment(s_lo_mm=0.0, s_hi_mm=15.0)
-    cfg = WaveStatsConfig(segments=[seg], peak_prominence_k=0.3)
+    cfg = WaveStatsConfig(segments_by_frame={"0": [seg]}, peak_prominence_k=0.3)
     pl = ProfileLineData(start=(10.0, 0.0), end=(10.0, 100.0))
     ann = AnnotationSchema(wave_stats=cfg, profile_line=pl)
 
@@ -45,19 +45,20 @@ def test_frozen_sub_models_survive_deep_copy():
     from pydantic import ValidationError
 
     seg = WaveSegment(s_lo_mm=5.0, s_hi_mm=25.0)
-    cfg = WaveStatsConfig(segments=[seg], peak_prominence_k=0.4)
+    cfg = WaveStatsConfig(segments_by_frame={"0": [seg]}, peak_prominence_k=0.4)
     ann = AnnotationSchema(wave_stats=cfg)
 
     snapshot = ann.model_copy(deep=True)
 
     assert snapshot.wave_stats is not None
-    assert len(snapshot.wave_stats.segments) == 1
-    assert snapshot.wave_stats.segments[0].s_lo_mm == pytest.approx(5.0)
-    assert snapshot.wave_stats.segments[0].s_hi_mm == pytest.approx(25.0)
+    snap_segs = snapshot.wave_stats.segments_for_frame(0)
+    assert len(snap_segs) == 1
+    assert snap_segs[0].s_lo_mm == pytest.approx(5.0)
+    assert snap_segs[0].s_hi_mm == pytest.approx(25.0)
 
     # Sub-models must still be frozen
     with pytest.raises(Exception):
-        snapshot.wave_stats.segments[0].s_lo_mm = 99.0  # type: ignore[misc]
+        snap_segs[0].s_lo_mm = 99.0  # type: ignore[misc]
 
 
 # ── Test 3: snapshot is a value-equal but distinct object ─────────────────────
@@ -65,7 +66,7 @@ def test_frozen_sub_models_survive_deep_copy():
 def test_snapshot_is_distinct_object():
     """Deep copy must not share identity with the source."""
     seg = WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0)
-    cfg = WaveStatsConfig(segments=[seg])
+    cfg = WaveStatsConfig(segments_by_frame={"0": [seg]})
     ann = AnnotationSchema(wave_stats=cfg)
 
     snapshot = ann.model_copy(deep=True)

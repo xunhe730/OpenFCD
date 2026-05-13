@@ -24,11 +24,25 @@ def _make_view(qapp):
     return view
 
 
+_FRAME_IDX = 100
+
+
 def _seed_with_annotation(view, segs: list[WaveSegment] | None = None):
     pl = ProfileLineData(start=(50.0, 0.0), end=(50.0, 299.0))
-    ws = WaveStatsConfig(segments=segs or [])
+    by_frame = {str(_FRAME_IDX): list(segs)} if segs else {}
+    ws = WaveStatsConfig(segments_by_frame=by_frame)
     view._annotation = AnnotationSchema(wave_stats=ws, profile_line=pl)
+    # Stub the spec so _frame_idx_at(0) -> _FRAME_IDX.
+    view._spec = SimpleNamespace(
+        frame_indices=[_FRAME_IDX],
+        profile_lines={},
+        viz_params={},
+        run_id=None,
+        name="test",
+    )
+    view._current_frame_pos = 0
     view._table_panel.set_annotation(view._annotation)
+    view._sync_table_current_frame()
 
 
 # ── Collect-button visibility / behaviour ──────────────────────────────────
@@ -253,7 +267,8 @@ def test_table_segment_edit_updates_annotation(qapp):
     )
     new_seg = WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0, label="renamed")
     view._on_table_segment_edited(0, new_seg)
-    assert view._annotation.wave_stats.segments[0].label == "renamed"
+    segs = view._annotation.wave_stats.segments_for_frame(_FRAME_IDX)
+    assert segs[0].label == "renamed"
 
 
 def test_table_segment_delete_updates_annotation(qapp):
@@ -266,5 +281,6 @@ def test_table_segment_delete_updates_annotation(qapp):
         ],
     )
     view._on_table_segment_deleted(0)
-    assert len(view._annotation.wave_stats.segments) == 1
-    assert view._annotation.wave_stats.segments[0].label == "b"
+    segs = view._annotation.wave_stats.segments_for_frame(_FRAME_IDX)
+    assert len(segs) == 1
+    assert segs[0].label == "b"

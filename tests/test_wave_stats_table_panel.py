@@ -19,17 +19,27 @@ from openfcd.gui.panels.wave_stats_table import (
 )
 
 
+_FRAME = 7
+
+
 def _make_annotation(segments: list[WaveSegment] | None = None) -> AnnotationSchema:
     segs = segments or [
         WaveSegment(s_lo_mm=0.0, s_hi_mm=10.0, label="A"),
         WaveSegment(s_lo_mm=10.0, s_hi_mm=20.0, label="B", color="#ff0000", visible=False),
     ]
-    return AnnotationSchema(wave_stats=WaveStatsConfig(segments=segs))
+    return AnnotationSchema(
+        wave_stats=WaveStatsConfig(segments_by_frame={str(_FRAME): segs})
+    )
+
+
+def _bind(panel: WaveStatsTablePanel, ann: AnnotationSchema, frame: int = _FRAME):
+    panel.set_annotation(ann)
+    panel.set_current_frame(frame)
 
 
 def test_table_populates_from_annotation(qapp):
     panel = WaveStatsTablePanel()
-    panel.set_annotation(_make_annotation())
+    _bind(panel, _make_annotation())
     assert panel._table.rowCount() == 2
     assert panel._table.item(0, COL_LABEL).text() == "A"
     assert panel._table.item(1, COL_LABEL).text() == "B"
@@ -38,12 +48,20 @@ def test_table_populates_from_annotation(qapp):
 def test_table_empty_when_no_wave_stats(qapp):
     panel = WaveStatsTablePanel()
     panel.set_annotation(AnnotationSchema())
+    panel.set_current_frame(_FRAME)
+    assert panel._table.rowCount() == 0
+
+
+def test_table_empty_when_other_frame_has_segments(qapp):
+    """A frame without its own segments must render an empty table."""
+    panel = WaveStatsTablePanel()
+    _bind(panel, _make_annotation(), frame=_FRAME + 1)
     assert panel._table.rowCount() == 0
 
 
 def test_segment_clicked_emits(qapp):
     panel = WaveStatsTablePanel()
-    panel.set_annotation(_make_annotation())
+    _bind(panel, _make_annotation())
     captured: list = []
     panel.segmentClicked.connect(lambda i: captured.append(i))
     panel._on_cell_clicked(1, 0)
@@ -52,7 +70,7 @@ def test_segment_clicked_emits(qapp):
 
 def test_label_edit_emits_segmentEdited(qapp):
     panel = WaveStatsTablePanel()
-    panel.set_annotation(_make_annotation())
+    _bind(panel, _make_annotation())
     captured: list = []
     panel.segmentEdited.connect(lambda i, s: captured.append((i, s)))
     panel._table.item(0, COL_LABEL).setText("Renamed")
@@ -64,7 +82,7 @@ def test_label_edit_emits_segmentEdited(qapp):
 
 def test_s_lo_edit_emits(qapp):
     panel = WaveStatsTablePanel()
-    panel.set_annotation(_make_annotation())
+    _bind(panel, _make_annotation())
     captured: list = []
     panel.segmentEdited.connect(lambda i, s: captured.append((i, s)))
     panel._table.item(0, COL_S_LO).setText("1.5")
@@ -77,7 +95,7 @@ def test_s_lo_edit_emits(qapp):
 def test_s_hi_invalid_does_not_emit(qapp):
     """s_hi <= s_lo: edit is silently rejected."""
     panel = WaveStatsTablePanel()
-    panel.set_annotation(_make_annotation())
+    _bind(panel, _make_annotation())
     captured: list = []
     panel.segmentEdited.connect(lambda i, s: captured.append((i, s)))
     panel._table.item(0, COL_S_HI).setText("-1.0")
@@ -86,7 +104,7 @@ def test_s_hi_invalid_does_not_emit(qapp):
 
 def test_visibility_toggle_emits(qapp):
     panel = WaveStatsTablePanel()
-    panel.set_annotation(_make_annotation())
+    _bind(panel, _make_annotation())
     captured: list = []
     panel.visibilityToggled.connect(lambda i, v: captured.append((i, v)))
     panel._on_visibility_toggled(0, False)
@@ -95,7 +113,7 @@ def test_visibility_toggle_emits(qapp):
 
 def test_delete_emits(qapp):
     panel = WaveStatsTablePanel()
-    panel.set_annotation(_make_annotation())
+    _bind(panel, _make_annotation())
     captured: list = []
     panel.segmentDeleted.connect(lambda i: captured.append(i))
     panel._on_delete_clicked(1)
@@ -111,5 +129,23 @@ def test_three_segments_render(qapp):
             WaveSegment(s_lo_mm=10.0, s_hi_mm=15.0, label="z"),
         ]
     )
-    panel.set_annotation(ann)
+    _bind(panel, ann)
     assert panel._table.rowCount() == 3
+
+
+def test_copy_previous_frame_signal(qapp):
+    panel = WaveStatsTablePanel()
+    _bind(panel, _make_annotation())
+    panel.set_previous_frame_has_segments(True)
+    assert panel._btn_copy_prev.isEnabled()
+    captured: list[bool] = []
+    panel.copyPreviousFrameRequested.connect(lambda: captured.append(True))
+    panel._btn_copy_prev.click()
+    assert captured == [True]
+
+
+def test_copy_previous_frame_disabled_when_no_prev(qapp):
+    panel = WaveStatsTablePanel()
+    _bind(panel, _make_annotation())
+    panel.set_previous_frame_has_segments(False)
+    assert not panel._btn_copy_prev.isEnabled()
