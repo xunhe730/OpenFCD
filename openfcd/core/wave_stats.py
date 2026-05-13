@@ -3,9 +3,13 @@
 Pure functions — no IO, no Qt, no h5py dependencies.
 
 The profile line is sampled at 1-pixel resolution via bilinear interpolation.
-Each user-defined segment ``[s_lo_mm, s_hi_mm]`` along the arc length is then
-analysed independently using a prominence-gated peak finder whose minimum
-distance is estimated from the dominant FFT wavelength.
+The arc-length axis ``s_mm`` is **centered on the line midpoint** (s=0), with
+``s ∈ [-L/2, +L/2]`` where ``L`` is the line length in millimetres. This
+matches the centered ``x_mm`` axis used by ``profile_composite`` for the 1D
+sub-plot, so user-drawn segment boundaries read directly off that plot can be
+fed in verbatim. Each user-defined segment ``[s_lo_mm, s_hi_mm]`` is analysed
+independently using a prominence-gated peak finder whose minimum distance is
+estimated from the dominant FFT wavelength.
 """
 
 from __future__ import annotations
@@ -259,7 +263,9 @@ def compute_frame_wave_stats(
 
     ds_mm = 1.0 / px_per_mm
     L_mm = L_px * ds_mm
-    s_profile_mm = t_vals * L_mm
+    # Centered arc-length axis: s=0 at the line midpoint, matching the
+    # centered x_mm axis used by profile_composite's 1D sub-plot.
+    s_profile_mm = t_vals * L_mm - 0.5 * L_mm
 
     out: list[SegmentWaveStats] = []
     for idx, (s_lo, s_hi) in enumerate(segments):

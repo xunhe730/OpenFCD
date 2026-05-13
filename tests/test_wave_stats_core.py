@@ -45,14 +45,15 @@ def test_pure_sine_wavelength():
     A = 1.0
     eta = _make_sine_eta(H, W, lambda_mm, A, px_per_mm)
     L_mm = (W - 1) / px_per_mm
-    mid_mm = L_mm / 2.0
+    half = L_mm / 2.0
 
+    # s_mm is centered on line midpoint: left half = [-L/2, 0], right half = [0, L/2]
     result = compute_frame_wave_stats(
         eta=eta,
         profile_line=_horizontal_profile(W, row=50.0),
         body_polygon_rc=None,
         px_per_mm=px_per_mm,
-        segments=[(0.0, mid_mm), (mid_mm, L_mm)],
+        segments=[(-half, 0.0), (0.0, half)],
         prominence_k=0.15,
     )
 
@@ -82,14 +83,14 @@ def test_damped_sine_wavelength_and_heights():
     eta = np.tile(eta_row, (H, 1))
 
     L_mm = (W - 1) / px_per_mm
-    mid_mm = L_mm / 2.0
+    half = L_mm / 2.0
 
     result = compute_frame_wave_stats(
         eta=eta,
         profile_line=_horizontal_profile(W, row=50.0),
         body_polygon_rc=None,
         px_per_mm=px_per_mm,
-        segments=[(0.0, mid_mm), (mid_mm, L_mm)],
+        segments=[(-half, 0.0), (0.0, half)],
         prominence_k=0.10,
     )
 
@@ -123,8 +124,8 @@ def test_noise_prominence_filtering():
     eta = np.tile(signal + noise, (H, 1))
 
     L_mm = (W - 1) / px_per_mm
-    mid_mm = L_mm / 2.0
-    segs = [(0.0, mid_mm), (mid_mm, L_mm)]
+    half = L_mm / 2.0
+    segs = [(-half, 0.0), (0.0, half)]
 
     strict = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
@@ -156,10 +157,13 @@ def test_short_window_nan_wavelength():
     rng = np.random.default_rng(0)
     eta = rng.standard_normal((H, W)) * 0.01
 
+    L_mm = (W - 1) / px_per_mm
+    half = L_mm / 2.0
+    # Two short windows: 1.5 mm flush at the left line edge, 1.4 mm flush at the right.
     result = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
         body_polygon_rc=None, px_per_mm=px_per_mm,
-        segments=[(0.0, 1.5), (38.5, 39.9)],
+        segments=[(-half, -half + 1.5), (half - 1.4, half)],
         prominence_k=0.3,
     )
 
@@ -195,10 +199,11 @@ def test_none_polygon_no_crash():
     eta = _make_sine_eta(H, W, lambda_mm, 1.0, px_per_mm)
     L_mm = (W - 1) / px_per_mm
 
+    half = L_mm / 2.0
     result = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
         body_polygon_rc=None, px_per_mm=px_per_mm,
-        segments=[(0.0, L_mm / 2.0), (L_mm / 2.0, L_mm)],
+        segments=[(-half, 0.0), (0.0, half)],
         prominence_k=0.15,
     )
     assert len(result.segments) == 2
@@ -214,13 +219,15 @@ def test_three_segments():
     eta = _make_sine_eta(H, W, lambda_mm, 1.0, px_per_mm)
     L_mm = (W - 1) / px_per_mm
 
+    half = L_mm / 2.0
+    sixth = L_mm / 6.0
     result = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
         body_polygon_rc=None, px_per_mm=px_per_mm,
         segments=[
-            (0.0, L_mm / 3.0),
-            (L_mm / 3.0, 2.0 * L_mm / 3.0),
-            (2.0 * L_mm / 3.0, L_mm),
+            (-half, -sixth),
+            (-sixth, sixth),
+            (sixth, half),
         ],
         prominence_k=0.15,
     )

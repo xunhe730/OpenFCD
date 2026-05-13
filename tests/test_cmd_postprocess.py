@@ -52,11 +52,12 @@ def _sha256_dataset(h5_path: Path, dataset_path: str) -> str:
 
 
 def _make_wave_stats_config(k: float = 0.15) -> WaveStatsConfig:
-    mid = L_MM / 2.0
+    # s_mm is centered on the line midpoint: fore = left half, aft = right half.
+    half = L_MM / 2.0
     return WaveStatsConfig(
         segments=[
-            WaveSegment(s_lo_mm=0.0, s_hi_mm=mid, label="fore"),
-            WaveSegment(s_lo_mm=mid, s_hi_mm=L_MM, label="aft"),
+            WaveSegment(s_lo_mm=-half, s_hi_mm=0.0, label="fore"),
+            WaveSegment(s_lo_mm=0.0, s_hi_mm=half, label="aft"),
         ],
         peak_prominence_k=k,
     )

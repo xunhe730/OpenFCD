@@ -45,11 +45,12 @@ def _make_eta(frame_idx: int) -> np.ndarray:
 
 
 def _make_annotation() -> AnnotationSchema:
-    mid = L_MM / 2.0
+    # s_mm is centered on the line midpoint (s=0): fore = left half, aft = right half.
+    half = L_MM / 2.0
     ws = WaveStatsConfig(
         segments=[
-            WaveSegment(s_lo_mm=0.0, s_hi_mm=mid, label="fore"),
-            WaveSegment(s_lo_mm=mid, s_hi_mm=L_MM, label="aft"),
+            WaveSegment(s_lo_mm=-half, s_hi_mm=0.0, label="fore"),
+            WaveSegment(s_lo_mm=0.0, s_hi_mm=half, label="aft"),
         ],
         peak_prominence_k=0.15,
     )
