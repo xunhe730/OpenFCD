@@ -809,17 +809,45 @@ def render_profile_composite_context(
         colorbar_mode = "bottom"
     if colorbar_mode not in {"bottom", "none"}:
         colorbar_mode = "bottom"
-    if context.eta is None or context.eta.size == 0:
-        widget_size = _figure_size_from_widget(fig, dpi)
-        fig_w, fig_h = widget_size if widget_size is not None else (fallback_w, fallback_h)
-        fig.set_size_inches(fig_w, fig_h, forward=True)
+
+    # Sizing contract:
+    #   layout_mode == "preview"  → Qt FigureCanvasQTAgg owns the figure size
+    #     (it forwards canvas-widget resizes into fig.set_size_inches). Core
+    #     reads the current size, never writes it back, so the agg buffer
+    #     always matches the on-screen widget rect.
+    #   else                       → headless export. Compute a physically
+    #     correct size from x_span/y_span and write it via set_size_inches.
+    def _resolve_fig_size(*, x_span: float | None = None, y_span: float | None = None) -> tuple[float, float]:
+        if layout_mode == "preview":
+            cur_w, cur_h = fig.get_size_inches()
+            fw = float(cur_w) if cur_w > 1e-3 else fallback_w
+            fh = float(cur_h) if cur_h > 1e-3 else fallback_h
+            return fw, fh
+        fh = fallback_h if (x_span is None or y_span is None) else _ensure_figure_height(
+            fallback_w, fallback_h, x_span, y_span
+        )
+        return fallback_w, fh
+
+    def _apply_fig_size(fw: float, fh: float) -> None:
+        # In preview mode, Qt's FigureCanvasQTAgg owns both size and DPI
+        # (it handles device pixel ratio internally). Mutating ``set_dpi``
+        # here desynchronises the agg buffer from the widget's physical
+        # pixels: inches stay at ``widget_px / old_dpi`` while buffer
+        # becomes ``inches × new_dpi``, leaving an uninitialised strip
+        # of stale memory on the right/bottom of the widget that surfaces
+        # as RGB noise or leftover axes through paintEvent.
+        if layout_mode == "preview":
+            return
+        fig.set_size_inches(fw, fh, forward=True)
         fig.set_dpi(dpi)
+
+    if context.eta is None or context.eta.size == 0:
+        fig_w, fig_h = _resolve_fig_size()
+        _apply_fig_size(fig_w, fig_h)
         return _empty_figure(fig, context.degraded_reason or "No eta frame")
     if context.profile_line is None:
-        widget_size = _figure_size_from_widget(fig, dpi)
-        fig_w, fig_h = widget_size if widget_size is not None else (fallback_w, fallback_h)
-        fig.set_size_inches(fig_w, fig_h, forward=True)
-        fig.set_dpi(dpi)
+        fig_w, fig_h = _resolve_fig_size()
+        _apply_fig_size(fig_w, fig_h)
         return _empty_figure(fig, context.degraded_reason or "Draw a profile line on the eta frame first")
 
     full_window = extract_profile_window(
@@ -858,14 +886,8 @@ def render_profile_composite_context(
 
     x_span = max(abs(float(window.x_mm[-1] - window.x_mm[0])), 1e-9)
     y_span = max(abs(float(window.y_mm[-1] - window.y_mm[0])), 1e-9)
-    widget_size = _figure_size_from_widget(fig, dpi) if layout_mode == "preview" else None
-    if widget_size is not None:
-        fig_w, fig_h = widget_size
-    else:
-        fig_w = fallback_w
-        fig_h = _ensure_figure_height(fallback_w, fallback_h, x_span, y_span)
-    fig.set_size_inches(fig_w, fig_h, forward=True)
-    fig.set_dpi(dpi)
+    fig_w, fig_h = _resolve_fig_size(x_span=x_span, y_span=y_span)
+    _apply_fig_size(fig_w, fig_h)
     rects = _layout_rects(fig_w, fig_h, x_span, y_span, include_colorbar=colorbar_mode == "bottom")
     ax_map = fig.add_axes(rects["map"])
     ax_cbar = fig.add_axes(rects["cbar"]) if colorbar_mode == "bottom" else None
