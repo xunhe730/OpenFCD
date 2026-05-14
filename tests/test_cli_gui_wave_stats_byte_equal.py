@@ -129,6 +129,7 @@ def test_wave_stats_subtree_structure(tmp_path):
                 seg = f[f"batches/{BATCH}/wave_stats/frame_{fid}/segments/{idx:04d}"]
                 for dataset in (
                     "wavelength_mm", "wavenumber_per_mm",
+                    "S_gamma_N_per_m", "S_g_N_per_m", "S_cg_N_per_m",
                     "peaks", "troughs", "heights",
                 ):
                     assert dataset in seg

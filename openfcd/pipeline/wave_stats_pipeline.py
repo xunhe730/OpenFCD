@@ -23,6 +23,9 @@ HDF5 layout produced (per batch b)::
           attrs: s_lo_mm, s_hi_mm, label, color, visible (uint8)
           wavelength_mm     scalar float64
           wavenumber_per_mm scalar float64
+          S_gamma_N_per_m   scalar float64   (3/4)·γ·k²·a²  (capillary, N/m)
+          S_g_N_per_m       scalar float64   (1/4)·ρ·g·a²   (gravity,   N/m)
+          S_cg_N_per_m      scalar float64   S_gamma + S_g  (total,     N/m)
           peaks   (n, 2) float64  columns: [s_mm, eta]
           troughs (n, 2) float64  columns: [s_mm, eta]
           heights (n,)   float64
@@ -122,6 +125,9 @@ def compute_and_write_wave_stats(
                         "visible": bool(seg.visible),
                         "wavelength_mm": float(seg_stats.wavelength_mm),
                         "wavenumber_per_mm": float(seg_stats.wavenumber_per_mm),
+                        "S_gamma_N_per_m": float(seg_stats.S_gamma_N_per_m),
+                        "S_g_N_per_m": float(seg_stats.S_g_N_per_m),
+                        "S_cg_N_per_m": float(seg_stats.S_cg_N_per_m),
                         "peaks": (
                             np.column_stack(
                                 [seg_stats.peaks_s_mm, seg_stats.peaks_eta]

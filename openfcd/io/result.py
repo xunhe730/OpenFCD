@@ -275,6 +275,9 @@ class HDF5ResultStore:
                   attrs: s_lo_mm, s_hi_mm, label, color, visible (uint8)
                   wavelength_mm     scalar float64
                   wavenumber_per_mm scalar float64
+                  S_gamma_N_per_m   scalar float64
+                  S_g_N_per_m       scalar float64
+                  S_cg_N_per_m      scalar float64
                   peaks   (n, 2) float64
                   troughs (n, 2) float64
                   heights (n,)   float64
@@ -322,6 +325,18 @@ class HDF5ResultStore:
                 seg_grp.create_dataset(
                     "wavenumber_per_mm",
                     data=np.float64(seg["wavenumber_per_mm"]),
+                )
+                seg_grp.create_dataset(
+                    "S_gamma_N_per_m",
+                    data=np.float64(seg.get("S_gamma_N_per_m", float("nan"))),
+                )
+                seg_grp.create_dataset(
+                    "S_g_N_per_m",
+                    data=np.float64(seg.get("S_g_N_per_m", float("nan"))),
+                )
+                seg_grp.create_dataset(
+                    "S_cg_N_per_m",
+                    data=np.float64(seg.get("S_cg_N_per_m", float("nan"))),
                 )
                 seg_grp.create_dataset(
                     "peaks",
