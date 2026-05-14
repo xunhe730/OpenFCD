@@ -253,8 +253,14 @@ class ProfileSceneView(QWidget):
     # 6 frames @120 Hz ProMotion. See draft-plan.md §Principle 2.
     _RENDER_DEBOUNCE_MS: int = 48
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, session_controller=None) -> None:
         super().__init__(parent)
+        # When supplied, the scene borrows the live in-memory annotation and
+        # ProjectModel from SessionController instead of re-reading them from
+        # disk on every load(). This keeps in-memory edits (profile_line,
+        # wave_stats segments) alive across scene switches. Test fixtures and
+        # legacy callers pass None and fall back to the disk-read path.
+        self._session = session_controller
         self._spec = None
         self._project_path: Path | None = None
         self._eta_frames: dict[int, np.ndarray] = {}
@@ -439,26 +445,50 @@ class ProfileSceneView(QWidget):
         self._eta_frames = {}
         self._frame_names = {}
         self._frame_calibrations = {}
-        self._annotation = None
-        self._project_model = None
-        self._run_manifest = None
         spec = self._spec
         if spec is None or not self._project_path:
+            # No project bound — clear everything (session_controller may
+            # also be None or empty, but binding to its property is still
+            # safe since it returns None when its store is None).
+            self._annotation = self._session.annotation if self._session else None
+            self._project_model = self._session.project if self._session else None
+            self._run_manifest = None
             return
+        # Annotation + project: prefer the live in-memory copy from
+        # SessionController (the canonical owner — see
+        # `.omc/plans/wave-stats-scene-switch-rootcause.md`). Falls back to
+        # an own read-only FileSessionStore only when no session_controller
+        # was injected (test fixtures, legacy callers).
+        if self._session is not None:
+            self._annotation = self._session.annotation
+            self._project_model = self._session.project
+        else:
+            self._annotation = None
+            self._project_model = None
+            try:
+                from openfcd.io.store import FileSessionStore
+                session = FileSessionStore.open(self._project_path, read_only=True)
+                try:
+                    self._annotation = session.annotation
+                    self._project_model = session.project
+                finally:
+                    session.close()
+            except Exception:
+                pass
+        # Run manifest: runs are immutable snapshots — always disk-read.
+        self._run_manifest = None
         try:
             from openfcd.io.store import FileSessionStore
             session = FileSessionStore.open(self._project_path, read_only=True)
-            self._annotation = session.annotation
-            self._project_model = session.project
-            run_id_for_manifest = spec.run_id or self._latest_run_id(self._project_path)
-            self._run_manifest = next(
-                (r for r in session.list_runs() if r.get("run_id") == run_id_for_manifest),
-                None,
-            )
-            session.close()
+            try:
+                run_id_for_manifest = spec.run_id or self._latest_run_id(self._project_path)
+                self._run_manifest = next(
+                    (r for r in session.list_runs() if r.get("run_id") == run_id_for_manifest),
+                    None,
+                )
+            finally:
+                session.close()
         except Exception:
-            self._annotation = None
-            self._project_model = None
             self._run_manifest = None
         run_id = spec.run_id or self._latest_run_id(self._project_path)
         if run_id is None:
@@ -821,13 +851,13 @@ class ProfileSceneView(QWidget):
                 from openfcd.io.annotation import ProfileLineData
                 new_pl = ProfileLineData(start=line[0], end=line[1])
                 self.profile_line_changed.emit(new_pl)
-                parent = self.parent()
-                if hasattr(parent, "set_profile_line"):
-                    parent.set_profile_line(new_pl)
-                if self._annotation is not None:
-                    self._annotation = self._annotation.model_copy(
-                        update={"profile_line": new_pl}
-                    )
+                # Route through SessionController so the canonical
+                # in-memory annotation survives scene re-entry. Falls back
+                # to a local model_copy for test/CLI paths without a
+                # SessionController. The legacy ``parent.set_profile_line``
+                # branch was dead — ``self.parent()`` is the QStackedWidget,
+                # which has no such method.
+                self._commit_profile_line(new_pl)
                 saved = True
         if not saved:
             self._enter_annotation()
@@ -988,6 +1018,34 @@ class ProfileSceneView(QWidget):
             return False
         return bool(ws.segments_for_frame(prev_idx))
 
+    def _commit_wave_stats(self, new_cfg) -> None:
+        """Route a WaveStatsConfig update through SessionController when
+        available — its in-place ``_store.annotation.wave_stats = config``
+        keeps the canonical shared AnnotationSchema in sync across the app
+        (table, other scenes, eventual flush to disk). Fallback path keeps
+        a local model_copy for tests and CLI replay callers that don't
+        wire a SessionController.
+
+        Always re-binds ``self._annotation`` to the canonical live
+        annotation so that subsequent scene re-entries borrowing
+        ``self._session.annotation`` observe the mutation.
+        """
+        if self._session is not None:
+            self._session.update_wave_stats_config(new_cfg)
+            self._annotation = self._session.annotation
+        elif self._annotation is not None:
+            self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+
+    def _commit_profile_line(self, new_pl) -> None:
+        """Route a ProfileLineData update through SessionController. See
+        ``_commit_wave_stats`` for the rationale.
+        """
+        if self._session is not None:
+            self._session.set_profile_line(new_pl)
+            self._annotation = self._session.annotation
+        elif self._annotation is not None:
+            self._annotation = self._annotation.model_copy(update={"profile_line": new_pl})
+
     def _append_segment_local(self, new_seg) -> None:
         """Append ``new_seg`` to the CURRENT frame's segment list."""
         if self._annotation is None:
@@ -1009,7 +1067,7 @@ class ProfileSceneView(QWidget):
             new_by_frame = dict(old_cfg.segments_by_frame)
             new_by_frame[frame_key] = existing + [new_seg]
             new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
-        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self._commit_wave_stats(new_cfg)
         self.wave_stats_config_changed.emit(new_cfg)
         self._table_panel.set_annotation(self._annotation)
         self._sync_table_current_frame()
@@ -1038,7 +1096,7 @@ class ProfileSceneView(QWidget):
         new_by_frame = dict(old_cfg.segments_by_frame)
         new_by_frame[str(cur_idx)] = new_segs
         new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
-        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self._commit_wave_stats(new_cfg)
         self.wave_stats_config_changed.emit(new_cfg)
         self._table_panel.set_annotation(self._annotation)
         self._sync_table_current_frame()
@@ -1240,7 +1298,7 @@ class ProfileSceneView(QWidget):
         new_by_frame = dict(old_cfg.segments_by_frame)
         new_by_frame[frame_key] = cur_segs
         new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
-        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self._commit_wave_stats(new_cfg)
         self.wave_segment_edited.emit(idx, new_seg)
         self.wave_stats_config_changed.emit(new_cfg)
         self._table_panel.set_annotation(self._annotation)
@@ -1261,7 +1319,7 @@ class ProfileSceneView(QWidget):
         new_by_frame = dict(old_cfg.segments_by_frame)
         new_by_frame[frame_key] = cur_segs
         new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
-        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        self._commit_wave_stats(new_cfg)
         self.wave_segment_deleted.emit(idx)
         self.wave_stats_config_changed.emit(new_cfg)
         if self._active_segment_idx is not None and self._active_segment_idx >= len(cur_segs):

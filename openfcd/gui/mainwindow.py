@@ -242,7 +242,7 @@ class MainWindow(QMainWindow):
 
         # SceneContainer — routes scene type to dedicated view (index 3)
         from openfcd.gui.scenes.scene_container import SceneContainer
-        self._scene_container = SceneContainer(self)
+        self._scene_container = SceneContainer(self, session_controller=self._session)
         self._center_stack.addWidget(self._scene_container)  # index 3
 
         center_layout.addWidget(self._center_stack, 1)
