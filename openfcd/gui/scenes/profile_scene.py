@@ -434,13 +434,6 @@ class ProfileSceneView(QWidget):
             self._enter_annotation()
         else:
             self._request_render(self._current_frame_pos)
-            # Synchronously rebind live wave-stats on scene re-entry. The
-            # render path also calls _recompute_live_stats but is debounced
-            # (~48ms); without this sync call the table renders with stale
-            # _live_stats from the previous session and can stay bound to
-            # None when _compute_live_stats falls through any of its
-            # missing-input branches.
-            self._recompute_live_stats()
 
     def _load_eta_frames(self) -> None:
         self._eta_frames = {}
