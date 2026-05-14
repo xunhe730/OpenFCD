@@ -1,6 +1,20 @@
-"""Profile Scene view: per-frame line annotation + composite preview + wave-segment table (v2)."""
+"""Profile Scene view: per-frame line annotation + composite preview + wave-segment table (v2).
+
+Render state machine (Tier 1c): the **only** full-figure repaint entry is
+``_request_render`` → debounced ``QTimer`` → ``_do_render`` → ``__show_chart``.
+``__show_chart`` is name-mangled to discourage direct external calls; a permanent
+``assert self._render_state == "rendering"`` at its entry plus the AST-grep
+whitelist test (see ``tests/test_overlay_whitelist_ast_grep.py``) enforce the
+invariant. Overlay-only paths (``_recompute_live_stats``) must not call
+``fig.clear``/``add_axes``/``add_subplot`` nor construct new Artists; they may
+only mutate existing artists via ``set_data``/``set_xy``/``set_offsets``/
+``set_array``.
+"""
 from __future__ import annotations
 
+import collections
+import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +33,10 @@ from PyQt6.QtWidgets import (
 )
 
 from openfcd.gui import tokens
+
+__all__ = ["ProfileSceneView"]
+
+_logger = logging.getLogger(__name__)
 
 
 # Local color cycle for wave-segment auto-assignment. Kept here (not imported
@@ -231,8 +249,18 @@ class ProfileSceneView(QWidget):
     wave_segment_deleted = pyqtSignal(int)
     live_stats_changed = pyqtSignal(object)         # FrameWaveStats | None
 
-    def __init__(self, parent=None) -> None:
+    # Debounce window for the render coalescer. 48 ms = 3 frames @60 Hz /
+    # 6 frames @120 Hz ProMotion. See draft-plan.md §Principle 2.
+    _RENDER_DEBOUNCE_MS: int = 48
+
+    def __init__(self, parent=None, session_controller=None) -> None:
         super().__init__(parent)
+        # When supplied, the scene borrows the live in-memory annotation and
+        # ProjectModel from SessionController instead of re-reading them from
+        # disk on every load(). This keeps in-memory edits (profile_line,
+        # wave_stats segments) alive across scene switches. Test fixtures and
+        # legacy callers pass None and fall back to the disk-read path.
+        self._session = session_controller
         self._spec = None
         self._project_path: Path | None = None
         self._eta_frames: dict[int, np.ndarray] = {}
@@ -256,6 +284,18 @@ class ProfileSceneView(QWidget):
         self._peak_artists: list = []                # scatter artists for peaks/troughs
         self._pending_first_x: float | None = None
         self._live_frame_stats = None                # FrameWaveStats | None
+        # ── Render state machine (Tier 1c) ──────────────────────────
+        # State machine collapses same-frame multi-entry races into a single
+        # debounced repaint. Threading contract: ``_request_render``,
+        # ``_do_render``, and the ``_render_timer`` QTimer slot are ALL
+        # invoked on the Qt GUI main thread (Qt single-threaded GUI
+        # invariant); the ``deque`` therefore needs no lock. Background
+        # ``_RunWorker`` QThreads must hop back to the main thread via
+        # ``Qt.QueuedConnection`` signals before reaching ``_request_render``.
+        self._render_state: str = "idle"  # ∈ {"idle", "scheduled", "rendering"}
+        self._pending_render_dirty: bool = False
+        self._render_dirty_rearm_count: int = 0
+        self._render_state_log: collections.deque = collections.deque(maxlen=64)
 
         # ── Top-level layout ────────────────────────────────────────
         layout = QVBoxLayout(self)
@@ -308,6 +348,9 @@ class ProfileSceneView(QWidget):
         self._table_panel.segmentEdited.connect(self._on_table_segment_edited)
         self._table_panel.segmentDeleted.connect(self._on_table_segment_deleted)
         self._table_panel.visibilityToggled.connect(self._on_table_visibility_toggled)
+        self._table_panel.copyPreviousFrameRequested.connect(
+            self._on_copy_previous_frame_segments
+        )
         self.live_stats_changed.connect(self._table_panel.set_live_stats)
         self._chart_widget.addWidget(self._table_panel)
         self._chart_widget.setStretchFactor(0, 3)
@@ -327,7 +370,7 @@ class ProfileSceneView(QWidget):
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(80)
+        self._render_timer.setInterval(self._RENDER_DEBOUNCE_MS)
         self._pending_idx = 0
         self._render_timer.timeout.connect(self._do_render)
         self._slider.valueChanged.connect(self._on_slider_moved)
@@ -390,37 +433,62 @@ class ProfileSceneView(QWidget):
         self._btn_edit.setVisible(True)
         self._table_panel.set_annotation(self._annotation)
         self._table_panel.set_h5_path(self._h5_path(), batch="default")
+        self._sync_table_current_frame()
         missing_pos = self._first_missing_line_pos()
         if missing_pos is not None:
             self._set_frame_pos(missing_pos)
             self._enter_annotation()
         else:
-            self._show_chart(self._current_frame_pos)
+            self._request_render(self._current_frame_pos)
 
     def _load_eta_frames(self) -> None:
         self._eta_frames = {}
         self._frame_names = {}
         self._frame_calibrations = {}
-        self._annotation = None
-        self._project_model = None
-        self._run_manifest = None
         spec = self._spec
         if spec is None or not self._project_path:
+            # No project bound — clear everything (session_controller may
+            # also be None or empty, but binding to its property is still
+            # safe since it returns None when its store is None).
+            self._annotation = self._session.annotation if self._session else None
+            self._project_model = self._session.project if self._session else None
+            self._run_manifest = None
             return
+        # Annotation + project: prefer the live in-memory copy from
+        # SessionController (the canonical owner — see
+        # `.omc/plans/wave-stats-scene-switch-rootcause.md`). Falls back to
+        # an own read-only FileSessionStore only when no session_controller
+        # was injected (test fixtures, legacy callers).
+        if self._session is not None:
+            self._annotation = self._session.annotation
+            self._project_model = self._session.project
+        else:
+            self._annotation = None
+            self._project_model = None
+            try:
+                from openfcd.io.store import FileSessionStore
+                session = FileSessionStore.open(self._project_path, read_only=True)
+                try:
+                    self._annotation = session.annotation
+                    self._project_model = session.project
+                finally:
+                    session.close()
+            except Exception:
+                pass
+        # Run manifest: runs are immutable snapshots — always disk-read.
+        self._run_manifest = None
         try:
             from openfcd.io.store import FileSessionStore
             session = FileSessionStore.open(self._project_path, read_only=True)
-            self._annotation = session.annotation
-            self._project_model = session.project
-            run_id_for_manifest = spec.run_id or self._latest_run_id(self._project_path)
-            self._run_manifest = next(
-                (r for r in session.list_runs() if r.get("run_id") == run_id_for_manifest),
-                None,
-            )
-            session.close()
+            try:
+                run_id_for_manifest = spec.run_id or self._latest_run_id(self._project_path)
+                self._run_manifest = next(
+                    (r for r in session.list_runs() if r.get("run_id") == run_id_for_manifest),
+                    None,
+                )
+            finally:
+                session.close()
         except Exception:
-            self._annotation = None
-            self._project_model = None
             self._run_manifest = None
         run_id = spec.run_id or self._latest_run_id(self._project_path)
         if run_id is None:
@@ -464,20 +532,45 @@ class ProfileSceneView(QWidget):
         return dirs[-1] if dirs else None
 
     def _on_slider_moved(self, idx: int) -> None:
-        self._pending_idx = idx
-        self._render_timer.start()
+        # Label updates immediately (cheap, no figure work); the heavy
+        # full-figure repaint is coalesced through ``_request_render``.
+        self._current_frame_pos = idx
+        total = len(self._spec.frame_indices) if self._spec is not None else 0
+        self._slider_lbl.setText(f"frame {idx}/{max(0, total - 1)}")
+        self._request_render(idx)
 
     def _do_render(self) -> None:
-        self._on_slider(self._pending_idx)
+        """QTimer slot: drive ``scheduled → rendering → idle`` transition.
+
+        Page-1 (annotator) takes the lightweight path and does NOT enter
+        ``__show_chart``; page-0 transitions to ``rendering`` and calls
+        ``__show_chart``, which manages its own ``finally`` state cleanup.
+        """
+        pending = self._pending_idx
+        if self._mode_stack.currentIndex() != 0:
+            # Annotator page: no figure work; just refresh the image.
+            prev = self._render_state
+            self._render_state = "idle"
+            self._pending_render_dirty = False
+            self._render_dirty_rearm_count = 0
+            self._render_state_log.append(
+                (time.monotonic(), prev, "idle", "do_render_page1_annotator")
+            )
+            self._show_annotator_frame(pending)
+            return
+        # Page-0 chart path: transition into ``rendering`` and dispatch.
+        prev = self._render_state
+        self._render_state = "rendering"
+        self._render_state_log.append(
+            (time.monotonic(), prev, "rendering", "do_render_dispatch")
+        )
+        self.__show_chart(pending)
 
     def _on_slider(self, pos: int) -> None:
         self._current_frame_pos = pos
         total = len(self._spec.frame_indices) if self._spec is not None else 0
         self._slider_lbl.setText(f"frame {pos}/{max(0, total - 1)}")
-        if self._mode_stack.currentIndex() == 0:
-            self._show_chart(pos)
-        else:
-            self._show_annotator_frame(pos)
+        self._request_render(pos)
 
     def _set_frame_pos(self, pos: int) -> None:
         self._current_frame_pos = pos
@@ -485,11 +578,50 @@ class ProfileSceneView(QWidget):
         self._slider_lbl.setText(f"frame {pos}/{max(0, total - 1)}")
         if self._slider.value() != pos:
             self._slider.setValue(pos)
+        # Reset segment-collect mode so it does not bleed across frames.
+        if hasattr(self, "_btn_collect") and self._btn_collect.isChecked():
+            self._btn_collect.setChecked(False)
+        # Notify the table panel of the active frame so it renders the
+        # segment list for the new frame (per-frame wave-stats, v3).
+        self._sync_table_current_frame()
 
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
+        # Coalesce rapid resize storms (window drag, splitter move, table-row
+        # add/remove that nudges the canvas height) into a single deferred
+        # render via the state machine. Page-1 (annotator) is skipped because
+        # the chart figure is not visible there.
         if getattr(self, "_fig", None) is not None and self._mode_stack.currentIndex() == 0:
-            self._show_chart(self._current_frame_pos)
+            self._request_render(self._current_frame_pos)
+
+    # ── Render state machine: single full-figure repaint entry ───────
+
+    def _request_render(self, pos: int) -> None:
+        """Single full-figure repaint entry (state-machine driver).
+
+        Threading contract: must be called on the Qt GUI main thread.
+        Background workers must hop via ``Qt.QueuedConnection`` signal.
+        """
+        prev = self._render_state
+        if self._render_state == "idle":
+            self._pending_idx = pos
+            self._render_state = "scheduled"
+            self._render_state_log.append(
+                (time.monotonic(), prev, "scheduled", "request_render_idle")
+            )
+            self._render_timer.start()
+        elif self._render_state == "scheduled":
+            # Coalesce: keep the timer running, just refresh the target pos.
+            self._pending_idx = pos
+            self._render_state_log.append(
+                (time.monotonic(), prev, "scheduled", "request_render_coalesce")
+            )
+        else:  # "rendering"
+            self._pending_idx = pos
+            self._pending_render_dirty = True
+            self._render_state_log.append(
+                (time.monotonic(), prev, "rendering", "request_render_dirty")
+            )
 
     def _frame_idx_at(self, pos: int) -> int | None:
         if self._spec and 0 <= pos < len(self._spec.frame_indices):
@@ -525,52 +657,135 @@ class ProfileSceneView(QWidget):
     def _profile_viz_params(self) -> dict:
         params = dict(self._spec.viz_params or {}) if self._spec is not None else {}
         params.pop("px_per_mm", None)
+        # In preview mode the renderer reads fig.get_size_inches() (Qt-synced
+        # from the canvas widget) and never writes it back, so the agg buffer
+        # always matches the on-screen widget rect. Don't inject figure_width/
+        # figure_height — that path was the root cause of the noisy uninited
+        # buffer leaking through when canvas size and figure size diverged.
         params["layout_mode"] = "preview"
-        if self._fig is not None:
-            dpi = float(params.get("dpi", 150) or 150)
-            canvas = self._fig.canvas
-            if canvas is not None and canvas.width() > 1 and canvas.height() > 1 and dpi > 0:
-                params["figure_width"] = canvas.width() / dpi
-                params["figure_height"] = canvas.height() / dpi
         return params
 
-    def _show_chart(self, pos: int) -> None:
-        if self._fig is None:
-            return
-        frame_idx = self._frame_idx_at(pos)
-        eta = self._eta_frames.get(frame_idx) if frame_idx is not None else None
-        from openfcd.core.profile_composite import (
-            build_profile_composite_context,
-            render_profile_composite_context,
-            resolve_body_polygon,
-        )
-        frame_name = self._frame_names.get(frame_idx) if frame_idx is not None else None
-        body_polygon, body_source = resolve_body_polygon(self._annotation, frame_name)
-        context = build_profile_composite_context(
-            eta=eta,
-            profile_line=self._get_line_for_pos(pos),
-            viz_params=self._profile_viz_params(),
-            frame_idx=frame_idx,
-            frame_name=frame_name,
-            run_id=getattr(self._spec, "run_id", None),
-            body_polygon_rc=body_polygon,
-            body_source=body_source,
-            spatial_calibration=self._frame_calibrations.get(frame_idx),
-        )
-        render_profile_composite_context(
-            context,
-            fig=self._fig,
-            frame_label=f"Profile Composite - frame {frame_idx}" if frame_idx is not None else None,
-        )
-        # Reset overlay refs (matplotlib clears axes on render)
-        self._lower_ax = self._detect_lower_axis()
-        self._hover_vline = None
-        self._hover_text = None
-        self._segment_patches = []
-        self._peak_artists = []
-        self._recompute_live_stats()
-        self._overlay_segments(self._active_segment_idx)
-        self._fig.canvas.draw_idle()
+    def __show_chart(self, pos: int) -> None:
+        """Full-figure repaint. **Permanent invariant**: must be entered in
+        ``rendering`` state via ``_do_render`` (or the rearm-cap final
+        consume); name-mangled (``_ProfileSceneView__show_chart``) so any
+        external call site immediately surfaces as ``AttributeError``.
+
+        MUST NOT call any API that spins the Qt event loop — no
+        ``QApplication.processEvents``, no ``QEventLoop.exec``, no modal
+        dialogs. Spinning the loop here re-enters the state machine while
+        the figure is half-built and reintroduces the very race this
+        machine exists to suppress.
+        """
+        # Permanent invariant — kept in release builds (do NOT gate with
+        # ``__debug__``); state contract is the last line of defence
+        # against bypass routes that escape the AST-grep whitelist.
+        assert self._render_state == "rendering"
+        # Backbuffer-flush root-cause fix (orthogonal to the state machine):
+        # explicitly clear the figure and drain pending agg events so the
+        # next add_axes pass renders into a clean buffer. Without this,
+        # axes rebuilt after a resize can leak old pixels at the next
+        # paintEvent even when entry races are serialised.
+        if self._fig is not None:
+            self._fig.clear()
+            try:
+                self._fig.canvas.flush_events()
+            except Exception:
+                pass
+        try:
+            if self._fig is None:
+                return
+            frame_idx = self._frame_idx_at(pos)
+            eta = self._eta_frames.get(frame_idx) if frame_idx is not None else None
+            from openfcd.core.profile_composite import (
+                build_profile_composite_context,
+                render_profile_composite_context,
+                resolve_body_polygon,
+            )
+            frame_name = self._frame_names.get(frame_idx) if frame_idx is not None else None
+            body_polygon, body_source = resolve_body_polygon(self._annotation, frame_name)
+            context = build_profile_composite_context(
+                eta=eta,
+                profile_line=self._get_line_for_pos(pos),
+                viz_params=self._profile_viz_params(),
+                frame_idx=frame_idx,
+                frame_name=frame_name,
+                run_id=getattr(self._spec, "run_id", None),
+                body_polygon_rc=body_polygon,
+                body_source=body_source,
+                spatial_calibration=self._frame_calibrations.get(frame_idx),
+            )
+            render_profile_composite_context(
+                context,
+                fig=self._fig,
+                frame_label=f"Profile Composite - frame {frame_idx}" if frame_idx is not None else None,
+            )
+            # Reset overlay refs (matplotlib clears axes on render).
+            self._lower_ax = self._detect_lower_axis()
+            self._hover_vline = None
+            self._hover_text = None
+            self._segment_patches = []
+            self._peak_artists = []
+            # Resync the table panel's current frame so its row list reflects
+            # this frame's segments — slider handlers only update
+            # ``_current_frame_pos``, the canonical frame-change point is
+            # the debounced render.
+            self._sync_table_current_frame()
+            # Single recompute path: this also redraws the segment/peak overlay
+            # on the freshly-built axes and schedules a canvas repaint.
+            self._recompute_live_stats()
+            # After fig.clear()+add_axes(), force a synchronous draw so the agg
+            # buffer is committed at the current canvas size before Qt's next
+            # paintEvent — otherwise a stale buffer can leak through as
+            # uninited pixels around the new axes.
+            self._fig.canvas.draw()
+        finally:
+            # Transition out of ``rendering``. If a ``_request_render`` came
+            # in mid-flight (dirty=True), rearm the timer (state→scheduled)
+            # up to ``_render_dirty_rearm_count < 3``; on cap, consume the
+            # final pending idx ONCE more and then force idle so we don't
+            # silently drop the user's most recent intent.
+            if self._pending_render_dirty:
+                self._render_dirty_rearm_count += 1
+                if self._render_dirty_rearm_count >= 3:
+                    final_pos = self._pending_idx
+                    self._pending_render_dirty = False
+                    self._render_state_log.append(
+                        (time.monotonic(), "rendering", "rendering", "rearm_cap_final_consume")
+                    )
+                    # State remains "rendering" so the recursive call's
+                    # entry assert holds. The inner call's ``finally``
+                    # sees ``dirty=False`` and falls through to idle; we
+                    # then overwrite with our cap-finalised idle below.
+                    try:
+                        self.__show_chart(final_pos)
+                    except Exception:
+                        _logger.exception(
+                            "rearm cap final consume failed at idx=%s", final_pos
+                        )
+                    _logger.error(
+                        "render rearm cap reached at idx=%s; final frame may lag, "
+                        "retrigger via slider/resize",
+                        final_pos,
+                    )
+                    self._render_state = "idle"
+                    self._render_dirty_rearm_count = 0
+                    self._render_state_log.append(
+                        (time.monotonic(), "rendering", "idle", "rearm_cap_finalized")
+                    )
+                else:
+                    self._pending_render_dirty = False
+                    self._render_state = "scheduled"
+                    self._render_state_log.append(
+                        (time.monotonic(), "rendering", "scheduled", "dirty_rearm")
+                    )
+                    self._render_timer.start()
+            else:
+                self._render_state = "idle"
+                self._render_dirty_rearm_count = 0
+                self._render_state_log.append(
+                    (time.monotonic(), "rendering", "idle", "render_complete")
+                )
 
     def _detect_lower_axis(self):
         """Detect which axis is the 1D η(x) subplot.
@@ -588,6 +803,17 @@ class ProfileSceneView(QWidget):
     # ── Edit Lines flow (unchanged behaviour) ─────────────────────────
 
     def _enter_annotation(self) -> None:
+        # Switching to the annotator page hides the chart figure entirely.
+        # Cancel any in-flight chart render bookkeeping so a stale rearm
+        # cannot fire while page-1 is active.
+        self._render_timer.stop()
+        prev_state = self._render_state
+        self._render_state = "idle"
+        self._pending_render_dirty = False
+        self._render_dirty_rearm_count = 0
+        self._render_state_log.append(
+            (time.monotonic(), prev_state, "idle", "enter_annotation")
+        )
         self._annotating_per_frame = True
         self._mode_stack.setCurrentIndex(1)
         self._btn_edit.setVisible(False)
@@ -625,13 +851,13 @@ class ProfileSceneView(QWidget):
                 from openfcd.io.annotation import ProfileLineData
                 new_pl = ProfileLineData(start=line[0], end=line[1])
                 self.profile_line_changed.emit(new_pl)
-                parent = self.parent()
-                if hasattr(parent, "set_profile_line"):
-                    parent.set_profile_line(new_pl)
-                if self._annotation is not None:
-                    self._annotation = self._annotation.model_copy(
-                        update={"profile_line": new_pl}
-                    )
+                # Route through SessionController so the canonical
+                # in-memory annotation survives scene re-entry. Falls back
+                # to a local model_copy for test/CLI paths without a
+                # SessionController. The legacy ``parent.set_profile_line``
+                # branch was dead — ``self.parent()`` is the QStackedWidget,
+                # which has no such method.
+                self._commit_profile_line(new_pl)
                 saved = True
         if not saved:
             self._enter_annotation()
@@ -645,7 +871,7 @@ class ProfileSceneView(QWidget):
         self._mode_stack.setCurrentIndex(0)
         self._btn_done.setVisible(False)
         self._btn_edit.setVisible(True)
-        self._show_chart(self._current_frame_pos)
+        self._request_render(self._current_frame_pos)
 
     def apply_viz(self, params: dict) -> None:
         if self._spec is not None:
@@ -654,7 +880,7 @@ class ProfileSceneView(QWidget):
         self._mode_stack.setCurrentIndex(0)
         self._btn_done.setVisible(False)
         self._btn_edit.setVisible(True)
-        self._show_chart(self._current_frame_pos)
+        self._request_render(self._current_frame_pos)
 
     def current_slider_value(self) -> int:
         return int(self._current_frame_pos)
@@ -760,31 +986,127 @@ class ProfileSceneView(QWidget):
             f"已采集 [{s_lo:.2f}, {s_hi:.2f}] mm"
         )
 
+    def _current_frame_key(self) -> str | None:
+        """Return ``str(frame_idx)`` for the active slider position, or None."""
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if frame_idx is None:
+            return None
+        return str(frame_idx)
+
+    def _sync_table_current_frame(self) -> None:
+        """Push the active frame_idx to the table panel."""
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if hasattr(self._table_panel, "set_current_frame"):
+            self._table_panel.set_current_frame(frame_idx)
+        # Refresh "copy previous frame" button enabled state.
+        if hasattr(self._table_panel, "set_previous_frame_has_segments"):
+            self._table_panel.set_previous_frame_has_segments(
+                self._previous_frame_has_segments()
+            )
+
+    def _previous_frame_has_segments(self) -> bool:
+        if self._spec is None or self._annotation is None:
+            return False
+        ws = self._annotation.wave_stats
+        if ws is None:
+            return False
+        pos = self._current_frame_pos
+        if pos <= 0:
+            return False
+        prev_idx = self._frame_idx_at(pos - 1)
+        if prev_idx is None:
+            return False
+        return bool(ws.segments_for_frame(prev_idx))
+
+    def _commit_wave_stats(self, new_cfg) -> None:
+        """Route a WaveStatsConfig update through SessionController when
+        available — its in-place ``_store.annotation.wave_stats = config``
+        keeps the canonical shared AnnotationSchema in sync across the app
+        (table, other scenes, eventual flush to disk). Fallback path keeps
+        a local model_copy for tests and CLI replay callers that don't
+        wire a SessionController.
+
+        Always re-binds ``self._annotation`` to the canonical live
+        annotation so that subsequent scene re-entries borrowing
+        ``self._session.annotation`` observe the mutation.
+        """
+        if self._session is not None:
+            self._session.update_wave_stats_config(new_cfg)
+            self._annotation = self._session.annotation
+        elif self._annotation is not None:
+            self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+
+    def _commit_profile_line(self, new_pl) -> None:
+        """Route a ProfileLineData update through SessionController. See
+        ``_commit_wave_stats`` for the rationale.
+        """
+        if self._session is not None:
+            self._session.set_profile_line(new_pl)
+            self._annotation = self._session.annotation
+        elif self._annotation is not None:
+            self._annotation = self._annotation.model_copy(update={"profile_line": new_pl})
+
     def _append_segment_local(self, new_seg) -> None:
-        """Update local annotation cache and refresh table+overlays."""
+        """Append ``new_seg`` to the CURRENT frame's segment list."""
         if self._annotation is None:
+            return
+        frame_key = self._current_frame_key()
+        if frame_key is None:
             return
         from openfcd.io.annotation import WaveStatsConfig
         old_cfg = self._annotation.wave_stats
-        existing = list(old_cfg.segments) if old_cfg else []
+        existing = list(old_cfg.segments_for_frame(frame_key)) if old_cfg else []
         # Auto-assign next color from cycle if caller passed the default.
+        # Pick the first cycle entry not currently in use among existing
+        # segments — using len(existing) as the index regressed after a
+        # deletion and collided with the surviving segment's color.
         if new_seg.color == "#1f77b4":
-            new_seg = new_seg.model_copy(
-                update={"color": _COLOR_CYCLE[len(existing) % len(_COLOR_CYCLE)]}
+            used = {s.color for s in existing}
+            chosen = next(
+                (c for c in _COLOR_CYCLE if c not in used),
+                _COLOR_CYCLE[len(existing) % len(_COLOR_CYCLE)],
             )
+            new_seg = new_seg.model_copy(update={"color": chosen})
         if old_cfg is None:
-            new_cfg = WaveStatsConfig(segments=[new_seg])
+            new_cfg = WaveStatsConfig(segments_by_frame={frame_key: [new_seg]})
         else:
-            new_cfg = old_cfg.model_copy(
-                update={"segments": existing + [new_seg]}
-            )
-        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+            new_by_frame = dict(old_cfg.segments_by_frame)
+            new_by_frame[frame_key] = existing + [new_seg]
+            new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
+        self._commit_wave_stats(new_cfg)
         self.wave_stats_config_changed.emit(new_cfg)
         self._table_panel.set_annotation(self._annotation)
-        self._overlay_segments(self._active_segment_idx)
+        self._sync_table_current_frame()
+        # _recompute_live_stats handles overlay refresh + canvas redraw.
         self._recompute_live_stats()
-        if self._fig is not None:
-            self._fig.canvas.draw_idle()
+
+    def _on_copy_previous_frame_segments(self) -> None:
+        """Copy the previous frame's segments to the current frame."""
+        if self._annotation is None or self._annotation.wave_stats is None:
+            return
+        if self._spec is None:
+            return
+        pos = self._current_frame_pos
+        if pos <= 0:
+            return
+        prev_idx = self._frame_idx_at(pos - 1)
+        cur_idx = self._frame_idx_at(pos)
+        if prev_idx is None or cur_idx is None:
+            return
+        old_cfg = self._annotation.wave_stats
+        prev_segs = old_cfg.segments_for_frame(prev_idx)
+        if not prev_segs:
+            return
+        # Re-instantiate frozen WaveSegment objects to keep frames decoupled.
+        new_segs = [seg.model_copy() for seg in prev_segs]
+        new_by_frame = dict(old_cfg.segments_by_frame)
+        new_by_frame[str(cur_idx)] = new_segs
+        new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
+        self._commit_wave_stats(new_cfg)
+        self.wave_stats_config_changed.emit(new_cfg)
+        self._table_panel.set_annotation(self._annotation)
+        self._sync_table_current_frame()
+        self._recompute_live_stats()
 
     # ── Live wave-stats computation ───────────────────────────────────
 
@@ -821,89 +1143,60 @@ class ProfileSceneView(QWidget):
             return ann.polygons[0].as_rc_array()
         return None
 
-    def _recompute_live_stats(self) -> None:
-        """Compute FrameWaveStats for current frame + visible segments.
+    def _compute_live_stats(self):
+        """Run compute_frame_wave_stats for the current frame + visible segments.
 
-        Pushes the result into the table panel and stores it on
-        ``self._live_frame_stats``.  Safe to call when inputs are missing
-        (sets the cache to ``None`` and clears the table stats).
+        Returns the FrameWaveStats result, or ``None`` if any required input is
+        missing or the underlying compute fails.
         """
         ann = self._annotation
-        # Profile line may live in annotation.profile_line (newly drawn) OR in
+        # Profile line may live in annotation.profile_line (newly drawn) or in
         # spec.profile_lines per-frame dict (loaded from an existing project).
-        # _show_chart sources from _get_line_for_pos; mirror that here so the
+        # __show_chart sources from _get_line_for_pos; mirror that here so the
         # two pipelines see the same line.
         pl_endpoints = self._get_line_for_pos(self._current_frame_pos)
         if pl_endpoints is None and ann is not None and ann.profile_line is not None:
             pl_endpoints = (tuple(ann.profile_line.start), tuple(ann.profile_line.end))
         if ann is None or ann.wave_stats is None or pl_endpoints is None:
-            print(  # noqa: T201 — Patch 5 diagnostic
-                f"[recompute] bail A: ann={ann is not None} "
-                f"wave_stats={ann.wave_stats is not None if ann else None} "
-                f"pl_endpoints={pl_endpoints is not None}"
-            )
-            self._live_frame_stats = None
-            if hasattr(self._table_panel, "set_live_stats"):
-                self._table_panel.set_live_stats(None)
-            self.live_stats_changed.emit(None)
-            return
-        segs = list(ann.wave_stats.segments)
-        if not segs:
-            print("[recompute] bail B: no segments")  # noqa: T201
-            self._live_frame_stats = None
-            if hasattr(self._table_panel, "set_live_stats"):
-                self._table_panel.set_live_stats(None)
-            self.live_stats_changed.emit(None)
-            return
+            return None
         frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if frame_idx is None:
+            return None
+        segs = ann.wave_stats.segments_for_frame(frame_idx)
+        if not segs:
+            return None
         eta = self._eta_frames.get(frame_idx) if frame_idx is not None else None
         if eta is None:
-            print(  # noqa: T201
-                f"[recompute] bail C: frame_idx={frame_idx} "
-                f"current_pos={self._current_frame_pos} "
-                f"eta_frames_keys={list(self._eta_frames)[:5]}..."
-                f"({len(self._eta_frames)} total)"
-            )
-            self._live_frame_stats = None
-            if hasattr(self._table_panel, "set_live_stats"):
-                self._table_panel.set_live_stats(None)
-            self.live_stats_changed.emit(None)
-            return
-        px_per_mm = self._resolve_px_per_mm() or 1.0
-        prominence_k = float(ann.wave_stats.peak_prominence_k)
+            return None
         try:
             from openfcd.core.wave_stats import compute_frame_wave_stats
-            print(  # noqa: T201
-                f"[recompute] OK: frame_idx={frame_idx} eta.shape={np.asarray(eta).shape} "
-                f"px_per_mm={px_per_mm} pl={pl_endpoints} "
-                f"n_segs={len(segs)} prom_k={prominence_k} "
-                f"body_poly={'yes' if self._resolve_body_polygon_rc() is not None else 'no'}"
-            )
-            stats = compute_frame_wave_stats(
+            return compute_frame_wave_stats(
                 eta=np.asarray(eta, dtype=np.float64),
                 profile_line=pl_endpoints,
                 body_polygon_rc=self._resolve_body_polygon_rc(),
-                px_per_mm=float(px_per_mm),
+                px_per_mm=float(self._resolve_px_per_mm() or 1.0),
                 segments=[(float(s.s_lo_mm), float(s.s_hi_mm)) for s in segs],
-                prominence_k=prominence_k,
+                prominence_k=float(ann.wave_stats.peak_prominence_k),
             )
-        except Exception as exc:
-            import traceback
-            print(f"[recompute] bail D: compute failed: {type(exc).__name__}: {exc}")  # noqa: T201
-            traceback.print_exc()
-            self._live_frame_stats = None
-            if hasattr(self._table_panel, "set_live_stats"):
-                self._table_panel.set_live_stats(None)
-            self.live_stats_changed.emit(None)
-            return
-        print(  # noqa: T201
-            f"[recompute] emit: n_seg_stats={len(stats.segments)} "
-            f"first_lambda={stats.segments[0].wavelength_mm if stats.segments else None}"
-        )
+        except Exception:
+            return None
+
+    def _recompute_live_stats(self) -> None:
+        """Recompute live stats and synchronise table + 1D-subplot overlay.
+
+        Single entry point for any mutation that affects wave-stats output
+        (segment add/edit/delete, visibility toggle, frame switch). Always
+        refreshes the peak/trough overlay so it cannot drift out of sync with
+        the cached ``self._live_frame_stats``.
+        """
+        stats = self._compute_live_stats()
         self._live_frame_stats = stats
         if hasattr(self._table_panel, "set_live_stats"):
             self._table_panel.set_live_stats(stats)
         self.live_stats_changed.emit(stats)
+        self._overlay_segments(self._active_segment_idx)
+        if self._fig is not None:
+            self._fig.canvas.draw_idle()
 
     # ── Segment overlay on 1D subplot ─────────────────────────────────
 
@@ -931,7 +1224,10 @@ class ProfileSceneView(QWidget):
             return
         if self._annotation is None or self._annotation.wave_stats is None:
             return
-        segs = self._annotation.wave_stats.segments
+        frame_idx = self._frame_idx_at(self._current_frame_pos)
+        if frame_idx is None:
+            return
+        segs = self._annotation.wave_stats.segments_for_frame(frame_idx)
         if not segs:
             return
 
@@ -997,58 +1293,62 @@ class ProfileSceneView(QWidget):
     def _on_table_segment_edited(self, idx: int, new_seg) -> None:
         if self._annotation is None or self._annotation.wave_stats is None:
             return
-        old_cfg = self._annotation.wave_stats
-        if idx >= len(old_cfg.segments):
+        frame_key = self._current_frame_key()
+        if frame_key is None:
             return
-        new_segs = list(old_cfg.segments)
-        new_segs[idx] = new_seg
-        new_cfg = old_cfg.model_copy(update={"segments": new_segs})
-        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        old_cfg = self._annotation.wave_stats
+        cur_segs = list(old_cfg.segments_for_frame(frame_key))
+        if idx >= len(cur_segs):
+            return
+        cur_segs[idx] = new_seg
+        new_by_frame = dict(old_cfg.segments_by_frame)
+        new_by_frame[frame_key] = cur_segs
+        new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
+        self._commit_wave_stats(new_cfg)
         self.wave_segment_edited.emit(idx, new_seg)
         self.wave_stats_config_changed.emit(new_cfg)
         self._table_panel.set_annotation(self._annotation)
-        self._overlay_segments(self._active_segment_idx)
+        self._sync_table_current_frame()
         self._recompute_live_stats()
-        if self._fig is not None:
-            self._fig.canvas.draw_idle()
 
     def _on_table_segment_deleted(self, idx: int) -> None:
         if self._annotation is None or self._annotation.wave_stats is None:
             return
-        old_cfg = self._annotation.wave_stats
-        if idx >= len(old_cfg.segments):
+        frame_key = self._current_frame_key()
+        if frame_key is None:
             return
-        new_segs = list(old_cfg.segments)
-        new_segs.pop(idx)
-        new_cfg = old_cfg.model_copy(update={"segments": new_segs})
-        self._annotation = self._annotation.model_copy(update={"wave_stats": new_cfg})
+        old_cfg = self._annotation.wave_stats
+        cur_segs = list(old_cfg.segments_for_frame(frame_key))
+        if idx >= len(cur_segs):
+            return
+        cur_segs.pop(idx)
+        new_by_frame = dict(old_cfg.segments_by_frame)
+        new_by_frame[frame_key] = cur_segs
+        new_cfg = old_cfg.model_copy(update={"segments_by_frame": new_by_frame})
+        self._commit_wave_stats(new_cfg)
         self.wave_segment_deleted.emit(idx)
         self.wave_stats_config_changed.emit(new_cfg)
-        if self._active_segment_idx is not None and self._active_segment_idx >= len(new_segs):
+        if self._active_segment_idx is not None and self._active_segment_idx >= len(cur_segs):
             self._active_segment_idx = None
         self._table_panel.set_annotation(self._annotation)
-        self._overlay_segments(self._active_segment_idx)
+        self._sync_table_current_frame()
         self._recompute_live_stats()
-        if self._fig is not None:
-            self._fig.canvas.draw_idle()
 
     def _on_table_visibility_toggled(self, idx: int, visible: bool) -> None:
-        # Data mutation is handled by _on_table_segment_edited, which receives
-        # the updated WaveSegment via wave_stats_table._on_visibility_toggled's
-        # dual emit (visibilityToggled + segmentEdited). Here we only refresh
-        # UI side-effects so we don't double-mutate the annotation.
-        self._overlay_segments(self._active_segment_idx)
+        # Data mutation arrives separately via wave_stats_table's dual emit
+        # (visibilityToggled + segmentEdited → _on_table_segment_edited). Here
+        # we just rerun the live recompute so peaks/troughs of the (now-hidden
+        # or now-visible) segment are added/removed from the 1D subplot.
         self._recompute_live_stats()
-        if self._fig is not None:
-            self._fig.canvas.draw_idle()
 
     # ── Misc public API ───────────────────────────────────────────────
 
     def refresh(self) -> None:
         if self._mode_stack.currentIndex() == 0:
-            self._show_chart(self._current_frame_pos)
+            self._request_render(self._current_frame_pos)
         self._table_panel.set_h5_path(self._h5_path(), batch="default")
         self._table_panel.set_annotation(self._annotation)
+        self._sync_table_current_frame()
 
     def _h5_path(self) -> Path | None:
         if self._project_path is None or self._spec is None:

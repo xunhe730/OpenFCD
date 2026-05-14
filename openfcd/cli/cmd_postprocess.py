@@ -96,9 +96,11 @@ def postprocess_cmd(
     finally:
         session.close()
 
-    if annotation.wave_stats is None:
+    if annotation.wave_stats is None or not any(
+        annotation.wave_stats.segments_by_frame.values()
+    ):
         typer.echo(
-            "No wave_stats config found in annotation; nothing to postprocess."
+            "No wave_stats segments found in annotation; nothing to postprocess."
         )
         raise typer.Exit(0)
 

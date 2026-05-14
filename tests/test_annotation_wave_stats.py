@@ -64,14 +64,13 @@ class TestWaveSegment:
 class TestWaveStatsConfig:
     def test_defaults_empty(self):
         cfg = WaveStatsConfig()
-        assert cfg.segments == []
+        assert cfg.segments_by_frame == {}
         assert cfg.peak_prominence_k == pytest.approx(0.3)
 
     def test_with_single_segment(self):
         s = WaveSegment(s_lo_mm=0.0, s_hi_mm=20.0)
-        cfg = WaveStatsConfig(segments=[s], peak_prominence_k=0.5)
-        assert len(cfg.segments) == 1
-        assert cfg.segments[0] == s
+        cfg = WaveStatsConfig(segments_by_frame={"0": [s]}, peak_prominence_k=0.5)
+        assert cfg.segments_for_frame(0) == [s]
         assert cfg.peak_prominence_k == pytest.approx(0.5)
 
     def test_with_multiple_segments(self):
@@ -80,9 +79,21 @@ class TestWaveStatsConfig:
             WaveSegment(s_lo_mm=20.0, s_hi_mm=40.0, label="b"),
             WaveSegment(s_lo_mm=45.0, s_hi_mm=60.0, label="c"),
         ]
-        cfg = WaveStatsConfig(segments=segs)
-        assert len(cfg.segments) == 3
-        assert [s.label for s in cfg.segments] == ["a", "b", "c"]
+        cfg = WaveStatsConfig(segments_by_frame={"5": segs})
+        frame_segs = cfg.segments_for_frame(5)
+        assert len(frame_segs) == 3
+        assert [s.label for s in frame_segs] == ["a", "b", "c"]
+
+    def test_segments_for_frame_missing_key_empty(self):
+        cfg = WaveStatsConfig()
+        assert cfg.segments_for_frame(99) == []
+
+    def test_legacy_segments_field_ignored(self):
+        """Old JSON containing a flat ``segments`` key is silently dropped."""
+        cfg = WaveStatsConfig.model_validate(
+            {"segments": [{"s_lo_mm": 0.0, "s_hi_mm": 10.0}]}
+        )
+        assert cfg.segments_by_frame == {}
 
     def test_peak_prominence_k_lower_bound(self):
         with pytest.raises(ValidationError):
@@ -106,7 +117,7 @@ class TestWaveStatsConfig:
             WaveSegment(s_lo_mm=0.0, s_hi_mm=20.0, label="x", color="#112233"),
             WaveSegment(s_lo_mm=30.0, s_hi_mm=60.0, visible=False),
         ]
-        cfg = WaveStatsConfig(segments=segs, peak_prominence_k=0.5)
+        cfg = WaveStatsConfig(segments_by_frame={"2": segs}, peak_prominence_k=0.5)
         data = cfg.model_dump()
         cfg2 = WaveStatsConfig.model_validate(data)
         assert cfg2 == cfg
@@ -175,11 +186,12 @@ class TestAnnotationSchemaIntegration:
 
     def test_wave_stats_set(self):
         seg = WaveSegment(s_lo_mm=0.0, s_hi_mm=20.0, label="alpha")
-        cfg = WaveStatsConfig(segments=[seg], peak_prominence_k=0.4)
+        cfg = WaveStatsConfig(segments_by_frame={"7": [seg]}, peak_prominence_k=0.4)
         ann = AnnotationSchema(wave_stats=cfg)
         assert ann.wave_stats is not None
-        assert len(ann.wave_stats.segments) == 1
-        assert ann.wave_stats.segments[0].label == "alpha"
+        frame_segs = ann.wave_stats.segments_for_frame(7)
+        assert len(frame_segs) == 1
+        assert frame_segs[0].label == "alpha"
 
     def test_profile_line_set(self):
         pl = ProfileLineData(start=(10.0, 5.0), end=(90.0, 200.0), label="main")
@@ -192,7 +204,7 @@ class TestAnnotationSchemaIntegration:
             WaveSegment(s_lo_mm=0.0, s_hi_mm=20.0, color="#aa0000"),
             WaveSegment(s_lo_mm=30.0, s_hi_mm=55.0, label="aft-ish"),
         ]
-        cfg = WaveStatsConfig(segments=segs, peak_prominence_k=0.6)
+        cfg = WaveStatsConfig(segments_by_frame={"3": segs}, peak_prominence_k=0.6)
         pl = ProfileLineData(start=(0.0, 25.0), end=(100.0, 25.0), label="centerline")
         ann = AnnotationSchema(wave_stats=cfg, profile_line=pl)
 
@@ -200,16 +212,17 @@ class TestAnnotationSchemaIntegration:
         ann2 = AnnotationSchema.model_validate(dumped)
 
         assert ann2.wave_stats is not None
-        assert len(ann2.wave_stats.segments) == 2
-        assert ann2.wave_stats.segments[0].color == "#aa0000"
-        assert ann2.wave_stats.segments[1].label == "aft-ish"
+        frame_segs = ann2.wave_stats.segments_for_frame(3)
+        assert len(frame_segs) == 2
+        assert frame_segs[0].color == "#aa0000"
+        assert frame_segs[1].label == "aft-ish"
         assert ann2.wave_stats.peak_prominence_k == pytest.approx(0.6)
         assert ann2.profile_line is not None
         assert ann2.profile_line.start == (0.0, 25.0)
 
     def test_save_load_round_trip(self, tmp_path):
         seg = WaveSegment(s_lo_mm=1.0, s_hi_mm=18.0, label="s1", color="#abcdef")
-        cfg = WaveStatsConfig(segments=[seg], peak_prominence_k=0.5)
+        cfg = WaveStatsConfig(segments_by_frame={"10": [seg]}, peak_prominence_k=0.5)
         pl = ProfileLineData(start=(1.0, 2.0), end=(3.0, 4.0))
         ann = AnnotationSchema(wave_stats=cfg, profile_line=pl, condition="roundtrip")
 
@@ -219,11 +232,12 @@ class TestAnnotationSchemaIntegration:
 
         assert ann2.condition == "roundtrip"
         assert ann2.wave_stats is not None
-        assert len(ann2.wave_stats.segments) == 1
-        assert ann2.wave_stats.segments[0].s_lo_mm == pytest.approx(1.0)
-        assert ann2.wave_stats.segments[0].s_hi_mm == pytest.approx(18.0)
-        assert ann2.wave_stats.segments[0].label == "s1"
-        assert ann2.wave_stats.segments[0].color == "#abcdef"
+        frame_segs = ann2.wave_stats.segments_for_frame(10)
+        assert len(frame_segs) == 1
+        assert frame_segs[0].s_lo_mm == pytest.approx(1.0)
+        assert frame_segs[0].s_hi_mm == pytest.approx(18.0)
+        assert frame_segs[0].label == "s1"
+        assert frame_segs[0].color == "#abcdef"
         assert ann2.wave_stats.peak_prominence_k == pytest.approx(0.5)
         assert ann2.profile_line is not None
         assert ann2.profile_line.start == (1.0, 2.0)

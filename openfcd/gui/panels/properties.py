@@ -642,7 +642,9 @@ class WaveStatsPanel(QWidget):
         ws = annotation.wave_stats if annotation is not None else None
         # A wave_stats config without segments is treated as "no wave stats"
         # for the purpose of enabling the recompute button.
-        self._has_wave_stats = ws is not None and len(ws.segments) > 0
+        self._has_wave_stats = ws is not None and any(
+            segs for segs in ws.segments_by_frame.values()
+        )
         if ws is not None:
             self._prom_spin.blockSignals(True)
             self._prom_spin.setValue(float(ws.peak_prominence_k))

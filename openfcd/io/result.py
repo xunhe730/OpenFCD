@@ -256,6 +256,103 @@ class HDF5ResultStore:
 
         self._file.flush()
 
+    def write_wave_stats_per_frame(
+        self,
+        batch: str,
+        per_frame_payloads: dict[int, dict],
+        attrs: dict,
+    ) -> None:
+        """Write per-frame wave statistics (v3) into
+        ``batches/{batch}/wave_stats/``.
+
+        Layout::
+
+            batches/{batch}/wave_stats/
+              attrs: <attrs dict, sorted-key order>
+              frame_{fid}/
+                attrs: frame_id, n_segments, segments_meta
+                segments/{idx:04d}/
+                  attrs: s_lo_mm, s_hi_mm, label, color, visible (uint8)
+                  wavelength_mm     scalar float64
+                  wavenumber_per_mm scalar float64
+                  S_gamma_N_per_m   scalar float64
+                  S_g_N_per_m       scalar float64
+                  S_cg_N_per_m      scalar float64
+                  peaks   (n, 2) float64
+                  troughs (n, 2) float64
+                  heights (n,)   float64
+
+        Frames not in ``per_frame_payloads`` are NOT written.
+        """
+        ws_grp = self._file.require_group(f"batches/{batch}/wave_stats")
+        for k in sorted(attrs.keys()):
+            ws_grp.attrs[k] = attrs[k]
+
+        for fid in sorted(per_frame_payloads.keys()):
+            payload = per_frame_payloads[fid]
+            frame_key = f"frame_{fid}"
+            if frame_key in ws_grp:
+                del ws_grp[frame_key]
+            frame_grp = ws_grp.create_group(frame_key)
+
+            seg_payloads = payload["segments"]
+            frame_attrs = {
+                "frame_id": int(fid),
+                "n_segments": int(len(seg_payloads)),
+                "segments_meta": str(payload["segments_meta_json"]),
+            }
+            for k in sorted(frame_attrs.keys()):
+                frame_grp.attrs[k] = frame_attrs[k]
+
+            segs_grp = frame_grp.create_group("segments")
+            sorted_segs = sorted(seg_payloads, key=lambda d: int(d["segment_idx"]))
+            for seg in sorted_segs:
+                idx = int(seg["segment_idx"])
+                seg_grp = segs_grp.create_group(f"{idx:04d}")
+                seg_attrs = {
+                    "s_lo_mm": float(seg["s_lo_mm"]),
+                    "s_hi_mm": float(seg["s_hi_mm"]),
+                    "label": str(seg.get("label", "")),
+                    "color": str(seg.get("color", "#1f77b4")),
+                    "visible": np.uint8(1 if bool(seg.get("visible", True)) else 0),
+                }
+                for k in sorted(seg_attrs.keys()):
+                    seg_grp.attrs[k] = seg_attrs[k]
+                seg_grp.create_dataset(
+                    "wavelength_mm",
+                    data=np.float64(seg["wavelength_mm"]),
+                )
+                seg_grp.create_dataset(
+                    "wavenumber_per_mm",
+                    data=np.float64(seg["wavenumber_per_mm"]),
+                )
+                seg_grp.create_dataset(
+                    "S_gamma_N_per_m",
+                    data=np.float64(seg.get("S_gamma_N_per_m", float("nan"))),
+                )
+                seg_grp.create_dataset(
+                    "S_g_N_per_m",
+                    data=np.float64(seg.get("S_g_N_per_m", float("nan"))),
+                )
+                seg_grp.create_dataset(
+                    "S_cg_N_per_m",
+                    data=np.float64(seg.get("S_cg_N_per_m", float("nan"))),
+                )
+                seg_grp.create_dataset(
+                    "peaks",
+                    data=np.asarray(seg["peaks"], dtype=np.float64),
+                )
+                seg_grp.create_dataset(
+                    "troughs",
+                    data=np.asarray(seg["troughs"], dtype=np.float64),
+                )
+                seg_grp.create_dataset(
+                    "heights",
+                    data=np.asarray(seg["heights"], dtype=np.float64),
+                )
+
+        self._file.flush()
+
     def close(self) -> None:
         if self._file is not None:
             self._file.close()

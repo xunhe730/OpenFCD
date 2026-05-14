@@ -19,7 +19,7 @@ class SceneContainer(QWidget):
     _IDX_PROFILE = 2
     _IDX_RMS = 3
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, session_controller=None) -> None:
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
@@ -35,7 +35,11 @@ class SceneContainer(QWidget):
         self._stack.addWidget(self._eta_map_view)  # 1
 
         from openfcd.gui.scenes.profile_scene import ProfileSceneView
-        self._profile_view = ProfileSceneView()
+        # Borrow the live in-memory annotation from SessionController so that
+        # in-memory edits (segments, profile_line) survive scene re-entry —
+        # otherwise _load_eta_frames would re-read a stale annotation from
+        # disk and clobber them. See `.omc/plans/wave-stats-scene-switch-rootcause.md`.
+        self._profile_view = ProfileSceneView(session_controller=session_controller)
         self._profile_view.scene_changed.connect(self.scene_changed.emit)
         self._stack.addWidget(self._profile_view)  # 2
 

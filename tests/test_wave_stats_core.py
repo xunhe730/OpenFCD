@@ -45,14 +45,15 @@ def test_pure_sine_wavelength():
     A = 1.0
     eta = _make_sine_eta(H, W, lambda_mm, A, px_per_mm)
     L_mm = (W - 1) / px_per_mm
-    mid_mm = L_mm / 2.0
+    half = L_mm / 2.0
 
+    # s_mm is centered on line midpoint: left half = [-L/2, 0], right half = [0, L/2]
     result = compute_frame_wave_stats(
         eta=eta,
         profile_line=_horizontal_profile(W, row=50.0),
         body_polygon_rc=None,
         px_per_mm=px_per_mm,
-        segments=[(0.0, mid_mm), (mid_mm, L_mm)],
+        segments=[(-half, 0.0), (0.0, half)],
         prominence_k=0.15,
     )
 
@@ -82,14 +83,14 @@ def test_damped_sine_wavelength_and_heights():
     eta = np.tile(eta_row, (H, 1))
 
     L_mm = (W - 1) / px_per_mm
-    mid_mm = L_mm / 2.0
+    half = L_mm / 2.0
 
     result = compute_frame_wave_stats(
         eta=eta,
         profile_line=_horizontal_profile(W, row=50.0),
         body_polygon_rc=None,
         px_per_mm=px_per_mm,
-        segments=[(0.0, mid_mm), (mid_mm, L_mm)],
+        segments=[(-half, 0.0), (0.0, half)],
         prominence_k=0.10,
     )
 
@@ -123,8 +124,8 @@ def test_noise_prominence_filtering():
     eta = np.tile(signal + noise, (H, 1))
 
     L_mm = (W - 1) / px_per_mm
-    mid_mm = L_mm / 2.0
-    segs = [(0.0, mid_mm), (mid_mm, L_mm)]
+    half = L_mm / 2.0
+    segs = [(-half, 0.0), (0.0, half)]
 
     strict = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
@@ -156,10 +157,13 @@ def test_short_window_nan_wavelength():
     rng = np.random.default_rng(0)
     eta = rng.standard_normal((H, W)) * 0.01
 
+    L_mm = (W - 1) / px_per_mm
+    half = L_mm / 2.0
+    # Two short windows: 1.5 mm flush at the left line edge, 1.4 mm flush at the right.
     result = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
         body_polygon_rc=None, px_per_mm=px_per_mm,
-        segments=[(0.0, 1.5), (38.5, 39.9)],
+        segments=[(-half, -half + 1.5), (half - 1.4, half)],
         prominence_k=0.3,
     )
 
@@ -195,10 +199,11 @@ def test_none_polygon_no_crash():
     eta = _make_sine_eta(H, W, lambda_mm, 1.0, px_per_mm)
     L_mm = (W - 1) / px_per_mm
 
+    half = L_mm / 2.0
     result = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
         body_polygon_rc=None, px_per_mm=px_per_mm,
-        segments=[(0.0, L_mm / 2.0), (L_mm / 2.0, L_mm)],
+        segments=[(-half, 0.0), (0.0, half)],
         prominence_k=0.15,
     )
     assert len(result.segments) == 2
@@ -214,13 +219,15 @@ def test_three_segments():
     eta = _make_sine_eta(H, W, lambda_mm, 1.0, px_per_mm)
     L_mm = (W - 1) / px_per_mm
 
+    half = L_mm / 2.0
+    sixth = L_mm / 6.0
     result = compute_frame_wave_stats(
         eta=eta, profile_line=_horizontal_profile(W, 50.0),
         body_polygon_rc=None, px_per_mm=px_per_mm,
         segments=[
-            (0.0, L_mm / 3.0),
-            (L_mm / 3.0, 2.0 * L_mm / 3.0),
-            (2.0 * L_mm / 3.0, L_mm),
+            (-half, -sixth),
+            (-sixth, sixth),
+            (sixth, half),
         ],
         prominence_k=0.15,
     )
@@ -279,3 +286,138 @@ def test_compute_heights_empty():
     empty = np.empty(0)
     h = _compute_heights(empty, empty, empty, empty)
     assert len(h) == 0
+
+
+def test_S_gamma_pure_sine():
+    """S_γ = (3/4)·γ·k²·a² with γ=0.072 N/m, a=A, k=2π/λ."""
+    from openfcd.core.wave_stats import SURFACE_TENSION_WATER_N_PER_M
+
+    H, W = 100, 600
+    px_per_mm = 10.0
+    lambda_mm = 10.0
+    A = 1.0  # amplitude in mm → H_max = 2A → a = A = 1 mm
+    eta = _make_sine_eta(H, W, lambda_mm, A, px_per_mm)
+    L_mm = (W - 1) / px_per_mm
+
+    result = compute_frame_wave_stats(
+        eta=eta,
+        profile_line=_horizontal_profile(W, row=50.0),
+        body_polygon_rc=None,
+        px_per_mm=px_per_mm,
+        segments=[(-L_mm / 2.0, L_mm / 2.0)],
+        prominence_k=0.15,
+    )
+
+    seg = result.segments[0]
+    k_phys = 2.0 * np.pi / lambda_mm
+    expected = 0.75 * SURFACE_TENSION_WATER_N_PER_M * (A * A) * (k_phys * k_phys)
+    assert np.isfinite(seg.S_gamma_N_per_m)
+    assert seg.S_gamma_N_per_m == pytest.approx(expected, rel=0.05)
+
+
+def test_S_g_pure_sine():
+    """S_g = (1/4)·ρ·g·a²; SI requires a in metres, so a_m = a_mm·1e-3."""
+    from openfcd.core.wave_stats import WATER_DENSITY_KG_PER_M3, GRAVITY_M_PER_S2
+
+    H, W = 100, 600
+    px_per_mm = 10.0
+    lambda_mm = 10.0
+    A = 1.0  # amplitude 1 mm → a_m = 1e-3 m
+    eta = _make_sine_eta(H, W, lambda_mm, A, px_per_mm)
+    L_mm = (W - 1) / px_per_mm
+
+    result = compute_frame_wave_stats(
+        eta=eta,
+        profile_line=_horizontal_profile(W, row=50.0),
+        body_polygon_rc=None,
+        px_per_mm=px_per_mm,
+        segments=[(-L_mm / 2.0, L_mm / 2.0)],
+        prominence_k=0.15,
+    )
+
+    seg = result.segments[0]
+    a_m = A * 1e-3
+    expected = 0.25 * WATER_DENSITY_KG_PER_M3 * GRAVITY_M_PER_S2 * (a_m * a_m)
+    assert np.isfinite(seg.S_g_N_per_m)
+    assert seg.S_g_N_per_m == pytest.approx(expected, rel=0.05)
+
+
+def test_S_cg_is_sum():
+    """S_cg must equal S_γ + S_g exactly (within float epsilon)."""
+    H, W = 100, 600
+    px_per_mm = 10.0
+    eta = _make_sine_eta(H, W, lambda_mm=10.0, amplitude=1.0, px_per_mm=px_per_mm)
+    L_mm = (W - 1) / px_per_mm
+
+    result = compute_frame_wave_stats(
+        eta=eta,
+        profile_line=_horizontal_profile(W, row=50.0),
+        body_polygon_rc=None,
+        px_per_mm=px_per_mm,
+        segments=[(-L_mm / 2.0, L_mm / 2.0)],
+        prominence_k=0.15,
+    )
+    seg = result.segments[0]
+    assert seg.S_cg_N_per_m == pytest.approx(
+        seg.S_gamma_N_per_m + seg.S_g_N_per_m, rel=1e-12
+    )
+
+
+def test_S_uses_rms_amplitude_not_max():
+    """S must use RMS amplitude: a² = ⟨(H/2)²⟩, not (H_max/2)²."""
+    from openfcd.core.wave_stats import SURFACE_TENSION_WATER_N_PER_M
+
+    H, W = 100, 1200
+    px_per_mm = 10.0
+    lambda_mm = 10.0
+    A_left, A_right = 1.0, 2.0
+    cols = np.arange(W, dtype=np.float64)
+    s_mm = cols / px_per_mm
+    eta_row = np.where(
+        s_mm < (W / px_per_mm) / 2.0,
+        A_left * np.sin(2.0 * np.pi * s_mm / lambda_mm),
+        A_right * np.sin(2.0 * np.pi * s_mm / lambda_mm),
+    )
+    eta = np.tile(eta_row, (H, 1))
+    L_mm = (W - 1) / px_per_mm
+
+    result = compute_frame_wave_stats(
+        eta=eta,
+        profile_line=_horizontal_profile(W, row=50.0),
+        body_polygon_rc=None,
+        px_per_mm=px_per_mm,
+        segments=[(-L_mm / 2.0, L_mm / 2.0)],
+        prominence_k=0.15,
+    )
+    seg = result.segments[0]
+    h = np.asarray(seg.peak_to_trough_heights, dtype=np.float64)
+    assert h.size >= 4, "synthetic input should yield multiple peak-trough pairs"
+
+    a_sq_rms = 0.25 * float(np.mean(h * h))
+    a_sq_max = 0.25 * float(np.max(h) ** 2)
+    assert a_sq_rms < a_sq_max, "non-uniform heights expected"
+
+    k_phys = 2.0 * np.pi * float(seg.wavenumber_per_mm)
+    S_gamma_rms = 0.75 * SURFACE_TENSION_WATER_N_PER_M * a_sq_rms * (k_phys * k_phys)
+    S_gamma_max = 0.75 * SURFACE_TENSION_WATER_N_PER_M * a_sq_max * (k_phys * k_phys)
+
+    assert seg.S_gamma_N_per_m == pytest.approx(S_gamma_rms, rel=1e-9)
+    assert seg.S_gamma_N_per_m != pytest.approx(S_gamma_max, rel=1e-3)
+
+
+def test_S_components_empty_segment_nan():
+    H, W = 50, 200
+    px_per_mm = 10.0
+    eta = np.zeros((H, W), dtype=np.float64)  # flat → no peaks
+    result = compute_frame_wave_stats(
+        eta=eta,
+        profile_line=_horizontal_profile(W, row=25.0),
+        body_polygon_rc=None,
+        px_per_mm=px_per_mm,
+        segments=[(-5.0, 5.0)],
+        prominence_k=0.15,
+    )
+    seg = result.segments[0]
+    assert not np.isfinite(seg.S_gamma_N_per_m)
+    assert not np.isfinite(seg.S_g_N_per_m)
+    assert not np.isfinite(seg.S_cg_N_per_m)

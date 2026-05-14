@@ -32,6 +32,19 @@ def line_annotator(qapp):
     a.close()
 
 
+def _flush_render(view) -> None:
+    """Synchronously drain the debounce timer and execute the pending render.
+
+    The render state machine schedules full-figure repaints via a 48ms
+    ``QTimer`` (``_RENDER_DEBOUNCE_MS``).  In headless pytest the Qt event
+    loop never spins, so the timer callback never fires.  Calling this helper
+    stops the timer and invokes ``_do_render()`` directly, flushing whatever
+    render was queued by the preceding ``load()``/``apply_viz()``/``refresh()``.
+    """
+    view._render_timer.stop()
+    view._do_render()
+
+
 def test_profile_scene_view_loads(profile_view, tmp_path):
     from openfcd.io.scene import SceneSpec, SceneType
 
@@ -152,6 +165,7 @@ def test_profile_scene_uses_composite_preview(profile_view, tmp_path):
         profile_lines={7: ProfileLine(p0=(10.0, 0.0), p1=(10.0, 29.0))},
     )
     profile_view.load(spec, tmp_path)
+    _flush_render(profile_view)
 
     assert len(profile_view._fig.axes) >= 3
     assert profile_view._fig.axes[2].get_xlabel() == "x (mm)"
@@ -176,6 +190,7 @@ def test_profile_scene_marks_missing_spatial_calibration(profile_view, tmp_path)
         profile_lines={7: ProfileLine(p0=(10.0, 0.0), p1=(10.0, 29.0))},
     )
     profile_view.load(spec, tmp_path)
+    _flush_render(profile_view)
 
     assert profile_view._frame_calibrations[7].source == "fallback_unverified"
     assert any("Unverified spatial calibration" in t.get_text() for t in profile_view._fig.axes[0].texts)

@@ -17,14 +17,7 @@ from openfcd.io.store import FileSessionStore
 from openfcd.io.annotation import (
     AnnotationSchema,
     ProfileLineData,
-    WaveSegment,
     WaveStatsConfig,
-)
-
-# Matplotlib default color cycle ("tab10") for auto-assigning segment colors.
-_COLOR_CYCLE: tuple[str, ...] = (
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
 )
 
 
@@ -295,61 +288,6 @@ class SessionController(QObject):
         ann = self._store.annotation
         ann.profile_line = line
         self.mark_dirty()
-
-    # ── Segment convenience methods (v2) ─────────────────────────────
-
-    def _replace_segments(self, new_segments: list[WaveSegment]) -> None:
-        if self._store is None:
-            return
-        ann = self._store.annotation
-        old = ann.wave_stats
-        if old is None:
-            new_cfg = WaveStatsConfig(segments=new_segments)
-        else:
-            new_cfg = old.model_copy(update={"segments": new_segments})
-        self.update_wave_stats_config(new_cfg)
-
-    def add_wave_segment(self, seg: WaveSegment) -> None:
-        if self._store is None:
-            return
-        old = self._store.annotation.wave_stats
-        segs = list(old.segments) if old is not None else []
-        # Auto-assign a distinct color from the cycle when caller used the
-        # default. Callers explicitly passing a non-default color keep it.
-        if seg.color == "#1f77b4":
-            cycle_color = _COLOR_CYCLE[len(segs) % len(_COLOR_CYCLE)]
-            seg = seg.model_copy(update={"color": cycle_color})
-        segs.append(seg)
-        self._replace_segments(segs)
-
-    def update_wave_segment(self, idx: int, seg: WaveSegment) -> None:
-        if self._store is None:
-            return
-        old = self._store.annotation.wave_stats
-        if old is None or idx >= len(old.segments):
-            return
-        segs = list(old.segments)
-        segs[idx] = seg
-        self._replace_segments(segs)
-
-    def delete_wave_segment(self, idx: int) -> None:
-        if self._store is None:
-            return
-        old = self._store.annotation.wave_stats
-        if old is None or idx >= len(old.segments):
-            return
-        segs = list(old.segments)
-        segs.pop(idx)
-        self._replace_segments(segs)
-
-    def toggle_segment_visibility(self, idx: int, visible: bool) -> None:
-        if self._store is None:
-            return
-        old = self._store.annotation.wave_stats
-        if old is None or idx >= len(old.segments):
-            return
-        seg = old.segments[idx]
-        self.update_wave_segment(idx, seg.model_copy(update={"visible": bool(visible)}))
 
     def recompute_wave_stats(self, run_id: str | None = None) -> bool:
         """Recompute wave_stats for *run_id* (default: latest run).

@@ -1,28 +1,34 @@
-"""Shared wave-stats computation layer (v2) — called by CLI PostprocessStage
+"""Shared wave-stats computation layer (v3) — called by CLI PostprocessStage
 and GUI _RunWorker / SessionController.recompute_wave_stats.
 
-The public entry point is ``compute_and_write_wave_stats``.  It is a pure
-orchestration function: it loads η frames from an already-open HDF5ResultStore,
-calls compute_frame_wave_stats per frame (one call per frame covers all
-visible segments), and writes the results back via store.write_wave_stats.
+v3 model: each frame carries its own independent list of WaveSegments.
+Frames without segments are skipped — no wave_stats group is written for
+them. The single-frame core ``compute_frame_wave_stats`` is unchanged; this
+module is pure orchestration that fans out by frame.
 
-HDF5 layout produced (per batch b):
+HDF5 layout produced (per batch b)::
 
-  batches/{b}/wave_stats/
-    attrs:
-      schema_version : int     (=2)
-      prominence_k   : float
-      ds_mm          : float   (1.0 / px_per_mm)
-      n_frames       : int
-      n_segments     : int
-      segments_meta  : str     (JSON list of {label, color, visible})
-    segments/{idx:04d}/        (one group per visible segment)
-      attrs: s_lo_mm, s_hi_mm, label, color, visible (uint8)
-      wavelength_mm     (n_frames,) float64
-      wavenumber_per_mm (n_frames,) float64
-      peaks/{frame_id}      (n, 2) float64  columns: [s_mm, eta]
-      troughs/{frame_id}    (n, 2) float64  columns: [s_mm, eta]
-      heights/{frame_id}    (n,)   float64
+    batches/{b}/wave_stats/
+      attrs:
+        schema_version : int     (=3)
+        prominence_k   : float
+        ds_mm          : float   (1.0 / px_per_mm)
+        n_frames       : int     (number of frames that have segments)
+      frame_{fid}/
+        attrs:
+          frame_id      : int
+          n_segments    : int
+          segments_meta : str  (JSON list of {segment_idx,label,color,visible,s_lo,s_hi})
+        segments/{idx:04d}/   (one group per visible segment on that frame)
+          attrs: s_lo_mm, s_hi_mm, label, color, visible (uint8)
+          wavelength_mm     scalar float64
+          wavenumber_per_mm scalar float64
+          S_gamma_N_per_m   scalar float64   (3/4)·γ·k²·a²  (capillary, N/m)
+          S_g_N_per_m       scalar float64   (1/4)·ρ·g·a²   (gravity,   N/m)
+          S_cg_N_per_m      scalar float64   S_gamma + S_g  (total,     N/m)
+          peaks   (n, 2) float64  columns: [s_mm, eta]
+          troughs (n, 2) float64  columns: [s_mm, eta]
+          heights (n,)   float64
 """
 from __future__ import annotations
 
@@ -44,30 +50,11 @@ def compute_and_write_wave_stats(
     body_polygons_by_batch_frame: dict[str, dict[str, np.ndarray | None]],
     eta_loader: Callable[[str, str], np.ndarray],
 ) -> bool:
-    """Compute and write wave statistics (v2) for every batch.
+    """Compute and write per-frame wave statistics for every batch.
 
-    Parameters
-    ----------
-    annotation :
-        AnnotationSchema carrying wave_stats (WaveStatsConfig with N segments)
-        and profile_line (ProfileLineData).  Returns False immediately if
-        either is None, or if no segment is visible.
-    store :
-        Open HDF5ResultStore.  Frames must already be written.
-    batches :
-        Ordered list of batch names to process (sorted internally).
-    px_per_mm_by_batch :
-        Pixels-per-mm calibration for each batch.
-    body_polygons_by_batch_frame :
-        ``{batch: {frame_id_str: polygon_rc | None}}``.  Reserved for future
-        use; v2 does not consult polygons for segmentation.
-    eta_loader :
-        ``(batch, frame_id_str) -> η (H, W) float64``.
-
-    Returns
-    -------
-    bool
-        True if at least one batch was written; False if no-op.
+    Returns ``True`` if at least one frame was written; ``False`` if no-op
+    (no wave_stats config, no profile_line, no segments_by_frame entries,
+    or every key maps to an empty/all-invisible list).
     """
     ws_cfg = annotation.wave_stats
     if ws_cfg is None:
@@ -77,14 +64,7 @@ def compute_and_write_wave_stats(
     if pl is None:
         return False
 
-    # Filter to only visible segments; remember original indices so output
-    # h5 group keys match the schema-level segment index.
-    visible_segments: list[tuple[int, float, float]] = [
-        (idx, float(seg.s_lo_mm), float(seg.s_hi_mm))
-        for idx, seg in enumerate(ws_cfg.segments)
-        if seg.visible
-    ]
-    if not visible_segments:
+    if not ws_cfg.segments_by_frame:
         return False
 
     profile_line_arg: tuple[tuple[float, float], tuple[float, float]] = (
@@ -92,7 +72,6 @@ def compute_and_write_wave_stats(
         pl.end,
     )
     prominence_k = float(ws_cfg.peak_prominence_k)
-    segments_tuples = [(s_lo, s_hi) for (_idx, s_lo, s_hi) in visible_segments]
 
     any_written = False
 
@@ -101,29 +80,26 @@ def compute_and_write_wave_stats(
         ds_mm = 1.0 / max(px_per_mm, 1e-9)
         poly_by_frame = body_polygons_by_batch_frame.get(batch, {})
 
-        frame_ids: list[int] = store.list_frames(batch)
-        sorted_fids = sorted(frame_ids)
-        n_frames = len(sorted_fids)
+        frame_ids: list[int] = sorted(store.list_frames(batch))
 
-        # Accumulators keyed by *visible-list local index* (0..len(visible)-1)
-        n_vis = len(visible_segments)
-        wavelengths_per_seg: list[list[float]] = [[] for _ in range(n_vis)]
-        wavenumbers_per_seg: list[list[float]] = [[] for _ in range(n_vis)]
-        peaks_per_seg: list[dict[int, np.ndarray]] = [dict() for _ in range(n_vis)]
-        troughs_per_seg: list[dict[int, np.ndarray]] = [dict() for _ in range(n_vis)]
-        heights_per_seg: list[dict[int, np.ndarray]] = [dict() for _ in range(n_vis)]
-
-        for fid in sorted_fids:
+        # Build per-frame payloads only for frames that have visible segments
+        per_frame_payloads: dict[int, dict] = {}
+        for fid in frame_ids:
             fid_str = str(fid)
+            seg_list = ws_cfg.segments_for_frame(fid_str)
+            visible = [
+                (i, seg) for i, seg in enumerate(seg_list) if seg.visible
+            ]
+            if not visible:
+                continue
             try:
                 eta = np.asarray(eta_loader(batch, fid_str), dtype=np.float64)
             except Exception:  # noqa: BLE001
-                # Append NaN placeholders to keep per-frame array length
-                for k in range(n_vis):
-                    wavelengths_per_seg[k].append(float("nan"))
-                    wavenumbers_per_seg[k].append(float("nan"))
                 continue
 
+            seg_tuples = [
+                (float(seg.s_lo_mm), float(seg.s_hi_mm)) for _, seg in visible
+            ]
             poly_rc: np.ndarray | None = poly_by_frame.get(fid_str, None)
 
             result: FrameWaveStats = compute_frame_wave_stats(
@@ -131,72 +107,73 @@ def compute_and_write_wave_stats(
                 profile_line=profile_line_arg,
                 body_polygon_rc=poly_rc,
                 px_per_mm=px_per_mm,
-                segments=segments_tuples,
+                segments=seg_tuples,
                 prominence_k=prominence_k,
             )
 
-            for k, seg_stats in enumerate(result.segments):
-                wavelengths_per_seg[k].append(float(seg_stats.wavelength_mm))
-                wavenumbers_per_seg[k].append(float(seg_stats.wavenumber_per_mm))
-                if seg_stats.n_peaks > 0:
-                    peaks_per_seg[k][fid] = np.column_stack(
-                        [seg_stats.peaks_s_mm, seg_stats.peaks_eta]
-                    ).astype(np.float64)
-                else:
-                    peaks_per_seg[k][fid] = np.empty((0, 2), dtype=np.float64)
-                if seg_stats.n_troughs > 0:
-                    troughs_per_seg[k][fid] = np.column_stack(
-                        [seg_stats.troughs_s_mm, seg_stats.troughs_eta]
-                    ).astype(np.float64)
-                else:
-                    troughs_per_seg[k][fid] = np.empty((0, 2), dtype=np.float64)
-                heights_per_seg[k][fid] = np.asarray(
-                    seg_stats.peak_to_trough_heights, dtype=np.float64
+            seg_payloads: list[dict] = []
+            seg_meta: list[dict] = []
+            for k, (orig_idx, seg) in enumerate(visible):
+                seg_stats = result.segments[k]
+                seg_payloads.append(
+                    {
+                        "segment_idx": int(orig_idx),
+                        "s_lo_mm": float(seg.s_lo_mm),
+                        "s_hi_mm": float(seg.s_hi_mm),
+                        "label": str(seg.label),
+                        "color": str(seg.color),
+                        "visible": bool(seg.visible),
+                        "wavelength_mm": float(seg_stats.wavelength_mm),
+                        "wavenumber_per_mm": float(seg_stats.wavenumber_per_mm),
+                        "S_gamma_N_per_m": float(seg_stats.S_gamma_N_per_m),
+                        "S_g_N_per_m": float(seg_stats.S_g_N_per_m),
+                        "S_cg_N_per_m": float(seg_stats.S_cg_N_per_m),
+                        "peaks": (
+                            np.column_stack(
+                                [seg_stats.peaks_s_mm, seg_stats.peaks_eta]
+                            ).astype(np.float64)
+                            if seg_stats.n_peaks > 0
+                            else np.empty((0, 2), dtype=np.float64)
+                        ),
+                        "troughs": (
+                            np.column_stack(
+                                [seg_stats.troughs_s_mm, seg_stats.troughs_eta]
+                            ).astype(np.float64)
+                            if seg_stats.n_troughs > 0
+                            else np.empty((0, 2), dtype=np.float64)
+                        ),
+                        "heights": np.asarray(
+                            seg_stats.peak_to_trough_heights, dtype=np.float64
+                        ),
+                    }
+                )
+                seg_meta.append(
+                    {
+                        "segment_idx": int(orig_idx),
+                        "label": str(seg.label),
+                        "color": str(seg.color),
+                        "visible": bool(seg.visible),
+                        "s_lo_mm": float(seg.s_lo_mm),
+                        "s_hi_mm": float(seg.s_hi_mm),
+                    }
                 )
 
-        # Build the per-segment dicts in the layout expected by write_wave_stats
-        segments_payload: list[dict] = []
-        segments_meta: list[dict] = []
-        for k, (orig_idx, s_lo, s_hi) in enumerate(visible_segments):
-            seg = ws_cfg.segments[orig_idx]
-            segments_payload.append(
-                {
-                    "segment_idx": int(orig_idx),
-                    "s_lo_mm": s_lo,
-                    "s_hi_mm": s_hi,
-                    "label": str(seg.label),
-                    "color": str(seg.color),
-                    "visible": bool(seg.visible),
-                    "wavelength_mm": np.asarray(wavelengths_per_seg[k], dtype=np.float64),
-                    "wavenumber_per_mm": np.asarray(
-                        wavenumbers_per_seg[k], dtype=np.float64
-                    ),
-                    "peaks": peaks_per_seg[k],
-                    "troughs": troughs_per_seg[k],
-                    "heights": heights_per_seg[k],
-                }
-            )
-            segments_meta.append(
-                {
-                    "segment_idx": int(orig_idx),
-                    "label": str(seg.label),
-                    "color": str(seg.color),
-                    "visible": bool(seg.visible),
-                    "s_lo_mm": s_lo,
-                    "s_hi_mm": s_hi,
-                }
-            )
+            per_frame_payloads[fid] = {
+                "segments": seg_payloads,
+                "segments_meta_json": json.dumps(seg_meta, sort_keys=True),
+            }
+
+        if not per_frame_payloads:
+            continue
 
         attrs: dict = {
-            "schema_version": 2,
+            "schema_version": 3,
             "prominence_k": prominence_k,
             "ds_mm": ds_mm,
-            "n_frames": n_frames,
-            "n_segments": len(visible_segments),
-            "segments_meta": json.dumps(segments_meta, sort_keys=True),
+            "n_frames": len(per_frame_payloads),
         }
 
-        store.write_wave_stats(batch, segments_payload, attrs)
+        store.write_wave_stats_per_frame(batch, per_frame_payloads, attrs)
         any_written = True
 
     return any_written

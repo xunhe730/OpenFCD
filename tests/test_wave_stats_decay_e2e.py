@@ -31,8 +31,12 @@ H = 100
 L_MM = 100.0
 W = int(L_MM * PX_PER_MM) + 1
 
-FORE_LO, FORE_HI = 5.0, 30.0
-AFT_LO, AFT_HI = 60.0, 95.0
+# s_mm is centered on the line midpoint (s=0 at L_MM/2). Originally these
+# segments lived on a [0, L_MM] axis as (5, 30) and (60, 95); they are
+# translated by -L_MM/2 here to preserve identical pixel coverage.
+_HALF = L_MM / 2.0
+FORE_LO, FORE_HI = 5.0 - _HALF, 30.0 - _HALF   # = (-45.0, -20.0): low-s end, near-field
+AFT_LO, AFT_HI = 60.0 - _HALF, 95.0 - _HALF    # = (10.0, 45.0): high-s end, far-field
 SEGMENTS: list[tuple[float, float]] = [(FORE_LO, FORE_HI), (AFT_LO, AFT_HI)]
 FORE_IDX, AFT_IDX = 0, 1
 

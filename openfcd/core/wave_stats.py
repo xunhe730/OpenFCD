@@ -3,9 +3,13 @@
 Pure functions — no IO, no Qt, no h5py dependencies.
 
 The profile line is sampled at 1-pixel resolution via bilinear interpolation.
-Each user-defined segment ``[s_lo_mm, s_hi_mm]`` along the arc length is then
-analysed independently using a prominence-gated peak finder whose minimum
-distance is estimated from the dominant FFT wavelength.
+The arc-length axis ``s_mm`` is **centered on the line midpoint** (s=0), with
+``s ∈ [-L/2, +L/2]`` where ``L`` is the line length in millimetres. This
+matches the centered ``x_mm`` axis used by ``profile_composite`` for the 1D
+sub-plot, so user-drawn segment boundaries read directly off that plot can be
+fed in verbatim. Each user-defined segment ``[s_lo_mm, s_hi_mm]`` is analysed
+independently using a prominence-gated peak finder whose minimum distance is
+estimated from the dominant FFT wavelength.
 """
 
 from __future__ import annotations
@@ -17,13 +21,28 @@ from scipy.ndimage import map_coordinates
 from scipy.signal import find_peaks
 
 
+# Surface tension of clean water at ~25°C, in N/m. Used for the capillary-wave
+# radiation stress S = (3/4)·γ·a²·k², where a = H_max/2 (max amplitude in the
+# segment) and k = 2π/λ (angular wavenumber, consistent with the dispersion
+# relation ω² = γk³/ρ). Hardcoded because OpenFCD targets water free-surface
+# experiments; promote to GeometryConfig only when non-water support is needed.
+SURFACE_TENSION_WATER_N_PER_M: float = 0.072
+
+# Water density at ~25°C (kg/m³) and standard gravity (m/s²). Used for the
+# gravity component of the radiation stress S_g = (1/4)·ρ·g·a². Hardcoded for
+# the same reason as γ (water-only use case); promote to GeometryConfig when
+# non-water support is needed.
+WATER_DENSITY_KG_PER_M3: float = 997.0
+GRAVITY_M_PER_S2: float = 9.80665
+
+
 # ── Output dataclasses ───────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class SegmentWaveStats:
     """Wave statistics for a single user-defined segment on one frame."""
-    segment_idx: int                       # 0-based index in WaveStatsConfig.segments
+    segment_idx: int                       # 0-based index within the frame's segment list
     s_lo_mm: float
     s_hi_mm: float
     peaks_s_mm: np.ndarray
@@ -36,6 +55,9 @@ class SegmentWaveStats:
     n_peaks: int
     n_troughs: int
     lambda0_fft_mm: float
+    S_gamma_N_per_m: float                 # capillary: (3/4)·γ·k²·a² (N/m); NaN if undefined
+    S_g_N_per_m: float                     # gravity:   (1/4)·ρ·g·a²    (N/m); NaN if undefined
+    S_cg_N_per_m: float                    # total:     S_gamma + S_g    (N/m); NaN if undefined
 
 
 @dataclass(frozen=True)
@@ -63,6 +85,9 @@ def _empty_segment_stats(segment_idx: int, s_lo: float, s_hi: float) -> SegmentW
         n_peaks=0,
         n_troughs=0,
         lambda0_fft_mm=float("nan"),
+        S_gamma_N_per_m=float("nan"),
+        S_g_N_per_m=float("nan"),
+        S_cg_N_per_m=float("nan"),
     )
 
 
@@ -179,6 +204,30 @@ def _compute_one_segment(
 
     heights = _compute_heights(peaks_s_mm, peaks_eta, troughs_s_mm, troughs_eta)
 
+    # Capillary-gravity wave radiation stress, deep-water small-amplitude:
+    #   S_γ = (3/4)·γ·k²·a²   (capillary component)
+    #   S_g = (1/4)·ρ·g·a²    (gravity   component)
+    #   S_cg = S_γ + S_g
+    # k_phys is angular wavenumber (rad/mm) = 2π · wavenumber_per_mm.
+    # a² uses the **RMS amplitude** over the segment: a² = ⟨(H/2)²⟩ =
+    # (1/4)·mean(H²). This is the physically correct segment-average for the
+    # quadratic functional S ∝ a² (equivalent to averaging per-pair S_i).
+    # For pure sinusoidal waves (all H equal to 2A), RMS reduces to A² —
+    # identical to (H_max/2)². For non-uniform wave trains they differ.
+    # For S_γ, mm-units cancel in a²·k². For S_g, ρ·g·a² requires SI: a²
+    # converts via a_m² = a_mm² · 1e-6.
+    if heights.size > 0 and np.isfinite(wavenumber_per_mm):
+        a_sq_mm2 = 0.25 * float(np.mean(heights * heights))
+        a_sq_m2 = a_sq_mm2 * 1e-6
+        k_phys = 2.0 * np.pi * float(wavenumber_per_mm)
+        S_gamma = 0.75 * SURFACE_TENSION_WATER_N_PER_M * a_sq_mm2 * (k_phys * k_phys)
+        S_g = 0.25 * WATER_DENSITY_KG_PER_M3 * GRAVITY_M_PER_S2 * a_sq_m2
+        S_cg = S_gamma + S_g
+    else:
+        S_gamma = float("nan")
+        S_g = float("nan")
+        S_cg = float("nan")
+
     return SegmentWaveStats(
         segment_idx=segment_idx,
         s_lo_mm=float(s_lo),
@@ -193,6 +242,9 @@ def _compute_one_segment(
         n_peaks=n_peaks,
         n_troughs=n_troughs,
         lambda0_fft_mm=lambda0,
+        S_gamma_N_per_m=S_gamma,
+        S_g_N_per_m=S_g,
+        S_cg_N_per_m=S_cg,
     )
 
 
@@ -259,7 +311,9 @@ def compute_frame_wave_stats(
 
     ds_mm = 1.0 / px_per_mm
     L_mm = L_px * ds_mm
-    s_profile_mm = t_vals * L_mm
+    # Centered arc-length axis: s=0 at the line midpoint, matching the
+    # centered x_mm axis used by profile_composite's 1D sub-plot.
+    s_profile_mm = t_vals * L_mm - 0.5 * L_mm
 
     out: list[SegmentWaveStats] = []
     for idx, (s_lo, s_hi) in enumerate(segments):

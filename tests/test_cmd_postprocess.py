@@ -51,20 +51,25 @@ def _sha256_dataset(h5_path: Path, dataset_path: str) -> str:
         return hashlib.sha256(f[dataset_path][:].tobytes()).hexdigest()
 
 
-def _make_wave_stats_config(k: float = 0.15) -> WaveStatsConfig:
-    mid = L_MM / 2.0
+def _make_wave_stats_config(k: float = 0.15, frame_ids=(0, 1)) -> WaveStatsConfig:
+    # s_mm is centered on the line midpoint: fore = left half, aft = right half.
+    half = L_MM / 2.0
+    segs = [
+        WaveSegment(s_lo_mm=-half, s_hi_mm=0.0, label="fore"),
+        WaveSegment(s_lo_mm=0.0, s_hi_mm=half, label="aft"),
+    ]
     return WaveStatsConfig(
-        segments=[
-            WaveSegment(s_lo_mm=0.0, s_hi_mm=mid, label="fore"),
-            WaveSegment(s_lo_mm=mid, s_hi_mm=L_MM, label="aft"),
-        ],
+        segments_by_frame={str(fi): list(segs) for fi in frame_ids},
         peak_prominence_k=k,
     )
 
 
-def _make_annotation(k: float = 0.15) -> AnnotationSchema:
+def _make_annotation(k: float = 0.15, frame_ids=(0, 1)) -> AnnotationSchema:
     pl = ProfileLineData(start=(H / 2.0, 0.0), end=(H / 2.0, float(W - 1)))
-    return AnnotationSchema(wave_stats=_make_wave_stats_config(k), profile_line=pl)
+    return AnnotationSchema(
+        wave_stats=_make_wave_stats_config(k, frame_ids=frame_ids),
+        profile_line=pl,
+    )
 
 
 def _build_project(tmp_path: Path, annotation: AnnotationSchema) -> Path:
@@ -181,6 +186,18 @@ class TestPostprocessCmdEndToEnd:
         assert h5_path.exists()
         with h5py.File(h5_path, "r") as f:
             assert "batches/test/wave_stats" in f
+
+    def test_empty_frame_is_skipped(self, tmp_path):
+        """Frame without segments must not get a wave_stats group (v3)."""
+        # Only frame 0 has segments; frame 1 should be skipped.
+        ann = _make_annotation(frame_ids=(0,))
+        ofcd = _build_project(tmp_path, ann)
+        h5_path = ofcd / "runs" / "run-20260101-120000" / "results.h5"
+        postprocess_cmd(ofcd_path=ofcd, run_id=None)
+        with h5py.File(h5_path, "r") as f:
+            ws = f["batches/test/wave_stats"]
+            assert "frame_0" in ws
+            assert "frame_1" not in ws
 
 
 class TestPostprocessCmdNoWaveStats:

@@ -27,9 +27,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QKeySequence
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
     QCheckBox,
     QColorDialog,
     QHBoxLayout,
@@ -54,8 +56,11 @@ COL_LAMBDA = 6
 COL_WAVENUM = 7
 COL_HEIGHTS = 8
 COL_N_PEAKS = 9
-COL_DELETE = 10
-N_COLS = 11
+COL_S_GAMMA = 10
+COL_S_G = 11
+COL_S_CG = 12
+COL_DELETE = 13
+N_COLS = 14
 
 # Legacy alias retained for any external imports — points at the same column.
 COL_MEAN_HEIGHT = COL_HEIGHTS
@@ -71,6 +76,9 @@ COL_HEADERS = [
     "k (1/mm)",
     "Heights",
     "N peaks",
+    "S_γ (μN/mm)",
+    "S_g (μN/mm)",
+    "S_cg (μN/mm)",
     "",
 ]
 
@@ -83,6 +91,7 @@ class WaveStatsTablePanel(QWidget):
     segmentDeleted = pyqtSignal(int)
     visibilityToggled = pyqtSignal(int, bool)
     heightsRequested = pyqtSignal(int)             # row idx; emitted on double-click of Heights cell
+    copyPreviousFrameRequested = pyqtSignal()      # "copy previous frame" button clicked
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -91,14 +100,31 @@ class WaveStatsTablePanel(QWidget):
         self._batch: str = "default"
         self._live_stats = None  # FrameWaveStats | None — populated by ProfileSceneView
         self._suspend_signals = False
+        # v3: per-frame wave-stats. The table renders the segments for the
+        # currently active frame. None ⇒ no frame selected (renders empty).
+        self._current_frame_idx: int | None = None
+        self._previous_frame_has_segments: bool = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(4)
 
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
         self._title = QLabel("Wave Segments")
         self._title.setStyleSheet("font-size: 11px; font-weight: 600;")
-        layout.addWidget(self._title)
+        header_layout.addWidget(self._title)
+        header_layout.addStretch()
+        self._btn_copy_prev = QPushButton("复制上帧")
+        self._btn_copy_prev.setFixedHeight(22)
+        self._btn_copy_prev.setEnabled(False)
+        self._btn_copy_prev.clicked.connect(
+            lambda: self.copyPreviousFrameRequested.emit()
+        )
+        header_layout.addWidget(self._btn_copy_prev)
+        layout.addWidget(header)
 
         self._table = QTableWidget(0, N_COLS, self)
         self._table.setHorizontalHeaderLabels(COL_HEADERS)
@@ -106,7 +132,21 @@ class WaveStatsTablePanel(QWidget):
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         hh.setStretchLastSection(False)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        # Excel-like selection: arbitrary rectangular cell ranges.
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        # Read-only cells must still be navigable + part of selections; suppress
+        # double-click edit-trigger so dragging selects rather than entering edit.
+        self._table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        # Ctrl+C / Cmd+C → copy selected range as TSV (Excel-compatible).
+        # Use an eventFilter on the table viewport rather than a QShortcut: the
+        # shortcut path can be swallowed by the QTableWidget's internal handling
+        # of Copy and lose all but the current cell, while a key-press filter
+        # intercepts the raw event before Qt's default kicks in.
+        self._table.installEventFilter(self)
         self._table.cellClicked.connect(self._on_cell_clicked)
         self._table.cellChanged.connect(self._on_cell_changed)
         self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
@@ -137,6 +177,52 @@ class WaveStatsTablePanel(QWidget):
     def live_stats(self):
         return self._live_stats
 
+    def set_current_frame(self, frame_idx: int | None) -> None:
+        """Bind the currently active frame index (v3 per-frame wave-stats)."""
+        self._current_frame_idx = frame_idx
+        self._rebuild_rows()
+
+    def set_previous_frame_has_segments(self, has_segments: bool) -> None:
+        """Enable/disable the 'copy previous frame' button."""
+        self._previous_frame_has_segments = bool(has_segments)
+        self._btn_copy_prev.setEnabled(self._previous_frame_has_segments)
+
+    def eventFilter(self, source, event) -> bool:  # type: ignore[override]
+        if source is self._table and event.type() == QEvent.Type.KeyPress:
+            if event.matches(QKeySequence.StandardKey.Copy):
+                self._copy_selection_as_tsv()
+                return True
+        return super().eventFilter(source, event)
+
+    def _copy_selection_as_tsv(self) -> None:
+        """Copy the currently selected rectangular cell range as TSV.
+
+        Tab-separated columns, newline-separated rows — paste cleanly into
+        Excel/Numbers/Google Sheets. Widget cells (checkbox/color/delete)
+        have no QTableWidgetItem and emit an empty string. Multiple disjoint
+        selections are concatenated row by row (Excel can't paste disjoint
+        ranges anyway; the first contiguous range is the common case).
+        """
+        ranges = self._table.selectedRanges()
+        if not ranges:
+            return
+        # Collect every selected cell as (row, col) → text, then emit row-by-row
+        # in ascending order of row, then column.
+        cell_text: dict[tuple[int, int], str] = {}
+        for r in ranges:
+            for row in range(r.topRow(), r.bottomRow() + 1):
+                for col in range(r.leftColumn(), r.rightColumn() + 1):
+                    item = self._table.item(row, col)
+                    cell_text[(row, col)] = item.text() if item is not None else ""
+        if not cell_text:
+            return
+        rows = sorted({r for r, _ in cell_text})
+        cols = sorted({c for _, c in cell_text})
+        lines = [
+            "\t".join(cell_text.get((row, col), "") for col in cols) for row in rows
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
+
     def select_row(self, idx: int) -> None:
         """Programmatically select a row (no signal emitted)."""
         if 0 <= idx < self._table.rowCount():
@@ -147,7 +233,11 @@ class WaveStatsTablePanel(QWidget):
     def _segments(self) -> list:
         if self._annotation is None or self._annotation.wave_stats is None:
             return []
-        return list(self._annotation.wave_stats.segments)
+        if self._current_frame_idx is None:
+            return []
+        return self._annotation.wave_stats.segments_for_frame(
+            self._current_frame_idx
+        )
 
     def _rebuild_rows(self) -> None:
         self._suspend_signals = True
@@ -204,8 +294,17 @@ class WaveStatsTablePanel(QWidget):
                     row, COL_HEIGHTS, _fmt_count(row_stats.get("n_pairs"))
                 )
                 self._set_readonly(row, COL_N_PEAKS, _fmt_count(row_stats.get("n_peaks")))
+                self._set_readonly(
+                    row, COL_S_GAMMA, _fmt_stress(row_stats.get("S_gamma_N_per_m"))
+                )
+                self._set_readonly(
+                    row, COL_S_G, _fmt_stress(row_stats.get("S_g_N_per_m"))
+                )
+                self._set_readonly(
+                    row, COL_S_CG, _fmt_stress(row_stats.get("S_cg_N_per_m"))
+                )
 
-                # 10: delete button
+                # 13: delete button
                 del_btn = QPushButton("✕")
                 del_btn.setFixedWidth(28)
                 del_btn.clicked.connect(lambda _checked, r=row: self._on_delete_clicked(r))
@@ -233,6 +332,9 @@ class WaveStatsTablePanel(QWidget):
                     "n_peaks": int(seg_stats.n_peaks),
                     "n_pairs": int(heights.size),
                     "heights": heights,
+                    "S_gamma_N_per_m": float(seg_stats.S_gamma_N_per_m),
+                    "S_g_N_per_m": float(seg_stats.S_g_N_per_m),
+                    "S_cg_N_per_m": float(seg_stats.S_cg_N_per_m),
                 }
         except Exception:
             return {}
@@ -363,6 +465,24 @@ def _fmt_int(v) -> str:
         return f"{float(v):.1f}"
     except (TypeError, ValueError):
         return "—"
+
+
+def _fmt_stress(v) -> str:
+    """Format radiation stress (S_γ / S_g / S_cg) for display in μN/mm.
+
+    Internal storage is SI (N/m). The GUI rescales by 1000× so typical
+    capillary-wave magnitudes show as values like 0.7 instead of 7e-4. HDF5
+    and the SegmentWaveStats fields keep N/m for physics correctness.
+    """
+    if v is None:
+        return "—"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(f):
+        return "—"
+    return f"{f * 1000.0:.4g}"
 
 
 def _fmt_count(v) -> str:
