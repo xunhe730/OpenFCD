@@ -64,10 +64,11 @@ def _write_invalid_project(dir_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def test_version() -> None:
-    """`openfcd version` prints 0.0.1."""
+    """`openfcd version` prints the package __version__."""
+    import openfcd
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
-    assert "0.0.1" in result.output
+    assert openfcd.__version__ in result.output
 
 
 # ---------------------------------------------------------------------------
