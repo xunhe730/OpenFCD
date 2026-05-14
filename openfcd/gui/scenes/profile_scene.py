@@ -1057,10 +1057,16 @@ class ProfileSceneView(QWidget):
         old_cfg = self._annotation.wave_stats
         existing = list(old_cfg.segments_for_frame(frame_key)) if old_cfg else []
         # Auto-assign next color from cycle if caller passed the default.
+        # Pick the first cycle entry not currently in use among existing
+        # segments — using len(existing) as the index regressed after a
+        # deletion and collided with the surviving segment's color.
         if new_seg.color == "#1f77b4":
-            new_seg = new_seg.model_copy(
-                update={"color": _COLOR_CYCLE[len(existing) % len(_COLOR_CYCLE)]}
+            used = {s.color for s in existing}
+            chosen = next(
+                (c for c in _COLOR_CYCLE if c not in used),
+                _COLOR_CYCLE[len(existing) % len(_COLOR_CYCLE)],
             )
+            new_seg = new_seg.model_copy(update={"color": chosen})
         if old_cfg is None:
             new_cfg = WaveStatsConfig(segments_by_frame={frame_key: [new_seg]})
         else:
